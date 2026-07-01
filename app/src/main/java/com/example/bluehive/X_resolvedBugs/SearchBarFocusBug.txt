@@ -1,0 +1,148 @@
+Focus Flash Bug - Detailed Documentation
+
+🐛 THE BUG:
+When exiting the sidebar using the RIGHT key, the SearchBar would briefly flash its focus glow before the correct target element (e.g., TV Shows button) received focus.
+
+User presses RIGHT on sidebar
+↓
+SearchBar glow appears for ~50-100ms (FLASH)
+↓
+TV Shows button receives focus correctly
+
+The Race Condition:
+The bug was caused by a timing gap between when the sidebar closed and when our parking mechanism activated. Here's the exact sequence of events:
+
+1. User presses RIGHT on sidebar
+   └→ onExitToRight() callback fires
+
+2. onExitToRight() executes synchronously:
+   sidebarCanFocus = false           // ✅ Sidebar loses focus capability
+   requestSidebarReturnFocus = true  // ✅ Triggers restoration
+
+3. ⚠️ CRITICAL MOMENT: Compose recomposes immediately
+   └→ SearchBar's focusProperties re-evaluates:
+       canFocus = !isRadioButtonSwitching && !sidebarCanFocus
+       canFocus = true && true = TRUE ✅
+   └→ SearchBar is NOW focusable!
+
+4. 🐛 Compose's focus system defaults to first focusable element
+   └→ SearchBar grabs focus (FLASH HAPPENS HERE)
+   └→ isSearchBarFocused = true
+   └→ Glow appears
+
+5. LaunchedEffect(requestSidebarReturnFocus) triggers:
+   └→ Waits 1 frame...
+   └→ Waits another frame...
+   └→ sidebarParkingEnabled = true (TOO LATE!)
+
+6. Parking spot requests focus (but SearchBar already has it)
+
+7. Finally, correct target gets focus
+   └→ SearchBar loses focus
+   └→ Glow disappears (end of flash)
+
+   🔧 THE FIX
+   Strategy: Parking Mechanism
+   We used a "parking spot" - an invisible, 1dp focusable element that:
+
+   Blocks all key events when active
+   Captures focus during transitions
+   Prevents SearchBar from being the default target
+
+
+   Implementation
+   Part 1: The Parking Spot (UI Element)
+   kotlinBox(
+       modifier = Modifier
+           .size(1.dp)                               // Invisible (1dp square)
+           .graphicsLayer(alpha = 0f)                // Completely transparent
+           .focusRequester(sidebarParkingRequester)  // Can be focused programmatically
+           .focusProperties { canFocus = sidebarParkingEnabled }  // Gated by flag
+           .onPreviewKeyEvent { event ->
+               if (sidebarParkingEnabled && event.type == KeyEventType.KeyDown) {
+                   Log.d("SIDEBAR_PARKING", "🚫 Blocking ${event.key} during sidebar transition")
+                   true  // ✅ Consume ALL keys (prevents any navigation)
+               } else {
+                   false
+               }
+           }
+           .focusable()
+   )
+
+   Part 2: Enable Parking IMMEDIATELY (Critical!)
+   kotlinHomeScreenSidebarCompose(
+       focusRequester = sidebarFocusRequester,
+       canFocus = sidebarCanFocus,
+       onExitToRight = {
+           // ✅ STEP 1: Enable parking FIRST (synchronous!)
+           sidebarParkingEnabled = true    // ← THIS IS THE KEY!
+
+           // ✅ STEP 2: Then close sidebar gate
+           sidebarCanFocus = false
+
+           // ✅ STEP 3: Finally trigger restoration
+           requestSidebarReturnFocus = true
+       }
+   )
+   ```
+
+   **Why This Order Matters:**
+
+   All three assignments happen **synchronously in the same frame**. When Compose recomposes after this callback:
+   ```
+   Parking: canFocus = sidebarParkingEnabled = TRUE  ✅
+   SearchBar: canFocus = !sidebarCanFocus = TRUE     ✅
+
+
+   Part 3: Restoration Logic
+   kotlinLaunchedEffect(requestSidebarReturnFocus, sidebarCanFocus) {
+       if (requestSidebarReturnFocus && !sidebarCanFocus) {
+           // Parking is ALREADY enabled from onExitToRight
+
+           kotlinx.coroutines.android.awaitFrame()  // Wait for composition
+
+           sidebarParkingRequester.requestFocus()   // Move to parking
+           kotlinx.coroutines.android.awaitFrame()  // Let it settle
+
+           // Now restore to actual target
+           when (sidebarReturnTarget) {
+               SidebarReturnTarget.SEARCH_BAR -> searchBarFocusRequester.requestFocus()
+               SidebarReturnTarget.TV_SHOWS -> tvShowsToggleButtonFocusRequester.requestFocus()
+               // ... etc
+           }
+
+           kotlinx.coroutines.android.awaitFrame()  // Wait for target to receive focus
+
+           // Cleanup
+           sidebarReturnTarget = null
+           requestSidebarReturnFocus = false
+           sidebarParkingEnabled = false  // ✅ Disable parking
+       }
+   }
+
+
+   ✅ FIXED SEQUENCE
+   kotlin1. User presses RIGHT on sidebar
+      └→ onExitToRight() callback fires
+
+   2. onExitToRight() executes (ALL SYNCHRONOUS):
+      sidebarParkingEnabled = true      // ✅ Parking activated FIRST
+      sidebarCanFocus = false
+      requestSidebarReturnFocus = true
+
+   3. Compose recomposes:
+      Parking spot: canFocus = TRUE     ✅ (enabled)
+      SearchBar: canFocus = TRUE        ✅ (but won't get focus)
+
+   4. ✅ Compose defaults to parking spot (rendered first)
+      └→ Parking spot gets focus (invisible, no flash)
+
+   5. LaunchedEffect triggers:
+      └→ Waits 1 frame (parking already has focus)
+      └→ Explicitly moves to parking (already there)
+      └→ Waits 1 frame
+      └→ Moves to TV Shows button
+      └→ Waits 1 frame
+      └→ Disables parking
+
+   6. ✅ Result: Smooth transition, no SearchBar flash!

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Focused state -->
+    <item android:state_focused="true" android:drawable="@drawable/titlecard_focused_inset" />
+
+    <!-- Default (not focused) -->
+    <item android:drawable="@drawable/titlecard_shadow_inset" />
+</selector>
+
+<!--    Instead of toggling separate focus and shadow views, you create one background drawable for the card that automatically switches images when the view gains or loses focus.-->
+<!--    That’s exactly what StateListDrawable (static) or AnimatedStateListDrawable (with crossfade) is for.-->

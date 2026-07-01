@@ -1,0 +1,16 @@
+# Reduce memory usage for low-RAM devices
+prefs:
+# Reduce JS memory pressure
+javascript.options.mem.gc_min_slice_budget_ms: 5
+javascript.options.mem.gc_max_empty_chunk_count: 2
+javascript.options.mem.gc_allocation_threshold_mb: 10
+
+# Reduce image decode cache
+image.cache.size: 1048576
+image.mem.surfacecache.max_size_kb: 2048
+
+# Single page — no history needed
+browser.sessionhistory.max_entries: 1
+
+# Reduce network cache
+browser.cache.memory.capacity: 2048

@@ -1,0 +1,567 @@
+================================================================================
+  BLUEHIVE ANDROID TV — SSE ARCHITECTURE GUIDE
+  Real-time Device Events, Session Control & Workspace Slot Management
+================================================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. WHAT IS THIS SYSTEM?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BlueHive's backend needs to instantly communicate with Android TV devices the
+moment something important happens — a device is removed, a session is revoked,
+or a slot opens up in a full workspace. Rather than having every TV constantly
+ask the server "has anything changed?", the server tells the TV the moment it
+does.
+
+This is done using SSE (Server-Sent Events) — a permanent, one-way connection
+from the server to each TV that stays open and silent until something actually
+happens. When it does, the event arrives in under 50 milliseconds.
+
+  Connection direction ......... Server → TV (server pushes, TV listens)
+  Connection type .............. One long-lived HTTP connection per TV (SSE)
+  TV → Server communication .... Short REST calls: end-session, check-slot,
+                                  background/foreground
+  Idle network usage ........... Zero — connection is silent when nothing
+                                  is happening
+  Event delivery latency ....... Under 50ms on local network
+  Max active devices ........... 6 per workspace (enforced server-side)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. WHY SSE, NOT POLLING OR WEBSOCKETS?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+THE OLD WAY (POLLING) — WHAT WAS REPLACED
+------------------------------------------
+The old HeartbeatManager sent a POST request every few seconds to ask "am I
+still okay?" This meant constant network traffic even when nothing was
+happening, up to N seconds of delay on revocations, and server load that grew
+linearly with the number of active devices.
+
+WHY NOT WEBSOCKET?
+------------------
+WebSocket is full-duplex (both sides can talk at any time) but everything
+meaningful in this system only goes one direction: the server tells the TV
+things. SSE is a plain HTTP response, works through proxies and load balancers
+without configuration, and is simpler to implement. For a one-directional push
+system, SSE is the right tool.
+
+WHY SSE?
+--------
+  • Zero bytes sent during idle — no polling noise
+  • Server pushes exactly when something changes
+  • Under 50ms delivery on LAN
+  • Plain HTTP — works through any proxy or firewall
+  • Automatic reconnect built into the protocol
+  • Server checks device status on every reconnect — missed events are
+    caught automatically
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. THE TWO REDIS CHANNELS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Every event travels through Redis (an in-memory message broker). There are two
+channel types:
+
+  bh:device:{fingerprint}
+      Private channel for one specific TV. Used for revoke and session kick
+      events. Only that TV's SSE stream is subscribed.
+
+  bh:workspace:{user_id}
+      Broadcast channel for all TVs on the same account. Used for slot_freed
+      events so every TV on the lockout screen can react simultaneously.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. DEVICE STATE — HOW A TV OCCUPIES A SLOT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A TV occupies one of the 6 available workspace slots based on fields in the
+database:
+
+  Device row exists
+      The TV is paired to the account. Row present = paired.
+      Row deleted = unpaired (hard removed).
+
+  is_device_active = True
+      The TV is currently in the app with an open SSE stream.
+
+  is_device_active = False
+      The TV is paired but not actively in the app.
+
+  last_seen_at
+      Audit timestamp. Updated every 30 seconds by the SSE keepalive. Acts as
+      a safety net — if is_device_active is stuck True after a crash, the
+      7-minute inactivity window eventually frees the slot automatically.
+
+  backgrounded_at
+      Set when the TV's home button is pressed. Cleared when the user returns.
+      Server-side only — the 10-minute grace timer runs in Redis.
+
+  [SAFETY NET] If a TV crashes or loses connection without cleanly ending its
+  session, last_seen_at stops updating. After 7 minutes of no updates, the
+  active-device gate stops counting that TV as active and the slot is freed
+  automatically. No manual intervention needed.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. EVENTS — WHAT GETS PUSHED AND WHEN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+EVENTS THE SERVER PUSHES TO THE TV
+------------------------------------
+  revoked
+      The TV was kicked from the session (soft kick). The device row still
+      exists — the user sees a lockout countdown and can re-enter after 3
+      minutes without re-pairing.
+
+  unpaired
+      The device row was permanently deleted (hard remove). The user is routed
+      directly to the pairing screen — no countdown, no re-entry.
+
+  slot_freed
+      A workspace slot just opened up. TVs sitting on the "workspace full"
+      lockout screen use this to show a green "A slot just opened" hint.
+
+  force_close
+      Internal signal telling the SSE generator to close cleanly. Sent by the
+      server's own end-session endpoint so it doesn't rely on TCP-level
+      disconnect detection.
+
+  session_started
+      Broadcast to the web dashboard when a TV connects. Used to refresh the
+      devices panel in real time.
+
+CALLS THE TV MAKES TO THE SERVER
+----------------------------------
+  POST /api/android/end-session
+      Back button on the home screen. Frees the slot immediately. The only
+      intentional exit path.
+
+  POST /api/android/check-slot
+      Refresh button on the lockout screen after the 3-minute countdown.
+      Re-occupies a slot if one is available.
+
+  POST /api/android/background
+      Home button pressed. Starts a 10-minute Redis grace timer server-side.
+      If the user returns within 10 minutes, the slot is preserved.
+
+  POST /api/android/foreground
+      User returned to the app. Cancels the grace timer. Tells the server the
+      slot should stay occupied.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. HOW EACH SCENARIO WORKS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+──────────────────────────────────────────
+  NORMAL APP LAUNCH
+──────────────────────────────────────────
+  [1] App opens
+      BlueHiveApplication.onCreate() runs. SessionManager loads stored
+      credentials.
+
+  [2] SSE stream opens
+      DeviceEventStream.start() fires GET /api/android/events. Server validates
+      the JWT token and confirms the device is active.
+
+  [3] Server subscribes to Redis
+      Server subscribes to bh:device:{fingerprint} and bh:workspace:{user_id}
+      for this TV.
+
+  [4] Stream sits silent
+      No bytes exchanged until an event happens. Every 30 seconds, a silent
+      keepalive comment keeps the connection alive through proxies.
+
+
+──────────────────────────────────────────
+  HARD REMOVE (Admin Deletes the Device)
+──────────────────────────────────────────
+  [1] Admin clicks Remove
+      Web dashboard calls DELETE /api/me/devices/{id}.
+      Device row is deleted from the database.
+
+  [2] Server pushes event
+      push_device_event() publishes {"event": "unpaired"} to the TV's Redis
+      channel. push_workspace_event() publishes {"event": "slot_freed"}.
+
+  [3] TV receives event
+      SSE generator reads the Redis message and forwards it over the open
+      HTTP connection.
+
+  [4] TV routes to pairing screen
+      dispatchEvent() sees "unpaired", calls SessionManager.clearSession(),
+      posts SessionExpiredBus. TV goes directly to pairing screen.
+      No countdown. Immediate.
+
+
+──────────────────────────────────────────
+  SOFT KICK (Admin Revokes a Session)
+──────────────────────────────────────────
+  [1] Admin clicks Revoke Session
+      Web dashboard calls DELETE /api/me/sessions/{id}. is_device_active is set
+      to False. Device row stays — TV remains paired.
+
+  [2] Server pushes event
+      push_device_event() publishes {"event": "revoked", "reason":
+      "revoked_by_admin"}. Slot is freed immediately.
+
+  [3] TV shows lockout screen
+      LockoutBus receives REASON_REVOKED_BY_ADMIN. 3-minute countdown starts:
+      "Your device was removed."
+
+  [4] User taps Re-enter
+      After 3 minutes, POST /api/android/check-slot runs the workspace capacity
+      check. If a slot is free: success, SSE reconnects, user picks a profile.
+      If full: 429, wait for slot_freed.
+
+
+──────────────────────────────────────────
+  MISSED EVENT (TV Was Offline During Revocation)
+──────────────────────────────────────────
+  [1] TV loses connection
+      Network drops. SSE stream closes. DeviceEventStream detects the broken
+      read and starts exponential backoff (2s, 4s, 8s... up to 60s).
+
+  [2] Admin revokes while TV is offline
+      The Redis PUBLISH fires but there are no subscribers. The event is lost.
+      The database is updated correctly.
+
+  [3] TV reconnects
+      GET /api/android/events is retried. Server validates the JWT and checks
+      the device row. Row gone = 404. Session kicked = 403.
+
+  [4] Missed event caught
+      The reconnect itself surfaces the revocation. No separate polling needed —
+      the SSE endpoint IS the status check.
+
+
+──────────────────────────────────────────
+  HOME BUTTON — 10-MINUTE GRACE TIMER
+──────────────────────────────────────────
+  [1] User presses the home button
+      ProcessLifecycleOwner.onStop() fires. InactivityWatcher calls
+      POST /api/android/background.
+
+  [2] Server starts the timer
+      Redis key bh:bg:{fingerprint} is created with a 10-minute TTL.
+      backgrounded_at is recorded in the database. SSE stream may close, but
+      the slot is preserved.
+
+  [3a] User returns within 10 minutes
+      InactivityWatcher fires POST /api/android/foreground. Redis grace key
+      deleted. backgrounded_at cleared. Slot was never freed.
+
+  [3b] 10 minutes pass — user did not return
+      Redis expires the key. The keyspace notification listener in main.py
+      fires. is_device_active set to False. slot_freed pushed to workspace.
+      Slot freed with exact wall-clock timing — no polling, no client
+      involvement.
+
+
+──────────────────────────────────────────
+  WORKSPACE FULL — SLOT FREED PATH
+──────────────────────────────────────────
+  [1] 7th TV tries to connect
+      GET /api/android/events returns 429 (workspace full). LockoutBus posts
+      REASON_WORKSPACE_FULL. DeviceEventStream keeps retrying in the background.
+
+  [2] Another TV frees its slot
+      Back button, session kick, or 10-minute grace expiry triggers
+      push_workspace_event({"event": "slot_freed"}).
+
+  [3] Waiting TV receives slot_freed
+      SlotFreedBus fires. LockoutActivity shows green hint:
+      "A slot just opened — tap Refresh to re-enter."
+
+  [4] User taps Refresh
+      POST /api/android/check-slot. active_device_gate verifies there is
+      genuinely a free slot before marking it occupied.
+      200 = enter. Still full = 429.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. EVERY FILE IN THIS SYSTEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BACKEND (Python / FastAPI)
+---------------------------
+
+  app/routers/events.py
+      The heart of the system. All SSE endpoints live here:
+        GET  /api/android/events       — the persistent TV stream
+        POST /api/android/end-session  — intentional app exit
+        POST /api/android/check-slot   — re-entry after lockout
+        POST /api/android/background   — home button pressed
+        POST /api/android/foreground   — user returned from home
+        GET  /api/me/events            — web dashboard SSE stream
+
+  app/main.py
+      FastAPI application entry point. Runs the _bg_expiry_listener background
+      task on startup — reacts when Redis grace keys expire and frees slots
+      after the 10-minute home-button timer.
+
+  app/routers/devices.py
+      Device pairing and removal. On remove_device(), pushes "unpaired" to the
+      device channel and "slot_freed" to the workspace channel.
+
+  app/routers/sessions.py
+      Session management. On revoke_session(), sets is_device_active = False,
+      pushes "revoked" to the device channel and "slot_freed" to the workspace
+      channel.
+
+  app/routers/workspace.py
+      Workspace membership. On remove_member() or leave_workspace(), revokes
+      all devices for that member and pushes events for each.
+
+  app/middleware/active_device_gate.py
+      Middleware dependency used by every TV endpoint that writes
+      is_device_active = True. Enforces the 6-device workspace capacity check
+      before allowing slot occupancy.
+
+  app/models.py
+      SQLAlchemy ORM definitions. Device model: is_device_active, last_seen_at,
+      backgrounded_at. These three fields drive all slot-management logic.
+
+  app/redis_client.py
+      Shared Redis connection. get_redis() returns the aioredis client used by
+      every push helper.
+
+  docker-compose.yml
+      Runs redis:7-alpine with --notify-keyspace-events Ex so the backend
+      receives notifications when Redis keys expire. Required for the
+      10-minute grace timer.
+
+ANDROID TV (Kotlin)
+--------------------
+
+  DeviceEventStream.kt
+      The SSE client. Maintains the long-lived connection to
+      /api/android/events. Handles all HTTP status codes (401/403/429/5xx),
+      exponential backoff on error, token rotation before every connect,
+      and event dispatch to the bus layer.
+
+  BlueHiveApplication.kt
+      Application class. Initialises DeviceEventStream and registers LockoutBus
+      and SessionExpiredBus listeners at process start. Guards against helper
+      processes (GeckoView's :tab/:gpu/:crashhelper) by checking
+      currentProcessName().
+
+  InactivityWatcher.kt
+      Listens to ProcessLifecycleOwner for app-level foreground/background
+      transitions. Calls POST /api/android/background on home button,
+      POST /api/android/foreground on return.
+
+  LockoutActivity.kt
+      The lockout screen. Handles three distinct reasons:
+        REASON_REVOKED_BY_ADMIN  — hard remove, re-pair required
+        REASON_SESSION_REVOKED   — soft kick, re-enter without re-pairing
+        REASON_WORKSPACE_FULL    — wait for slot_freed then refresh
+
+  LockoutBus.kt
+      In-process event bus. Carries lockout reason from DeviceEventStream to
+      BlueHiveApplication and LockoutActivity. Three constants:
+      REASON_REVOKED_BY_ADMIN, REASON_SESSION_REVOKED, REASON_WORKSPACE_FULL.
+
+  SlotFreedBus.kt
+      In-process event bus. Fires when the server pushes {"event": "slot_freed"}.
+      LockoutActivity subscribes to show the green re-entry hint UI.
+
+  SessionExpiredBus.kt
+      In-process event bus. Fires on hard unpair or definitive auth failure.
+      Routes to LoginScreenActivity with CLEAR_TASK — no back stack, no
+      countdown.
+
+  SessionManager.kt
+      Stores and manages the access token, refresh token, and device
+      fingerprint. clearSession() wipes all credentials and triggers
+      SessionExpiredBus.
+
+  ApiClient.kt
+      OkHttp client factory. Maintains two clients:
+        platformHttpClient — TokenAuthenticator for silent token rotation
+        sseClient          — no authenticator, 90s read timeout, no pooling
+
+  ApiService.kt
+      Retrofit interface. Declares all platform API endpoints including
+      background(), foreground(), endSession(), checkSlot().
+
+  HomeScreenCompose.kt
+      The TV home screen. The ONLY place end-session is triggered —
+      OnBackPressedCallback stops DeviceEventStream and calls
+      POST /api/android/end-session on intentional exit.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  8. STRENGTHS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RELIABILITY
+-----------
+  • Every SSE reconnect is also a status check — missed revocation events
+    during network outages are caught the moment connectivity returns,
+    without any polling.
+
+  • The 10-minute grace timer runs entirely in Redis server-side. Android's
+    Cached App Freezer (which suspends background process threads) cannot
+    affect it — the timer fires with exact wall-clock precision regardless
+    of what happens to the TV process.
+
+  • TCP keepalive tuning (tcp_retries2=5, tcp_keepalive_time=60) reduces dead
+    connection detection from 13-30 minutes to approximately 30 seconds,
+    freeing slots much faster after crashes or unplugged devices.
+
+  • The 7-minute last_seen_at safety net handles every unhandled exit path —
+    crashes, force-stops, power loss — without any special code.
+
+CORRECTNESS
+-----------
+  • is_device_active is owned by exactly four events:
+      Set True:  SSE connect, check-slot
+      Set False: end-session, SSE finally, revoke, remove
+    The keepalive deliberately does not write it, preventing race-resurrection
+    of ended sessions.
+
+  • Hard remove (delete device row) and soft kick (push revoke, set inactive)
+    are distinct code paths with distinct event names (unpaired vs revoked)
+    and distinct client behaviours (pairing screen vs lockout countdown).
+    They cannot be confused.
+
+  • The active_device_gate dependency is the single enforcement point for the
+    6-device cap. check-slot, SSE connect, and every other slot-occupying
+    endpoint run through it.
+
+  • The SSE client has no TokenAuthenticator — it manages its own pre-connect
+    token rotation. This prevents a mid-stream 401 from silently killing the
+    connection.
+
+SIMPLICITY
+----------
+  • Zero polling anywhere in the system. The server pushes when something
+    changes. TVs react.
+
+  • Redis channels are the only coupling between the HTTP response layer
+    (devices.py, sessions.py) and the SSE stream layer. Adding new event
+    types requires publishing to an existing channel — no new infrastructure.
+
+  • The distinction between the device channel (one subscriber max) and
+    workspace channel (all devices on the account) keeps routing logic trivial.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  9. WEAK POINTS & KNOWN RISKS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SINGLE REDIS INSTANCE
+----------------------
+  Risk:
+    The entire event-push system depends on a single Redis instance. If Redis
+    goes down, push_device_event() and push_workspace_event() catch the
+    exception and log a warning — the HTTP response still succeeds and the
+    database commit still happens. But the TV does not receive the event in
+    real time.
+
+  Mitigation:
+    The SSE reconnect path catches missed events (status check on reconnect).
+    For revocations, correctness is preserved — just with higher latency. For
+    slot_freed, the TV will miss the hint and the user must tap Refresh
+    manually. Acceptable at current scale. Redis Sentinel or Cluster would
+    remove this risk at scale.
+
+NO PERSISTENT EVENT LOG
+------------------------
+  Risk:
+    Redis Pub/Sub is fire-and-forget. If a TV is offline and no SSE stream is
+    subscribed when an event is published, the event is gone. The reconnect
+    status check catches revocations, but slot_freed events have no recovery
+    path — a TV that misses slot_freed must tap Refresh manually.
+
+  Mitigation:
+    Redis Streams (XADD/XREAD with consumer groups) would provide a persistent,
+    replayable event log. Not needed at current scale but worth adding before
+    multi-region deployment.
+
+SINGLE BACKGROUND LISTENER TASK
+---------------------------------
+  Risk:
+    The _bg_expiry_listener() task in main.py runs as one asyncio background
+    task per process. If uvicorn is configured with multiple workers, each
+    worker starts its own listener — each keyspace notification is received by
+    all workers, causing multiple simultaneous DB writes for the same grace key
+    expiry. Currently using a single worker so this is dormant.
+
+  Mitigation:
+    Use a Redis distributed lock (SET NX EX) as a guard inside
+    _bg_expiry_listener. Only the first worker to acquire the lock handles the
+    expiry; others skip. Required before scaling to multiple uvicorn workers.
+
+HARDCODED LOCAL IP (Development Only)
+---------------------------------------
+  Risk:
+    PLATFORM_BASE in BuildConfig points to a local LAN address over plain HTTP.
+    Bearer tokens transit in cleartext. Intentional for development but a
+    deployment blocker for production.
+
+  Mitigation:
+    Build flavour separation is already in place (BuildConfig.PLATFORM_BASE).
+    The release build config needs a production HTTPS URL before any public
+    deployment.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  10. EDGE CASES — QUESTIONS & ANSWERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: User switches apps temporarily (home button, notifications)?
+A: App backgrounds. The 10-minute grace timer starts server-side. SSE may
+   close. If the user returns within 10 minutes, POST /api/android/foreground
+   cancels the timer and the slot is preserved. If 10 minutes pass without
+   return, Redis expires the key and the slot is freed.
+
+Q: User swipes the app away (recent apps force-close)?
+A: Process is killed by Android. SSE dies. last_seen_at stops updating. Slot
+   frees after 7 minutes via the inactivity safety net. end-session is not
+   called — there is no reliable hook for force-close.
+
+Q: end-session network call fails on back-button exit?
+A: Fire-and-forget. finish() is called regardless of whether the POST succeeded.
+   Slot frees after 7-minute natural expiry. Not a user-visible failure.
+
+Q: Redis is down when admin revokes?
+A: push_device_event() catches the exception and logs a warning. The database
+   commit already happened. TV catches the revocation on the next SSE reconnect
+   via the status check. Correctness preserved; latency is higher.
+
+Q: TV has no internet when revoked?
+A: Same as above. The reconnect after connectivity returns surfaces the 403
+   (or 404 if the row was deleted). Missed event is always caught on reconnect.
+
+Q: Access token expires while SSE stream is open?
+A: SSE reads the response body — it does not re-authenticate mid-stream. Token
+   expiry does not interrupt the stream. On the next connect (after a network
+   drop), ensureFreshToken() rotates the token proactively before the reconnect
+   attempt.
+
+Q: GeckoView is playing a movie when a lockout fires?
+A: MainWebViewer subscribes to LockoutBus in onCreate. On any lockout event,
+   initiateGracefulShutdown() closes the GeckoSession and releases all media
+   resources before the lockout screen appears.
+
+Q: Multiple /background POSTs from OkHttp retries?
+A: The /api/android/background endpoint checks if a grace key already exists
+   (TTL > 0). If it does, the call is classified as "retry" and the existing
+   TTL is preserved — the timer is not reset. The first call's expiry time is
+   authoritative regardless of how many retries follow.
+
+Q: 6 devices active, kicked device presses Refresh at same time another exits?
+A: active_device_gate runs a DB count query inside a transaction before marking
+   any device active. The first check-slot call that arrives while the count is
+   at 5 succeeds; subsequent simultaneous calls still see 6 and get 429.
+
+
+================================================================================
+  END OF DOCUMENT
+================================================================================

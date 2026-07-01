@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="utf-8"?>
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <!-- FOCUSED STATE - With underglow (no shadow) -->
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <item android:state_focused="true">
+        <layer-list>
+
+            <!-- 3D 2nd layer (keeps your color) -->
+            <item>
+                <inset android:insetBottom="6dp">
+                    <shape android:shape="rectangle">
+                        <solid android:color="#4D4C52" />
+                        <corners android:radius="3dp" />
+                    </shape>
+                </inset>
+            </item>
+
+            <!-- Main button -->
+            <item>
+                <inset android:insetBottom="4.5dp">
+                    <shape android:shape="rectangle">
+                        <solid android:color="#6C6C6C" />
+                        <corners android:radius="3dp" />
+                    </shape>
+                </inset>
+            </item>
+
+        </layer-list>
+    </item>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <!-- PRESSED STATE -->
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <item android:state_pressed="true">
+        <shape android:shape="rectangle">
+            <solid android:color="#07052F" />
+            <corners android:radius="3dp" />
+        </shape>
+    </item>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <!-- NORMAL STATE - With shadow (no underglow) -->
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <item>
+        <layer-list>
+
+            <!-- Shadow Layer (only visible when NOT focused) -->
+            <item>
+                <shape android:shape="rectangle">
+                    <solid android:color="#50000000" />
+                    <corners android:radius="4dp" />
+                </shape>
+            </item>
+
+
+            <!-- 3D 2nd layer (keeps your color) -->
+            <item>
+                <inset android:insetBottom="6dp">
+                    <shape android:shape="rectangle">
+                        <solid android:color="#2E2C37" />
+                        <corners android:radius="3dp" />
+                    </shape>
+                </inset>
+            </item>
+
+            <!-- Main button -->
+            <item>
+                <inset android:insetBottom="4.5dp">
+                    <shape android:shape="rectangle">
+                        <solid android:color="#6C6C6C" />
+                        <corners android:radius="3dp" />
+                    </shape>
+                </inset>
+            </item>
+
+        </layer-list>
+    </item>
+
+</selector>

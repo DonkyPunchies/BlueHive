@@ -1,0 +1,242 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    AndroidManifest.xml — host-model (Phase 2)
+    Entry point: .host.HostEntryActivity only (io.bluehive.host.action.LAUNCH).
+    No LEANBACK_LAUNCHER tile — BlueHive is reachable solely through the host
+    (Off-Grid Drive). LoadingScreenActivity → ProfileScreenActivity → HomeScreenCompose
+    is the internal flow once the host injects a token.
+-->
+<manifest xmlns:tools="http://schemas.android.com/tools"
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    tools:ignore="MissingLeanbackLauncher">
+
+    <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- §7.4 / Rule 8: required so BlueHive can hand a downloaded, sha256-
+         verified APK to PackageInstaller for self-update. One-time user grant
+         ("install unknown apps" toggle for BlueHive), then one confirm dialog
+         per update — unavoidable on sideloaded stock Android. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!-- Lets SpeechRecognizer locate the on-device recognition service on API 30+ -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+        <!-- Allows BlueHive to see + bind to the Off-Grid Drive host service
+             (IBlueHiveHost) on Android 11+. Without this, bindService() to the
+             host silently fails because package visibility is restricted. -->
+        <package android:name="com.offgriddrive.tv" />
+    </queries>
+
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+    <uses-feature
+        android:name="android.software.leanback"
+        android:required="true" />
+
+    <application
+        android:name=".BlueHiveApplication"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:allowBackup="true"
+        android:usesCleartextTraffic="true"
+        android:hardwareAccelerated="true"
+        android:largeHeap="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:banner="@drawable/hive"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.BlueHive">
+
+        <!-- PHASE 2: BlueHive has no independent launcher tile. Identity lives in
+             the host (Off-Grid Drive); BlueHive is only reachable via the host's
+             io.bluehive.host.action.LAUNCH intent (see .host.HostEntryActivity).
+             LoadingScreenActivity is now an internal-only entry point started by
+             HostEntryActivity after the host injects a token, so it's no longer
+             exported and carries no LEANBACK_LAUNCHER category. -->
+        <activity
+            android:name=".LoadingScreenActivity"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.BlueHive" />
+
+
+
+        <!-- BlueHive's host-launch front door. The host (Off-Grid Drive) targets this
+         via io.bluehive.host.action.LAUNCH. exported=true is required because a
+         different app (the host) starts it. NO LEANBACK_LAUNCHER here — this is not
+         a home-screen entry point; it's only reachable via the host intent. -->
+        <activity
+            android:name=".host.HostEntryActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.bluehive.host.action.LAUNCH" />
+                <category android:name="io.bluehive.host.category.COMPANION" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".sidebarComponents.LiveTvScreenActivity"
+            android:exported="false"
+            android:noHistory="true"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.BlueHive" />
+
+        <activity
+            android:name=".ProfileManageActivity"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.BlueHive" />
+
+        <activity
+            android:name="com.example.bluehive.catalog.MediaCatalogActivity"
+            android:exported="false"
+            android:theme="@style/Theme.BlueHive" />
+
+
+        <!--
+            Workspace lockout screen — shown when the 6-active device cap is hit.
+            Launched from BlueHiveApplication's LockoutBus listener with
+            FLAG_NEW_TASK | FLAG_CLEAR_TASK whenever any platform API call
+            returns 429. See LockoutActivity.kt for the full flow.
+        -->
+
+
+        <!-- ExoPlayer screen — MAIN process, full-screen. Plays the m3u8. -->
+        <activity
+            android:name=".webview.miruro.MiruroPlayerActivity"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize|keyboardHidden|navigation" />
+
+        <!-- Headless extractor — its OWN process, translucent, kills itself when done. -->
+        <activity
+            android:name=".webview.miruro.MiruroExtractorActivity"
+            android:exported="false"
+            android:process=":extractor"
+            android:screenOrientation="landscape"
+            android:excludeFromRecents="true"
+            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|uiMode"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+
+
+        <activity
+            android:name=".webview.cinesrc.CineSrcExtractorActivity"
+            android:exported="false"
+            android:process=":cineextractor"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <activity
+            android:name=".webview.cinesrc.CineSrcPlayerActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
+
+
+        <activity
+            android:name=".LockoutActivity"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.BlueHive" />
+
+        <activity
+            android:name=".searchBarComponent.SearchBarActivity"
+            android:exported="false"
+            android:noHistory="true"
+            android:screenOrientation="landscape"
+            android:windowSoftInputMode="adjustNothing"
+            android:theme="@style/Theme.BlueHive" />
+
+        <!-- Profile picker (shown after login, every launch) -->
+        <activity
+            android:name=".ProfileScreenActivity"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.BlueHive" />
+
+        <!-- Profile creation (opened from ProfileScreen's create button) -->
+        <activity
+            android:name=".ProfileCreationActivity"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:windowSoftInputMode="adjustNothing"
+            android:theme="@style/Theme.BlueHive" />
+
+        <activity
+            android:name=".sidebarComponents.HistoryScreenActivity"
+            android:exported="false"
+            android:noHistory="true"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.BlueHive" />
+
+        <activity
+            android:name=".sidebarComponents.FavoritesScreenActivity"
+            android:exported="false"
+            android:noHistory="true"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.BlueHive" />
+
+        <!-- Home screen (reached after profile is selected) -->
+        <!-- AFTER -->
+        <activity
+            android:name=".HomeScreenCompose"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:windowSoftInputMode="adjustNothing" />
+
+        <activity
+            android:name=".MoviesDetailsScreenCompose"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.BlueHive" />
+
+        <activity
+            android:name=".TVShowsDetailsScreenCompose"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.BlueHive" />
+
+        <activity
+            android:name=".webview.MainWebViewer"
+            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize"
+            android:screenOrientation="landscape"
+            android:noHistory="true"
+            android:launchMode="singleTask"
+            android:taskAffinity="com.example.bluehive.video"
+            android:excludeFromRecents="false"
+            android:exported="false"/>
+
+        <!-- Self-update (#5): receives PackageInstaller status callbacks.
+             exported=false — only our own PendingIntent targets it. -->
+        <receiver
+            android:name=".update.SelfUpdateInstallReceiver"
+            android:exported="false" />
+
+        <!-- Self-update (#5): the in-app "Updating BlueHive" screen shown at cold
+             start when a newer version exists, before the app opens. -->
+        <activity
+            android:name=".update.SelfUpdateActivity"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.BlueHive" />
+
+        <!-- Self-update (#5): auto-relaunch after the app is replaced. -->
+        <receiver
+            android:name=".update.PackageReplacedReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+
+</manifest>

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@drawable/titlecard_focused"
+    android:insetTop="8.5dp"
+    android:insetBottom="23.5dp"
+    android:insetLeft="-7.9dp"
+    android:insetRight="-7.4dp" />

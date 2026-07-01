@@ -1,0 +1,91 @@
+
+How to use  Android Studio's APK Analyzer
+
+Here's exactly where to click:
+
+1. Click "Build" in the top menu bar (between "Refactor" and "Run")
+2. Hover over "Generate app  bundles or apk's"
+3. Click "Generate APK(s)" from the submenu that appears
+4. click analyze when it pops up
+
+
+adb connect 192.168.1.74:5555  ----- > onn box
+./gradlew assembleRelease
+adb install app\build\outputs\apk\release\app-release.apk
+
+
+adb connect 192.168.1.225:5555  ----- > fire tv
+./gradlew assembleRelease; if ($LASTEXITCODE -eq 0) { adb install -r app\build\outputs\apk\release\app-release.apk }
+
+
+
+
+
+            hard uninstall old code version from the onn box:
+            adb -s 192.168.1.74:5555 uninstall com.example.bluehive
+
+            hard install if the bluehive companion app isn't installed on OGD:
+            adb -s 192.168.1.74:5555 install -r app\build\outputs\apk\release\app-release.apk
+
+            check what version the companion app is on:
+            adb -s 192.168.1.74:5555 shell dumpsys package com.example.bluehive | findstr versionCode
+
+            To install updated code:
+            1.  .\gradlew assembleRelease
+            2.  cd C:\DevProjects\bluehive-backend\bluehive-updates
+            3.  .\release.ps1 -ReleaseNotes "<Name of update>"
+
+
+
+
+
+
+
+
+
+Track datta through commands
+
+1. open git bash
+2. enter:
+        while true; do
+           clear
+           echo "=== BlueHive Memory Stats ==="
+           adb shell dumpsys meminfo com.example.bluehive | grep -E "TOTAL|Native|Graphics|Dalvik"
+           sleep 2
+         done
+
+
+
+
+
+Layer	                                               Purpose	                                                                                    Thread Context
+===================================================================================================================================================================================
+UI / RecyclerView binding	                           Shows visible posters (posterImageView.load())	                                            Main thread (UI)
+Preloading system	                                   Decodes & caches off-screen posters	                                                        Background (Dispatchers.IO)
+Coil’s internal threads	                               Network fetch, decode, and transform	                                                        Coil’s own I/O + decode thread pools
+
+
+
+[Main Thread] ──► RecyclerView binds
+                 │
+                 ├─► posterImageView.load() → Coil (background fetch + decode) → back to main to draw
+                 │
+                 └─► emits focus position → preloadThrottle
+
+[Dispatchers.IO] ──► debounce(400ms) → preloadRange()
+                     │
+                     └─► Coil.enqueue(bgRequest) → decode + cache (stays here)
+
+
+
+
+
+
+
+
+
+To see how much ram my app consumes:
+    - adb shell dumpsys meminfo com.example.bluehive
+
+
+

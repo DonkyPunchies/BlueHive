@@ -1,0 +1,54 @@
+TrailerAdapter → TrailerNavigation → StreamResolver (NewPipe) → Video Overlay (View/Compose) → ExoPlayer
+    (UI)            (Controller)          (Extractor)             (Player UI)        (Playback)
+
+
+
+     DownloaderImpl:
+     DownloaderImpl extends NewPipe’s Downloader and translates NewPipe “extractor requests” into real OkHttp calls.
+     It also injects “more legit” headers (desktop Chrome UA, language, consent cookie, no-cache). If it detects rate-limit/captcha
+     signals (HTTP 429 or “captcha” in body), it throws a ReCaptchaException so your extraction flow can fail fast instead of hanging.
+
+     NewPipeExtractorViewer:
+     1. Calls NewPipe.init(getDownloader()) in initialize() so NewPipe will use your DownloaderImpl for its extraction HTTP traffic.
+     2. Inflates an overlay layout containing a Media3 PlayerView, positions it over your UI, hides it by default, and adds it to parentView so it can sit on top of Compose.
+     3. On showTrailer(), it makes the overlay visible, brings it to front, and blocks focus from going back to Compose while the video is up.
+
+
+
+     DownloaderImpl.kt:
+     -  Persistent cookies (step 6): Added an in-file PersistentCookieJar that stores expiry-based cookies in SharedPreferences and reloads them on app restart.
+        This helps with YouTube consent/session continuity so NewPipe extraction gets blocked less often.
+
+     -  No static Cookie header: The interceptor does not inject any Cookie: header—cookies are managed by the jar (more realistic, fewer conflicts).
+
+     -  Unified User-Agent + sane defaults: Ensures User-Agent, Accept-Language, Accept, and conservative cache headers are always present so extraction behaves consistently.
+
+     -  More specific block/captcha detection: Replaced naive "captcha" substring checks with stronger signals: 429, /sorry/, consent.youtube.com, plus real
+        recaptcha/unusual-traffic HTML markers (only when content-type is HTML).
+
+     -  Response always closes (step 1): Changed network execution to execute().use { response -> ... } so the OkHttp Response is always closed (prevents
+        leaks / connection pool exhaustion / “random hangs” after many requests).
+
+     -  Exposes OkHttpClient: Added okHttpClient() so playback can reuse the same client (cookies/UA/redirect behavior) as extraction.
+
+
+     NewPipeExtractorViewer.kt (View overlay):
+     -  Removed reflection: Instead of Class.forName(...) to find OkHttpDataSource, it directly uses:
+        OkHttpDataSource.Factory(getDownloader().okHttpClient())
+
+     -  Playback matches extraction: ExoPlayer uses the same OkHttp client (and default headers) as NewPipe extraction → fewer cases where extraction works but playback 403’s.
+
+     -  Correct Media3 wiring: Uses DefaultMediaSourceFactory(context).setDataSourceFactory(...) which is the reliable way in Media3 to apply your datasource factory.
+
+     -  Everything else (layout inflate, sizing, focus blocking, key handling) stays basically the same, but now networking is consistent.
+
+
+     HomeScreenTrailerVideoOverlayCompose.kt (Compose overlay):
+     -  Removed reflection: Same change—uses OkHttpDataSource.Factory(...) directly.
+
+     -  Fixed MediaSourceFactory creation: Uses DefaultMediaSourceFactory(context).setDataSourceFactory(...) so the datasource is actually used correctly
+        (avoids subtle “still using default HTTP stack” issues).
+
+     -  Key handling improvement: Stops swallowing every key (else -> false), so system/volume/etc. can bubble when appropriate.
+
+     -  Keeps your existing flow: resolve URL via NewPipe, then play via ExoPlayer.

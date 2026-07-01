@@ -1,0 +1,68 @@
+
+
+graph TD
+    A[App Startup] --> B[BlueHiveApplication.onCreate]
+    B --> C[GeckoWebViewManager.initialize]
+    C --> D[GeckoRuntime Created Once]
+    D --> E[uBlock Origin Installed]
+
+    F[User Selects Video] --> G[DetailsScreen]
+    G --> H[MainWebViewer Created]
+    H --> I[Request Fresh Session]
+    I --> J[GeckoWebViewManager.getSession]
+    J --> K[Create New GeckoSession]
+    K --> L[Attach to GeckoView]
+    L --> M[Load Streaming URL]
+
+    N[User Exits Video] --> O[MainWebViewer.onDestroy]
+    O --> P[cleanup Called]
+    P --> Q[GeckoWebViewManager.cleanupSession]
+    Q --> R[Session Closed & Destroyed]
+
+    S[User Opens Trailer] --> T[TrailerNavigation]
+    T --> U[Creates Its Own GeckoSession]
+    U --> V[Separate from MainWebViewer]
+
+    style D fill:#90EE90
+    style K fill:#FFB6C1
+    style R fill:#FFB6C1
+
+
+
+
+    📋 Key Points:
+    One Runtime, Many Sessions
+
+    GeckoRuntime: Created ONCE at app startup, shared by entire app
+    GeckoSessions: Created fresh for each video, completely destroyed when done
+
+    What Happens When You Navigate:
+
+    Select Video → New MainWebViewer activity → Fresh GeckoSession created
+    Exit Video → Activity destroyed → Session completely closed (not reused)
+    Select Another Video → Brand new MainWebViewer → Brand new GeckoSession
+    No URL changes within same session - each video gets its own isolated session
+
+    Trailer Section Independence:
+    MainWebViewer Session (Video)     TrailerNavigation Session (YouTube)
+             │                                    │
+             ├── Isolated                         ├── Isolated
+             ├── Own cookies                      ├── Own cookies
+             └── Destroyed on exit                └── Destroyed on exit
+    Session Lifecycle:
+    CREATE → ATTACH → LOAD URL → USER WATCHES → DESTROY
+      ↑                                            ↓
+      └────────────── No Reuse ───────────────────┘
+    Memory Impact:
+
+    Before (Pooling): 3 sessions kept alive, reused, potential contamination
+    Now (Fresh): 0 idle sessions, each video gets clean slate, no contamination
+
+    Why This Works Better for Streaming Sites:
+
+    Each video load looks like a "first visit" to anti-bot systems
+    No cookies/state carried between videos
+    No detection of "unusual" navigation patterns
+    Clean JavaScript environment every time
+
+    The webview doesn't "restart" with URL changes because you don't change URLs within a session - you create a new session for each video. This is why you're not seeing white screens anymore - no contaminated state!

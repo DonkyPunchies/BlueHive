@@ -1,0 +1,150 @@
+
+
+RecommendedMediaSection
+=================================================
+Overall: for 20 items you’re in a very safe zone. Nothing here is “oh god this will blow up RAM”. Most of your patterns are already good:
+- LazyRow = virtualized list → only visible items are composed
+- rememberLazyListState() → scroll & prefetch handled efficiently
+- remember(...) around releaseDateText, runTimeText, rating → avoids recalculating every recomposition
+
+UI side (LazyRow behavior) works like a RecyclerView:
+- It only composes items that are visible in the viewport + a small prefetch buffer.
+- in the recommended media lazy row, we have a width of about 870.dp, Each card column is ~112dp + 2dp spacing So you see maybe 7–8 items at once.
+- As you scroll horizontally: Items leaving the left side are disposed (their composable subtree is removed).
+- New items entering from the right are composed on demand.
+- So out of 20 recommendations: At any given time, maybe 8–10 items actually exist as UI. The rest are just entries in the list, waiting to be composed if you scroll.
+- That’s the most memory-efficient you’re going to get while still having smooth scrolling. This is already the “optimized procedure” — Compose’s lazy list system is the optimized approach for speed/memory.
+
+
+1. Big Picture: How navigation through recommendations works
+When you’re on a movie’s details screen and start navigating through Recommended Media:
+You start on a MoviesDetailsScreenCompose instance for some MediaItem (call it Movie A).
+When you toggle Extras → Recommended Media, the RecommendedMediaSection composable shows a horizontal LazyRow of MediaItem cards.
+When you click a recommended item (say Movie B):
+RecommendedMediaSection calls its onMediaClick(media) callback.
+That flows up into MoviesDetailsScreenContent, which calls MoviesDetailsScreenCompose.openMediaDetails(media).
+openMediaDetails:
+Pushes the new MediaItem into the global details history stack in BlueHiveApplication.
+Starts a new MoviesDetailsScreenCompose Activity with Movie B’s data in the intent.
+Immediately finish()es the current Activity so there’s only ever one details Activity alive.
+When the user presses Back:
+The Activity’s OnBackPressedCallback asks BlueHiveApplication for the previous item on the history stack.
+If there is a previous MediaItem (Movie A, Movie C, etc.), it starts a fresh MoviesDetailsScreenCompose for that item and finishes the current one.
+If there is no previous item, it just finishes and returns to Home.
+So the Activity layer itself is always “one screen at a time,” and the cross-movie navigation history is stored globally in the Application object.
+
+2. BlueHiveApplication: global history + state
+BlueHiveApplication is doing more than Coil and Gecko init – it also owns a bounded details history stack:
+History is stored as:
+private val detailsHistory: ArrayDeque<MediaItem>
+with a max size of MAX_DETAILS_HISTORY = 8.
+When you navigate into a details screen for a given MediaItem, the code calls:
+app.pushDetailsHistory(media)
+
+This:
+Skips pushing if the last entry already has the same tmdbId (no duplicate screen spam).
+Adds the new item to the tail of the deque.
+If the size > 8, it removeFirst() and logs which title got evicted.
+Logs a human–readable stack like:
+📂 Stack [push]: The Batman → Dune → Spider-Man: No Way Home
+When you hit Back on the details screen, the Activity calls:
+val previous = app.popPreviousDetails()
+
+This:
+Pops the current item (last entry).
+Returns the new last entry (previous movie), or null if history is now empty.
+Logs what you backed out from and what’s now on top.
+clearDetailsHistory() is used when you’re about to leave the details flow completely (e.g., launching the Gecko WebViewer to actually stream something). This wipes the stack so Back from playback doesn’t try to return through old detail screens.
+There’s also app-wide AppState (HOME_ACTIVE, DETAILS_VIEWING, VIDEO_PLAYING, TRAILER_PLAYING) and a listener system so other components can react to state changes, but the key bit for navigation is the history stack.
+
+3. MoviesDetailsScreenCompose: one Activity, many movies
+MoviesDetailsScreenCompose is the details Activity. Its job, navigation-wise:
+3.1. Opening details for a MediaItem
+The function:
+fun openMediaDetails(media: MediaItem)
+does three things:
+Fetches the BlueHiveApplication instance and calls app.pushDetailsHistory(media).
+Builds an Intent for MoviesDetailsScreenCompose and copies all relevant fields from the MediaItem into extras (id, title, images, ratings, genres, etc.).
+Calls startActivity(intent) and then finish() the current details Activity, so we never stack multiple details Activities on the Android back stack.
+Result: navigation between movies happens by reusing the same Activity class with different extras, and the logical sequence of visited movies is tracked by the Application’s detailsHistory.
+
+3.2. Handling Back (TV remote / system back)
+In onCreate, the Activity registers an OnBackPressedCallback:
+Plays the “back out” sound via BlueHiveApplication.playBackOutSound().
+Calls popPreviousDetails() on the Application.
+If there’s no previous item:
+Finish the Activity → user goes back to Home.
+If there is a previous item:
+Build a new Intent for MoviesDetailsScreenCompose with that previous MediaItem’s data.
+startActivity(intent) and finish() the current one.
+This gives you a manual “movie back stack” that is independent of the OS Activity stack, and bounded at 8 entries for memory reasons.
+
+3.3. Starting playback and resetting history
+When the user picks a streaming source (VidFast, etc.):
+handleStreamingSourceSelected is called.
+It logs and then calls:
+(application as BlueHiveApplication).apply {
+    clearDetailsHistory()
+    setAppState(AppState.VIDEO_PLAYING)
+}
+
+Then it launches MainWebViewer with all the extras needed to play the content.
+So once the user has committed to streaming, the details history is wiped and the app state becomes VIDEO_PLAYING.
+
+4. RecommendedMediaSection: the LazyRow and focus behavior
+RecommendedMediaSection is a composable used inside MoviesDetailsScreenContent when the Extras button is toggled into “Extras → Recommended”.
+It renders a LazyRow of MediaItem cards with:
+fun RecommendedMediaSection(
+    recommendations: List<MediaItem>,
+    fontFamily: FontFamily,
+    onMediaClick: (MediaItem) -> Unit,
+    onNavigateUp: () -> Unit,
+    modifier: Modifier = Modifier
+)
+
+Focus / navigation:
+Left/Right: moves focus between cards and plays a navigation sound via BlueHiveApplication.playTitleCardNavigation().
+Up: calls onNavigateUp() so the parent can move focus back to the Extras button.
+Back (remote back key):
+It doesn’t just clear focus – it forwards back to the Activity:
+activity?.onBackPressedDispatcher?.onBackPressed()
+This ensures the same OnBackPressedCallback in MoviesDetailsScreenCompose runs, so back from a focused card still goes through the details history logic.
+Select/Enter on a card:
+Plays a pop sound via BlueHiveApplication.playClickSound().
+Invokes onMediaClick(mediaItem).
+The composable itself does not know about history or Activities. It just exposes hooks (onMediaClick, onNavigateUp) and uses BlueHiveApplication only for sound effects.
+
+5. How multiple navigations actually play out
+Concrete example to refresh your brain later:
+From Home, you open Movie A details (some other code pushes A into history and launches MoviesDetailsScreenCompose).
+On Movie A:
+You toggle Extras → Recommended Media.
+You select Movie B in the LazyRow.
+RecommendedMediaSection calls onMediaClick(B) → MoviesDetailsScreenContent → MoviesDetailsScreenCompose.openMediaDetails(B):
+Application history now looks like: [Movie A, Movie B].
+New details Activity shows Movie B, previous Activity is finished.
+On Movie B, you select Movie C:
+History: [Movie A, Movie B, Movie C].
+New Activity shows Movie C.
+You press Back on Movie C:
+popPreviousDetails() pops C and returns B.
+New Activity shows Movie B again.
+Press Back again:
+Pops B, previous = A → show Movie A.
+Press Back again:
+History empty → finish details → back to Home.
+At all times there is only one MoviesDetailsScreenCompose instance in the Activity stack, but the logical navigation sequence is preserved in BlueHiveApplication.detailsHistory.
+
+6. Things to remember if you change this later
+When you’re editing this months from now, keep these invariants in mind:
+If you add any new entry points to the details screen, make sure they:
+Call pushDetailsHistory(media) on the BlueHiveApplication for the item being opened.
+Start MoviesDetailsScreenCompose and (optionally) finish the previous details Activity if you want to keep the “1 details Activity at a time” rule.
+If you change back behavior, you MUST:
+Keep OnBackPressedCallback in sync with the history logic.
+Ensure that any Composable handling the Back key (like RecommendedMediaSection) forwards it to onBackPressedDispatcher so you don’t bypass the history stack.
+If you change the max history size, adjust MAX_DETAILS_HISTORY in BlueHiveApplication and be aware of memory tradeoffs.
+This is the mental model that makes all the recommended-media navigation “just work” without relying on the OS Activity back stack.
+
+RecommendedMediaCard
+=================================================

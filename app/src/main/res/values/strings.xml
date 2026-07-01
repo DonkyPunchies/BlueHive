@@ -1,0 +1,38 @@
+<resources>
+    <string name="app_name">BlueHive</string>
+    <string name="browse_title">Videos by Your Company</string>
+    <string name="related_movies">Related Videos</string>
+    <string name="grid_view">Grid View</string>
+    <string name="error_fragment">Error Fragment</string>
+    <string name="personal_settings">Personal Settings</string>
+    <string name="watch_trailer_1">Watch trailer</string>
+    <string name="watch_trailer_2">FREE</string>
+    <string name="rent_1">Rent By Day</string>
+    <string name="rent_2">From $1.99</string>
+    <string name="buy_1">Buy and Own</string>
+    <string name="buy_2">AT $9.99</string>
+    <string name="movie">Movie</string>
+
+    <!-- Error messages -->
+    <string name="error_fragment_message">An error occurred</string>
+    <string name="dismiss_error">Dismiss</string>
+    <string name="play">Play</string>
+
+    <string name="VidEasy">VidEasy</string>
+    <string name="OneOneOneMovies">111Movies</string>
+    <string name="fmovies">fmovies</string>
+    <string name="watch.moviestv.my">watch.moviestv.my</string>
+    <string name="www.wcostream.tv">wcostream.tv</string>
+    <string name="profile_button">Profile button</string>
+
+    <string name="settings_button">settings button</string>
+    <string name="favourite_button">favourite button</string>
+    <string name="livetv_button">livetv button</string>
+    <string name="changelog_button">changelog button</string>
+    <string name="history_button">history button</string>
+    <string name="reboot_button">reboot button</string>
+
+    <string name="search_default_text">Search for your desired content</string>
+    <string name="trailer_poster">Movie trailer poster</string>
+
+</resources>

@@ -1,0 +1,1230 @@
+================================================================================
+  BLUEHIVE — NETFLIX ROW PERSONALIZATION ARCHITECTURE
+  Full Technical Documentation — Frontend & Backend
+================================================================================
+
+Last updated: June 2026
+Database: bluehivemetadata (PostgreSQL 17)
+Backend containers: streaming-backend-bluehive-api-1 (port 8000, TMDB/media)
+                    platform-backend-platform-api-1  (port 9000, auth/profiles)
+Android: Jetpack Compose, Kotlin, Retrofit + OkHttp, Coil
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 1 — OVERVIEW
+────────────────────────────────────────────────────────────────────────────────
+
+The Netflix row is a horizontally scrollable lazy row on the home screen that
+shows content available on Netflix, ordered by a personalized ranking algorithm
+unique to each user profile. It is NOT the same list for everyone.
+
+The ranking is a 4-layer multiplicative score:
+
+  final_score = quality_score × decay × platform_boost × profile_weight
+
+Each layer is described in full in Section 3.
+
+The row uses a 65/35 exploitation/exploration blend:
+  - 65% of cards are the highest-ranked items for this profile's taste.
+  - 35% of cards are deliberately from genres the profile hasn't explored,
+    sorted purely by quality × recency — horizon-broadening picks.
+  - The two streams are interleaved so discovery cards are distributed evenly
+    throughout the row, not clustered at the end.
+
+The system handles cold-start profiles (no watch history yet) by falling back
+to a latest_release sort when no genre weights exist, avoiding a meaningless
+blend that would return the same items on both streams.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 2 — HIGH-LEVEL ARCHITECTURE DIAGRAM
+────────────────────────────────────────────────────────────────────────────────
+
+COLD START (app opens):
+
+  LoadingScreenActivity
+    └── AppWarmup.run()
+          ├── Step 1: getMe() — token prime (blocks all other calls)
+          ├── Step 2: [parallel] TrendingRepository.getTrending()
+          │                      TrailerRepository.getLatestTrailers()
+          │                      platformApi.listProfiles()
+          │                      ShelfRepository.loadPage(NETFLIX, MOVIES, profileId=warmProfileId)  ← new
+          │                      ShelfRepository.loadPage(NETFLIX, TV_SHOWS, profileId=warmProfileId) ← new
+          ├── Step 3: Await all — store in BlueHiveApplication.HomeScreenPrefetch
+          └── Step 4: warmFirstPaintImages() — prime Coil image cache
+    └── Navigate to ProfileScreenActivity (when warmup finishes, not on a timer)
+
+PROFILE SELECTION:
+
+  ProfileScreenActivity
+    └── ProfileCard.onClick()
+          └── goHome(profileId, displayName, avatarResId)
+                ├── SessionManager.get().setLastProfileId(profileId)  ← persists for next cold start
+                └── startActivity(HomeScreenCompose, PROFILE_ID=profileId)
+
+HOME SCREEN LOAD:
+
+  HomeScreenCompose
+    └── ShelfStack(mediaType=MOVIES, profileId=profileId)
+          └── ShelfRowContent(shelf=NETFLIX)
+                ├── LaunchedEffect(Unit):
+                │     consumeNetflixMoviesPrefetch(profileId)  ← instant if warmup hit
+                │     else: repository.loadPage(NETFLIX, page=0, profileId=profileId)
+                ├── items.isNotEmpty() → onFirstPageReady() → showEntryTransition = false
+                └── TvWideLazyRow renders title cards
+
+NETFLIX DATA REQUEST (live, when prefetch missed or scrolling to page 2+):
+
+  MediaRecyclerViewData.loadNetflixMovies(page, profileId)
+    └── loadProviderGroupMedia(NETFLIX_GROUP, "movie", sortBy="personalized", profileId)
+          └── GET /api/provider-groups/netflix/media
+                ?media_type=movie&limit=20&offset=N&sort_by=personalized&profile_id=25
+              → TMDB_Api_Server.py: get_media_by_provider_group()
+                    ├── has_weights check (cold-start guard)
+                    ├── _fetch_personalized_rows() — 13 items by final_score
+                    ├── _fetch_discovery_rows()    — 7 items from unexplored genres
+                    └── _interleave_rows()         — distribute evenly
+
+NIGHTLY WEIGHTS (2:00 AM):
+
+  main.py: _genre_weight_loop()
+    └── run_genre_weight_job()  (genre_weights.py)
+          └── TRUNCATE + INSERT bluehive.profile_genre_weights
+                using 5-CTE query reading bluehive.watch_history + bluehive.favorites
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 3 — THE SCORING SYSTEM
+────────────────────────────────────────────────────────────────────────────────
+
+  final_score = quality_score × decay × platform_boost × profile_weight
+
+3.1  LAYER 1: quality_score  (stored, date-independent)
+─────────────────────────────────────────────────────────
+Column:   public.media_items.quality_score  (DOUBLE PRECISION)
+Formula:  vote_average × LEAST(vote_count / 1000.0, 1.0)
+Range:    0 to ~10
+
+The second factor is a vote-credibility cap. A 9.0-rated film with 500 votes
+gets credibility 0.5, quality_score = 4.5. The same rating with 2000 votes
+gets credibility 1.0, quality_score = 9.0. This stops obscure high-rated niche
+titles from dominating over well-established content.
+
+When computed:   At scrape time and on every subsequent upsert.
+File:            TMDB_Media_Metadata.py
+                 — in the ON CONFLICT DO UPDATE SET clause of both the
+                   movie and TV media_items upserts:
+                   quality_score = COALESCE(EXCLUDED.vote_average, 0) *
+                                   LEAST(COALESCE(EXCLUDED.vote_count, 0)::double
+                                         precision / 1000.0, 1.0)
+Index:           idx_media_items_type_quality
+                 ON public.media_items (media_type, quality_score DESC NULLS LAST)
+
+
+3.2  LAYER 2: decay  (computed live per request)
+─────────────────────────────────────────────────
+Formula:  1.0 / log2(days_since_latest_release + 2)
+          = 1.0 / (ln(days + 2) / ln(2.0))
+NULL:     If latest_release_at IS NULL → constant 0.05 (sinks but stays ranked)
+Range:    0 to ~1.44 (briefly >1 for brand-new content due to log behavior)
+
+"latest_release_at" is the authoritative recency date:
+  - Movies: release_date column.
+  - TV shows: MAX(air_date) across all aired episodes.
+
+The log2 function gives a slow, graceful decay. Content loses half its decay
+contribution roughly every 2x in age — a year-old show still competes with new
+content on quality, it just gets a smaller boost from recency.
+
+Where stored: public.media_items.latest_release_at (DATE)
+When updated:
+  - On every TV episode batch write in TMDB_Media_Metadata.py:
+      UPDATE media_items
+      SET latest_release_at = (
+          SELECT MAX(e.air_date) FROM tv_episodes e
+          JOIN tv_seasons s ON s.season_id = e.season_id
+          WHERE s.media_id = media_items.media_id
+            AND e.air_date <= CURRENT_DATE
+      )
+      WHERE media_id = <id>
+  - Movie latest_release_at = release_date, set at insert/upsert time.
+Index:    idx_media_items_type_release
+          ON public.media_items (media_type, latest_release_at DESC NULLS LAST)
+
+
+3.3  LAYER 3: platform_boost  (computed live per request)
+──────────────────────────────────────────────────────────
+Value:    1.5 if recently licensed (newly arrived on platform), else 1.0
+Condition (all must be true):
+  - provider_first_seen.first_seen_at IS NOT NULL
+  - provider_first_seen.first_seen_at > (latest_release_at + 30 days)
+     (licensed more than 30 days after original release — indicates post-release
+      licensing, the "new to Netflix" pattern)
+  - provider_first_seen.first_seen_at >= (CURRENT_DATE - 90 days)
+     (arrived within the last 90 days — still "new")
+
+The 1.5× boost rewards titles that recently came to the platform, independent
+of when they were originally released.
+
+Where stored: public.provider_first_seen (media_id, provider_id, first_seen_at)
+              This table is append-only (INSERT ... ON CONFLICT DO NOTHING).
+              Once a first_seen_at is recorded it never changes.
+When populated:
+  TMDB_Media_Metadata.py — batch_update_watch_providers():
+      INSERT INTO provider_first_seen (media_id, provider_id, first_seen_at)
+      SELECT wp.media_id, wp.provider_id, COALESCE(m.release_date, CURRENT_DATE)
+      FROM watch_providers wp
+      JOIN media_items m ON m.media_id = wp.media_id
+      ON CONFLICT (media_id, provider_id) DO NOTHING
+
+Note: The initial backfill set first_seen_at = release_date for all existing
+content. This means the boost is effectively dormant on the existing catalog —
+it will only fire for content added to provider groups AFTER deployment. This
+is intentional: no false "new to platform" boosts for catalog content that has
+been on Netflix for years.
+
+Index:    idx_provider_first_seen_provider
+          ON public.provider_first_seen (provider_id, media_id)
+
+
+3.4  LAYER 4: profile_weight  (from nightly job, per-profile)
+───────────────────────────────────────────────────────────────
+Value:    AVG(weight) across all genres this media item belongs to
+          Falls back to 1.0 if the profile has no genre weights or the item
+          has no matching genre weights.
+Range:    1.0 (no preference) to WEIGHT_CAP = 4.0 (strong preference)
+
+A media item has multiple genres. The endpoint looks up each genre's weight
+for the requesting profile and averages them. A horror-thriller film for a
+horror-loving profile might get (3.8 + 3.2) / 2 = 3.5× multiplier. An
+unexplored genre stays at 1.0.
+
+Where stored: bluehive.profile_genre_weights
+              (profile_id, genre_id, weight, watch_seconds, updated_at)
+              Primary key: (profile_id, genre_id)
+When updated: Nightly at 2 AM — full TRUNCATE + INSERT rebuild.
+              See Section 5 for the full nightly job details.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 4 — DATABASE TABLES INVOLVED
+────────────────────────────────────────────────────────────────────────────────
+
+All tables are in the bluehivemetadata database.
+"public" schema = media catalog data (owned by TMDB server)
+"bluehive" schema = user/profile data (owned by platform server)
+
+public.media_items
+  media_id            SERIAL PRIMARY KEY
+  tmdb_id             INTEGER NOT NULL
+  media_type          VARCHAR(10) NOT NULL          ('movie' | 'tv')
+  title               TEXT
+  poster_path         TEXT
+  backdrop_path       TEXT
+  logos               JSONB
+  overview            TEXT
+  release_date        DATE
+  latest_release_at   DATE                          ← Layer 2 decay input
+  vote_average        DOUBLE PRECISION
+  vote_count          INTEGER
+  popularity          DOUBLE PRECISION
+  quality_score       DOUBLE PRECISION              ← Layer 1 scoring
+  runtime             INTEGER
+  status              TEXT
+  content_rating      TEXT
+  original_language   VARCHAR(10)
+  budget              BIGINT
+  revenue             BIGINT
+  number_of_seasons   INTEGER
+  number_of_episodes  INTEGER
+  last_season_count   INTEGER
+  youtube_trailer_url TEXT
+  media_sourcepage_url TEXT
+  created_at          TIMESTAMP WITH TIME ZONE
+  updated_at          TIMESTAMP WITH TIME ZONE
+
+public.provider_first_seen                         ← Layer 3 platform boost
+  media_id      INTEGER NOT NULL  (FK → media_items)
+  provider_id   INTEGER NOT NULL
+  first_seen_at DATE NOT NULL DEFAULT CURRENT_DATE
+  PRIMARY KEY (media_id, provider_id)
+
+public.watch_providers
+  media_id        INTEGER NOT NULL
+  provider_id     INTEGER NOT NULL
+  provider_name   TEXT
+  logo_path       TEXT
+  provider_type   TEXT
+  display_priority INTEGER
+
+public.provider_groups
+  group_id    SERIAL PRIMARY KEY
+  group_slug  TEXT UNIQUE          ('netflix', 'prime_video', etc.)
+  group_name  TEXT
+
+public.provider_group_members
+  group_id    INTEGER (FK → provider_groups)
+  provider_id INTEGER
+  priority    INTEGER
+  PRIMARY KEY (group_id, provider_id)
+
+public.media_genres
+  media_id  INTEGER (FK → media_items)
+  genre_id  INTEGER (FK → genres)
+
+public.genres
+  genre_id  SERIAL PRIMARY KEY
+  name      TEXT
+
+bluehive.profile_genre_weights                    ← Layer 4 personalization
+  profile_id    INTEGER NOT NULL (FK → bluehive.profiles, CASCADE DELETE)
+  genre_id      INTEGER NOT NULL
+  weight        REAL NOT NULL DEFAULT 1.0
+  watch_seconds BIGINT NOT NULL DEFAULT 0
+  updated_at    TIMESTAMP WITH TIME ZONE DEFAULT now()
+  PRIMARY KEY (profile_id, genre_id)
+
+bluehive.watch_history                            ← source for nightly job
+  id              SERIAL PRIMARY KEY
+  profile_id      INTEGER NOT NULL (FK → profiles, CASCADE)
+  device_id       INTEGER (FK → devices, SET NULL)
+  media_tmdb_id   INTEGER NOT NULL
+  media_type      VARCHAR(10) NOT NULL
+  season_number   SMALLINT
+  episode_number  SMALLINT
+  watched_at      TIMESTAMP WITH TIME ZONE DEFAULT now()
+  progress_seconds INTEGER NOT NULL DEFAULT 0
+  stopped_at      TIMESTAMP WITH TIME ZONE         ← session end time
+  media_title     VARCHAR(500)
+  episode_name    VARCHAR(500)
+  source_name     VARCHAR(255)                     (e.g. "VidFast", "VidEasy")
+
+bluehive.favorites                                ← bonus credit in nightly job
+  profile_id    INTEGER NOT NULL
+  media_tmdb_id INTEGER NOT NULL
+  media_type    VARCHAR(10) NOT NULL
+  created_at    TIMESTAMP WITH TIME ZONE
+  UNIQUE (profile_id, media_tmdb_id, media_type)
+
+KEY INDEXES:
+  ix_watch_history_profile_media_type  ON bluehive.watch_history (profile_id, media_tmdb_id, media_type)
+  ix_watch_history_watched_at          ON bluehive.watch_history (watched_at)
+  idx_provider_first_seen_provider     ON public.provider_first_seen (provider_id, media_id)
+  idx_media_items_type_quality         ON public.media_items (media_type, quality_score DESC NULLS LAST)
+  idx_media_items_type_release         ON public.media_items (media_type, latest_release_at DESC NULLS LAST)
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 5 — NIGHTLY GENRE-WEIGHT JOB
+────────────────────────────────────────────────────────────────────────────────
+
+File:       app/jobs/genre_weights.py
+Scheduled:  main.py → _genre_weight_loop() → fires at 02:00 daily
+Manual run: docker exec -it platform-backend-platform-api-1 python -m app.jobs.genre_weights
+
+The job rebuilds the entire bluehive.profile_genre_weights table from scratch in
+one atomic transaction (TRUNCATE + INSERT). Readers never see an in-between state.
+
+TUNEABLE CONSTANTS (top of genre_weights.py):
+  WEIGHT_CAP              = 4.0     Maximum weight any genre can reach. Controls
+                                    how strongly preferred genres dominate.
+  FAVORITE_BONUS_SECONDS  = 3600    Flat 3,600s (1hr) credited for each favorite.
+                                    Favorites do NOT decay — they're explicit signals.
+  WEIGHT_CUTOVER          = env WEIGHT_CUTOVER (default "2026-01-01")
+                                    Sessions before this date are ignored. Set to
+                                    the date session-timing migration (002) deployed
+                                    to prevent old-format progress_seconds bleeding in.
+  MAX_SECONDS_PER_TITLE   = 7200    Fix 1: 2-hour cap per title. Prevents a single
+                                    rewatched title from monopolizing a genre weight
+                                    regardless of how many times it's been watched.
+  MIN_SESSION_SECONDS     = 30      Fix 2: Bounce filter. Sessions under 30 seconds
+                                    (accidentally opened, immediately closed) are
+                                    excluded entirely — not genuine interest signals.
+  RECENCY_HALF_LIFE_DAYS  = 90      Fix 3: Recency decay. A session's credit halves
+                                    every 90 days. Taste from 8 months ago counts
+                                    ~¼ of what last week's watching counts.
+
+THE 5-CTE SQL PIPELINE:
+
+  watch_per_media
+  ───────────────
+  Joins bluehive.watch_history to public.media_items (via tmdb_id + media_type).
+  Filters:
+    - stopped_at IS NOT NULL         (session must be properly closed)
+    - progress_seconds >= :min_session  (30s bounce filter — per individual session
+                                         BEFORE aggregation, so even a 2s open
+                                         followed by a 40-minute rewatch counts the
+                                         rewatch only)
+    - watched_at >= CAST(:cutover AS timestamptz)
+  Per-session credit = progress_seconds × POWER(0.5, age_in_seconds / (86400 × 90))
+  Per-title credit   = LEAST(SUM(per-session credit), :max_per_title)  ← 7200s cap
+  Groups by (profile_id, media_id).
+
+  fav_per_media
+  ─────────────
+  Joins bluehive.favorites to public.media_items.
+  Assigns a flat :fav_bonus (3600s) to each favorited item for each profile.
+  No decay — favorites are deliberate, explicit preference signals.
+
+  credit_per_media
+  ────────────────
+  UNION ALL of watch_per_media and fav_per_media, summed per (profile_id, media_id).
+  One row per profile+title with their combined effective credit.
+
+  raw_per_genre
+  ─────────────
+  Joins credit_per_media to public.media_genres.
+  Sums credit across all titles per genre, per profile.
+  One row per (profile_id, genre_id) with total genre credit.
+
+  normalized
+  ──────────
+  Window function: MAX(raw_secs) OVER (PARTITION BY profile_id).
+  Finds the single most-watched genre per profile to use as the normalization
+  denominator. This makes weights relative — the genre you watch most gets 4.0;
+  everything else scales proportionally.
+
+INSERT:
+  weight = 1.0 + (raw_secs / max_secs) × (WEIGHT_CAP − 1.0)
+  If max_secs IS NULL or 0 → weight = 1.0 (neutral, no data).
+  Range: 1.0 to 4.0.
+
+WHAT COUNTS AS A VALID SESSION:
+  - Watching from ANY screen counts equally: Netflix row, catalog, search results,
+    continue watching, favorites, details screen — all write the same watch_history
+    row and all feed the weights job identically. There is no "source" tracking.
+  - The watch_history records media_tmdb_id + media_type only. The weights system
+    knows WHAT you watched, not HOW you found it.
+
+JOB OUTPUT:
+  Logs: "genre-weight job complete  rows=N profiles=M elapsed=Xs"
+  rows = total (profile, genre) pairs written
+  profiles = number of distinct profiles that had enough valid sessions
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 6 — BACKEND API ENDPOINT
+────────────────────────────────────────────────────────────────────────────────
+
+File:     TMDB_Api_Server.py
+Route:    GET /api/provider-groups/{group_slug}/media
+Example:  GET /api/provider-groups/netflix/media
+              ?media_type=movie
+              &limit=20
+              &offset=0
+              &sort_by=personalized
+              &profile_id=25
+
+Parameters:
+  group_slug   (path)  — 'netflix', 'prime_video', 'disney', 'hulu', etc.
+  media_type   (query) — 'movie' | 'tv' | null (returns both)
+  limit        (query) — page size (20 matches Android shelf's pageSize)
+  offset       (query) — page * limit
+  sort_by      (query) — 'popularity' | 'rating' | 'latest_release' | 'personalized'
+  profile_id   (query) — integer profile ID; enables personalized blend
+
+Authentication: X-API-Key header (all /api/* endpoints)
+
+MODULE-LEVEL CONSTANTS (defined just above the @app.get decorator):
+  DISCOVERY_RATIO          = 0.35   Fraction of each page reserved for discovery cards.
+  DISCOVERY_WEIGHT_CEILING = 1.5    Items with avg genre weight BELOW this are
+                                    "unexplored" and eligible for discovery slots.
+
+MODULE-LEVEL HELPERS:
+
+  _interleave_rows(personalized, discovery, total) → List
+  ────────────────────────────────────────────────────────
+  Takes the personalized and discovery lists and distributes the discovery cards
+  evenly across the combined result. For 20 cards with 7 discovery, discovery
+  appears approximately every 20/7 ≈ 2.85 positions — roughly every 3rd card.
+  Uses a floating-point accumulator (step = total/n_disc) to place each discovery
+  card at the mathematically correct position. If either list runs short (e.g.
+  few unwatched unexplored titles), the other fills the gap.
+
+ENDPOINT FUNCTION: get_media_by_provider_group()
+────────────────────────────────────────────────
+
+Step 1: Provider group lookup
+  SELECT group_id, group_name, group_slug FROM provider_groups
+  WHERE group_slug = $1
+  Returns 404 if not found.
+
+Step 2: Cold-start guard
+  has_weights = False
+  If sort_by == "personalized" and profile_id is not None:
+      weight_count = SELECT COUNT(*) FROM bluehive.profile_genre_weights
+                     WHERE profile_id = $profile_id
+      has_weights = (weight_count > 0)
+
+  personalized_active = has_weights
+
+  If sort_by == "personalized" and NOT personalized_active:
+      order_sql = latest_release order
+      future_sql = exclude unreleased content
+  (A new profile with no watch history gets latest_release instead of a
+   meaningless blend where both streams return the same quality-sorted items.)
+
+Step 3: Route to normal path or blend path
+
+  NORMAL PATH (popularity | rating | latest_release, or personalized with no weights):
+  ─────────────────────────────────────────────────────────────────────────────────────
+  Runs a single query with 3 CTEs:
+    provider_entry  — all media_ids in this provider group (with MIN(first_seen_at)
+                       for the boost calculation)
+    profile_weights — this profile's genre weights (empty if no profile_id)
+    item_weights    — AVG(weight) per media_id for this profile, joined through
+                       media_genres; NULL if no matching weights → COALESCE to 1.0
+
+  SELECT [all media columns]
+  FROM media_items m
+  JOIN provider_entry pe ON pe.media_id = m.media_id
+  LEFT JOIN item_weights iw ON iw.media_id = m.media_id
+  WHERE [media_type filter] [future content filter]
+  ORDER BY [order_sql]
+  LIMIT $limit OFFSET $offset
+
+  BLEND PATH (sort_by == "personalized" AND profile has weights):
+  ───────────────────────────────────────────────────────────────
+  discovery_count    = round(limit × 0.35)      e.g. 7 for limit=20
+  personalized_count = limit − discovery_count  e.g. 13 for limit=20
+  page     = offset // limit
+  p_offset = page × personalized_count           independent stream pagination
+  d_offset = page × discovery_count
+
+  _fetch_personalized_rows(conn, group_id, media_type, profile_id,
+                            personalized_count, p_offset)
+  ──────────────────────────────────────────────────────────────────
+  Runs the same 3-CTE query as the normal path but:
+    - Orders by: (quality_score × decay × boost × avg_weight) DESC, media_id DESC
+    - decay_sql = CASE WHEN latest_release_at IS NULL THEN 0.05
+                       ELSE 1.0 / (ln(GREATEST(days,0)+2)/ln(2.0)) END
+    - boost_sql = CASE WHEN first_seen > (release + 30)
+                        AND first_seen >= (TODAY - 90)
+                       THEN 1.5 ELSE 1.0 END
+    - profile_weight = COALESCE(iw.avg_weight, 1.0)
+
+  _fetch_discovery_rows(conn, group_id, media_type, profile_id,
+                         discovery_count, d_offset, exclude_ids)
+  ─────────────────────────────────────────────────────────────────
+  Runs the same 3-CTE query BUT with three additional filters:
+    1. COALESCE(iw.avg_weight, 1.0) < DISCOVERY_WEIGHT_CEILING (1.5)
+       Only items in unexplored/low-engagement genres. Items with NULL avg weight
+       (no genres in the profile's weight table) have COALESCE → 1.0 < 1.5 = TRUE,
+       so completely unexplored content always qualifies for discovery.
+    2. NOT EXISTS (SELECT 1 FROM bluehive.watch_history wh
+                   WHERE wh.profile_id = $profile_id
+                     AND wh.media_tmdb_id = m.tmdb_id
+                     AND wh.media_type = m.media_type)
+       Fix 4: Excludes anything the profile has already watched. Discovery should
+       genuinely be new, not a rewatch in a different genre category.
+    3. m.media_id <> ALL($exclude_ids::int[])
+       Excludes anything already in the personalized 65% for this page, preventing
+       a title appearing in both streams on the same page.
+  Orders by: (quality_score × decay) DESC, media_id DESC  (no weight — unexplored)
+
+  After both queries:
+    media_rows = _interleave_rows(personalized_rows, discovery_rows, limit)
+
+Step 4: Total count query
+  Counts the full provider group membership (for pagination: tells the client
+  how many pages exist). Uses the same provider_entry CTE and media_type filter.
+
+Step 5: Genre fetch (2nd query, same pattern as /api/media/browse)
+  SELECT mg.media_id, ARRAY_AGG(DISTINCT g.name) AS genres
+  FROM media_genres mg
+  JOIN genres g ON g.genre_id = mg.genre_id
+  WHERE mg.media_id = ANY($1::int[])
+  GROUP BY mg.media_id
+  Fetches genres only for the returned media_ids (never joins upfront — avoids
+  row multiplication which was the original performance problem).
+
+Step 6: Build response
+  Returns MediaBrowseResponse shape:
+    group_slug, group_name, media_type, sort_by,
+    total_count, count, limit, offset, items: [MediaItem...]
+  Each item includes all media columns plus genres array.
+  Date fields serialized to ISO 8601 strings.
+
+SORT MODES (non-personalized):
+  popularity     → ORDER BY m.popularity DESC, m.media_id DESC
+  rating         → ORDER BY m.vote_average DESC, m.media_id DESC
+  latest_release → ORDER BY m.latest_release_at DESC NULLS LAST,
+                             m.vote_average DESC, m.media_id DESC
+                   + excludes future-dated content
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 7 — SESSION TRACKING (Watch History)
+────────────────────────────────────────────────────────────────────────────────
+
+Sessions are the raw material the nightly job consumes to build genre weights.
+Without valid sessions, there are no personalized weights.
+
+A "session" is one opening of the webviewer (GeckoView) to watch a stream.
+
+PLATFORM BACKEND — app/profiles.py or app/sessions.py:
+
+  POST /api/bluehive/watch-history
+  ─────────────────────────────────
+  Called when the webviewer opens. Creates a new watch_history row.
+  Body: { profile_id, media_tmdb_id, media_type, source_name,
+          media_title, season_number, episode_number, episode_name }
+  Sets: watched_at = now(), progress_seconds = 0, stopped_at = NULL
+  Returns: { id: <session_id> }
+
+  POST /api/bluehive/watch-history/{id}/stop
+  ───────────────────────────────────────────
+  Called when the webviewer closes (back button, app exit, etc.).
+  Sets: stopped_at = now()
+        progress_seconds = compute_progress_seconds(watched_at, now())
+        Capped at MAX_SESSION_SECONDS = 14,400 (4 hours) to handle edge cases.
+
+  Safety nets (prevent ghost open sessions):
+    - events.py end-session event: sets stopped_at = now() on device end-session.
+    - main.py grace-expiry listener: closes open sessions with stopped_at =
+      backgrounded_at when a device goes inactive.
+
+  app/watch_sessions.py helpers:
+    close_open_sessions_for_device(device_id, timestamp) — called by safety nets.
+    compute_progress_seconds(started_at, ended_at)       — caps at 4h.
+
+WHAT THE NIGHTLY JOB USES:
+  watch_history rows where:
+    stopped_at IS NOT NULL          — properly closed sessions only
+    progress_seconds >= 30          — bounce filter
+    watched_at >= WEIGHT_CUTOVER    — within the deployment window
+  These are what become genre credits.
+
+ENV VAR: WEIGHT_CUTOVER (platform-backend)
+  Default: "2026-01-01"
+  Set explicitly to the date migration 002 (stopped_at column) was deployed.
+  Prevents old-format progress_seconds data from polluting genre weights.
+  Set in docker-compose or .env: WEIGHT_CUTOVER=2026-06-01
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 8 — DATA SCRAPING (keeping scores current)
+────────────────────────────────────────────────────────────────────────────────
+
+File:     TMDB_Media_Metadata.py
+Container: streaming-backend-bluehive-api-1
+
+This scraper is responsible for keeping quality_score, latest_release_at, and
+provider_first_seen current. These are the inputs for Layers 1, 2, and 3.
+
+quality_score:
+  Updated in every media_items upsert (ON CONFLICT DO UPDATE SET):
+    quality_score = COALESCE(EXCLUDED.vote_average, 0) *
+                    LEAST(COALESCE(EXCLUDED.vote_count, 0)::float / 1000.0, 1.0)
+  No separate job required — stays current automatically.
+
+latest_release_at (TV shows):
+  Updated in batch_update_episodes() or equivalent, after episode rows are written:
+    UPDATE media_items
+    SET latest_release_at = (
+        SELECT MAX(e.air_date)
+        FROM tv_episodes e JOIN tv_seasons s ON s.season_id = e.season_id
+        WHERE s.media_id = media_items.media_id AND e.air_date <= CURRENT_DATE
+    )
+    WHERE media_id = <id>
+  This means latest_release_at always reflects the most recent AIRED episode.
+
+latest_release_at (movies):
+  Set at insert/upsert time from release_date. Movies don't update.
+
+provider_first_seen:
+  Populated in batch_update_watch_providers() via append-only INSERT:
+    INSERT INTO provider_first_seen (media_id, provider_id, first_seen_at)
+    SELECT wp.media_id, wp.provider_id, COALESCE(m.release_date, CURRENT_DATE)
+    FROM watch_providers wp JOIN media_items m ON m.media_id = wp.media_id
+    ON CONFLICT (media_id, provider_id) DO NOTHING
+  The ON CONFLICT DO NOTHING is critical — first_seen_at is immutable once set.
+  The scraper deletes and re-inserts watch_providers rows on every run, but
+  provider_first_seen survives intact.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 9 — ANDROID FRONTEND: API LAYER
+────────────────────────────────────────────────────────────────────────────────
+
+File:  app/api/ApiService.kt
+Interface: ApiService (Retrofit)
+
+Relevant declaration:
+  @GET("/api/provider-groups/{groupSlug}/media")
+  suspend fun getMediaByProviderGroup(
+      @Path("groupSlug")   groupSlug: String,
+      @Query("media_type") mediaType: String? = null,
+      @Query("limit")      limit:     Int     = 20,
+      @Query("offset")     offset:    Int     = 0,
+      @Query("sort_by")    sortBy:    String? = null,
+      @Query("profile_id") profileId: Int?    = null
+  ): MediaBrowseResponse
+
+File:  app/api/ApiClient.kt
+  val trailerApi: ApiService = tmdbRetrofit.create(ApiService::class.java)
+  This is the Retrofit instance pointed at the TMDB server (port 8000).
+  Authentication: X-API-Key header injected by OkHttp interceptor.
+
+File:  app/models/MediaItem.kt
+  data class MediaBrowseResponse(
+      groupSlug:  String?,
+      groupName:  String?,
+      mediaType:  String?,
+      totalCount: Int,
+      count:      Int,
+      limit:      Int,
+      offset:     Int,
+      items:      List<MediaItem>
+  )
+
+  data class MediaItem — full media metadata including:
+      tmdbId, mediaType, title, posterUrl, backdropUrl, logos,
+      overview, releaseDate, latestReleaseAt, voteAverage, voteCount,
+      popularity, runtime, status, contentRating, originalLanguage,
+      budget, revenue, numberOfSeasons, numberOfEpisodes, lastSeasonCount,
+      youtubeTrailerUrl, qualityScore, genres: List<String>, etc.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 10 — ANDROID FRONTEND: REPOSITORY LAYER
+────────────────────────────────────────────────────────────────────────────────
+
+File:  app/repository/MediaRecyclerViewData.kt
+
+This class is the single point of contact between the UI paging system and the
+Retrofit API. It translates shelf+page requests into API calls.
+
+Companion constants:
+  NETFLIX_GROUP    = "netflix"
+  DEFAULT_PAGE_SIZE = 20         ← matches ShelfRowContent.pageSize
+
+Key methods for the Netflix row:
+
+  loadProviderGroupMedia(groupSlug, mediaType, page, pageSize,
+                         sortBy, profileId) : MediaBrowseResponse
+  ─────────────────────────────────────────────────────────────────
+  The core method. Converts page number to offset (page × pageSize),
+  calls api.getMediaByProviderGroup(), and returns the response.
+  On exception: returns an empty MediaBrowseResponse (never throws to callers).
+
+  loadNetflixMovies(page, moviesPerPage, profileId) : MediaBrowseResponse
+  ─────────────────────────────────────────────────────────────────────────
+  Calls loadProviderGroupMedia with:
+    groupSlug = NETFLIX_GROUP ("netflix")
+    mediaType = "movie"
+    sortBy    = "personalized"
+    profileId = profileId
+  profileId: Int? — null omits the query parameter entirely; the backend treats
+  a missing profile_id as anonymous (falls back to non-personalized sort).
+
+  loadNetflixTVShows(page, moviesPerPage, profileId) : MediaBrowseResponse
+  ──────────────────────────────────────────────────────────────────────────
+  Same as loadNetflixMovies but mediaType = "tv".
+
+  Other providers (loadPrimeVideoMovies, loadDisneyPlusMovies, etc.):
+  Currently call loadProviderGroupMedia WITHOUT sortBy or profileId — they use
+  the default "popularity" sort. To extend personalization to other providers,
+  pass sortBy="personalized" and profileId here.
+
+File:  app/singleShelfComponents/ShelfRepository.kt
+
+Sits between ShelfRowContent and MediaRecyclerViewData. Translates
+(mediaType, shelf, page, pageSize, profileId) tuples into specific loader calls.
+
+  loadPage(mediaType, shelf, page, pageSize, profileId) : MediaBrowseResponse
+  ─────────────────────────────────────────────────────────────────────────────
+  Dispatches to Dispatchers.IO. Routes:
+    MediaType.MOVIES   → loadMoviesPage(shelf, page, pageSize, profileId)
+    MediaType.TV_SHOWS → loadTVShowsPage(shelf, page, pageSize, profileId)
+    MediaType.ANIME    → loadAnimePage (returns empty — not yet implemented)
+    MediaType.CARTOONS → loadCartoonsPage (returns empty — not yet implemented)
+
+  loadMoviesPage(shelf, page, pageSize, profileId) : MediaBrowseResponse
+  ────────────────────────────────────────────────────────────────────────
+  Private. Dispatches:
+    POPULAR    → repo.loadPopularMovies(page, pageSize)
+    TOP_RATED  → repo.loadTopRatedMovies(page, pageSize)
+    NETFLIX    → repo.loadNetflixMovies(page, pageSize, profileId.takeIf{it>0})
+    Others     → their respective loaders (no profileId — not personalized)
+  Note: profileId.takeIf { it > 0 } — converts -1 sentinel to null so the API
+  call omits the query parameter when no valid profile is active.
+
+  loadTVShowsPage — same pattern as loadMoviesPage for TV types.
+
+  getShelfTitle(mediaType, shelf) : String
+  ─────────────────────────────────────────
+  Returns the display title shown above the shelf, e.g.:
+    POPULAR + MOVIES  → "What's Popular"
+    POPULAR + TV      → "Popular TV Shows"
+    NETFLIX           → "Netflix" (same for all media types)
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 11 — ANDROID FRONTEND: PAGING SYSTEM
+────────────────────────────────────────────────────────────────────────────────
+
+File:  app/singleShelfComponents/ShelfStackTypes.kt
+
+enum class MediaType   { MOVIES, TV_SHOWS, ANIME, CARTOONS }
+
+enum class ContentShelf { POPULAR, TOP_RATED, NETFLIX, PRIME_VIDEO, DISNEY_PLUS,
+                          HULU, PARAMOUNT_PLUS, APPLE_TV_PLUS, HBO_MAX, PEACOCK }
+
+data class PageWindow
+  ─────────────────────
+  Tracks the sliding window of loaded pages for one shelf.
+  Fields:
+    loadedPages:        MutableMap<Int, List<MediaItem>>   page number → items
+    windowStartPage:    Int  (lowest page currently in memory)
+    windowEndPage:      Int  (highest page currently in memory)
+    focusedTmdbId:      Int?  (last focused card's tmdbId for focus restoration)
+    pageNumberIncrement: Int  (tracks the furthest-loaded page number)
+
+  getAllItems() : List<MediaItem>
+  ─────────────────────────────────
+  Concatenates all pages in the window (windowStartPage..windowEndPage)
+  into a single flat list. Applies .distinctBy { it.tmdbId } to silently drop
+  any duplicate that snuck in from a sort-order shuffle between page fetches.
+  (Fix for offset pagination staleness — prevents the same card appearing twice
+   during scroll if a backend reorder happened between two page fetches.)
+
+  getPageCount() : Int     = windowEndPage - windowStartPage + 1
+  getRelativeIndex(absoluteIndex, pageSize) : Pair<Int, Int>
+      Returns (pageNumber, indexInPage) for an absolute list position.
+
+
+File:  app/singleShelfComponents/ShelfStack.kt
+
+COMPOSABLE: ShelfStack()
+  Parameters:
+    mediaType:         MediaType
+    modifier:          Modifier
+    onMediaClick:      (MediaItem) -> Unit
+    onNavigateBackToTabs: () -> Unit
+    showContinueWatching: Boolean = false
+    onFirstShelfChanged:  (Boolean) -> Unit = {}  fires when POPULAR shelf enters/exits
+    onShelfChanged:       (ContentShelf) -> Unit = {}
+    profileId:            Int = -1               ← threaded to all shelf loaders
+    onFirstPageReady:     () -> Unit = {}        ← fires when POPULAR has first page data
+
+  State managed by ShelfStack (parent, survives recompose):
+    focusedShelfIndex:  Int (rememberSaveable — survives rotation)
+    pageWindows:        Map<ContentShelf, PageWindow> (one per shelf)
+    rowFocusRequesters: Map<ContentShelf, FocusRequester>
+    tracker:            UnifiedShelfFocusTracker
+
+  Rendering: only shelves within ±1 of focusedShelfIndex are in the composition
+  tree. Shelves outside that window are held in rememberSaveableStateHolder
+  (focus memory and page state preserved while off-screen).
+
+  Focus architecture:
+    - Vertical D-pad intercepted in onPreviewKeyEvent at the Stack level.
+      No card ever sees a vertical keypress.
+    - A "parking" node (invisible 1dp Box) holds focus during shelf transitions
+      to prevent Compose from relocating focus to the search bar.
+    - UnifiedShelfFocusTracker manages card-focus epochs — each shelf has a
+      counter that increments when it should restore focus; only the current
+      shelf acts on it.
+    - LaunchedEffect(tracker.pendingTarget): the transition handoff. Sets
+      focusedShelfIndex → requestCardFocus → completes navigation.
+
+
+COMPOSABLE: ShelfRowContent()  (private)
+  Lives inside ShelfStack. One instance per visible shelf (max 3 at a time).
+  Manages all paging state for one shelf.
+
+  Paging constants:
+    pageSize        = 20  (MUST match AppWarmup.SHELF_PAGE_SIZE)
+    maxPages        = 2   (max pages kept in memory = max 40 items)
+    prefetchTrigger = 15  (trigger next-page fetch at card 15 of current page)
+    evictTrigger    = 20  (evict oldest page when at card 20)
+    reloadTrigger   = 5   (trigger previous-page fetch when at card 5)
+
+  LaunchedEffect(Unit): init / prefetch consumption
+    1. If pageWindow.loadedPages is empty (first mount):
+       - Check app.consumeMoviesPopularPrefetch()  for POPULAR+MOVIES
+       - Check app.consumeNetflixMoviesPrefetch(profileId)  for NETFLIX+MOVIES
+       - Check app.consumeNetflixTvShowsPrefetch(profileId) for NETFLIX+TV_SHOWS
+       If a prefetch hit: populate pageWindow immediately, items rendered in first frame.
+       Else: call loadPage(0) for a live fetch.
+    2. If pageWindow already has pages (returning to shelf):
+       Restore from pageWindow — no fetch needed.
+
+  LaunchedEffect(items.isNotEmpty()):
+    Fires once when items transitions from empty → non-empty.
+    Calls onFirstPageReady() — bubbled up to HomeScreenCompose to dismiss the
+    entry transition overlay once real cards exist in memory.
+
+  suspend fun loadPage(pageNum: Int):
+    Guards: skips if page already loaded. Cancels any in-flight job.
+    Calls: repository.loadPage(mediaType, shelf, pageNum, pageSize, profileId)
+    On success: updates pageWindow, recalculates items.
+    On failure: logs error, items unchanged (shows what was there before).
+
+  fun handleFocusChange(listIndex, tmdbId):
+    Records focused card in tracker.
+    Computes absoluteIndex = (windowStartPage × pageSize) + listIndex.
+    PREFETCH:  if at last page AND indexInPage >= 15 → loadPage(windowEndPage+1)
+    EVICT:     if at last page AND indexInPage >= 20 AND >2 pages loaded
+                 → evict windowStartPage
+    BACKWARD RELOAD: if at first page AND indexInPage <= 5 AND prevPage exists
+                 → loadPage(windowStartPage-1), then possibly evict windowEndPage
+
+
+File:  app/utilities/TvWideLazyRow.kt
+  The actual rendered card row. Receives:
+    items, onItemClick, onFocusChanged, rowFocusRequester,
+    isPageLoading, pendingFocusTmdbId, cardFocusEpoch, isFocusedShelf
+  Renders MediaCard components. Implements card-focus epoch system to restore
+  the previously-focused card when returning to this shelf.
+
+
+File:  app/singleShelfComponents/Unifiedshelffocustracking.kt
+  class UnifiedShelfFocusTracker
+  Manages: pendingTarget (next shelf to navigate to), parkingActive, parkingRequester,
+           per-shelf card focus epochs, per-shelf remembered tmdbId/listIndex.
+  Key methods:
+    requestNavigation(targetIndex)  — sets pendingTarget
+    requestCardFocus(shelf)         — increments that shelf's epoch
+    completeNavigation()            — clears pendingTarget and parkingActive
+    recordCard(shelf, tmdbId, idx)  — saves focus memory
+    cardTmdbId(shelf) / cardIndex(shelf)  — retrieves focus memory
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 12 — ANDROID FRONTEND: HOME SCREEN INTEGRATION
+────────────────────────────────────────────────────────────────────────────────
+
+File:  app/HomeScreenCompose.kt
+
+The home screen passes profileId down into ShelfStack, which propagates it all
+the way to the API call. It also manages the entry transition overlay.
+
+profileId threading:
+  onCreate():
+    val profileId = intent.getIntExtra("PROFILE_ID", -1)
+  setContent → HomeScreenComposeContent(profileId = profileId, ...)
+  HomeScreenComposeContent → ShelfStack(profileId = profileId, ...)
+  ShelfStack → ShelfRowContent(profileId = profileId, ...)
+  ShelfRowContent → repository.loadPage(..., profileId)
+  ShelfRepository → repo.loadNetflixMovies(..., profileId.takeIf{it>0})
+  MediaRecyclerViewData → api.getMediaByProviderGroup(..., profileId = profileId)
+
+Entry transition overlay:
+  State: showEntryTransition = true (blocks all D-pad input while true)
+         minTransitionElapsed = false (2000ms minimum display)
+         firstShelfDataReady = false (set by onFirstPageReady callback)
+
+  LaunchedEffect(Unit):        delay(2000ms) → minTransitionElapsed = true
+  LaunchedEffect(startContent): delay(6000ms) → firstShelfDataReady = true (safety net)
+  LaunchedEffect(firstShelfDataReady, minTransitionElapsed):
+    if both true → showEntryTransition = false → overlay fades out
+
+  ShelfStack(onFirstPageReady = { firstShelfDataReady = true })
+    The POPULAR shelf fires this the instant its first page of items exists —
+    either from prefetch (near-instant) or live fetch. The overlay then waits
+    for the minimum 2s to also have elapsed, then reveals the home screen with
+    cards already rendered behind it.
+
+  AnimatedVisibility(visible = showEntryTransition):
+    Black fullscreen overlay showing the profile-specific loading message.
+    "Getting [Name]'s profile ready for your entertainment"
+    Drawn last (topmost) in the Box, fades out with a 400ms tween.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 13 — COLD-START PREFETCH SYSTEM
+────────────────────────────────────────────────────────────────────────────────
+
+The prefetch system warms the Netflix row data (and other home screen content)
+during the cold-start loading screen, so first render is instant rather than
+showing a spinner.
+
+File:  app/BlueHiveApplication.kt
+
+data class HomeScreenPrefetch
+  capturedAt:       Long                         creation timestamp for TTL
+  profileId:        Int                          which profile this is for
+  trending:         List<TrendingItem>?
+  trailers:         List<LatestTrailer>?
+  continueWatching: List<WatchHistoryResponse>?
+  moviesPopular:    MediaBrowseResponse?
+  netflixMovies:    MediaBrowseResponse?         ← Netflix movies page 0
+  netflixTvShows:   MediaBrowseResponse?         ← Netflix TV shows page 0
+
+TTL: HOME_PREFETCH_TTL_MS = 90,000ms (90 seconds)
+     If the user spends more than 90 seconds on the profile picker (unlikely),
+     the prefetch is discarded and the home screen fetches live.
+
+freshHomePrefetchOrNull():
+  Checks age of homePrefetch against TTL. Returns null and clears cache if expired.
+
+consumeNetflixMoviesPrefetch(profileId) : MediaBrowseResponse?
+  Returns and nulls the netflixMovies slice IFF:
+    - TTL has not expired
+    - p.profileId == the requesting profile
+  Profile mismatch (e.g. warmup guessed wrong person) → returns null → live fetch.
+
+consumeNetflixTvShowsPrefetch(profileId) : MediaBrowseResponse?
+  Same pattern as consumeNetflixMoviesPrefetch.
+
+consumeMoviesPopularPrefetch() : MediaBrowseResponse?  — profile-agnostic
+consumeTrendingPrefetch()                              — profile-agnostic
+consumeTrailersPrefetch()                              — profile-agnostic
+consumeContinueWatchingPrefetch(profileId)             — profile-specific
+
+
+File:  app/AppWarmup.kt
+
+object AppWarmup { suspend fun run(app: BlueHiveApplication) }
+
+SHELF_PAGE_SIZE = 20    MUST match ShelfRowContent.pageSize. If these ever
+                        diverge, page 1 offset math breaks (5-item gap or overlap).
+
+Sequence:
+  Step 1: ApiClient.platformApi.getMe()
+    Blocks everything. If the stored access token is stale, the TokenAuthenticator
+    silently refreshes it HERE, before any parallel calls go out. Prevents a wave
+    of 401s from racing calls that all get "token expired" simultaneously.
+
+  Step 2: checkAppConfigPlaceholder()
+    No-op. Hook for future maintenance mode / force-update check.
+
+  Step 3: coroutineScope { parallel fan-out }
+    Fired at the TOP of the scope, BEFORE profiles resolves:
+      val warmProfileId = SessionManager.get().lastProfileId
+      netflixMoviesDeferred = if (warmProfileId != -1) async {
+          ShelfRepository().loadPage(MOVIES, NETFLIX, 0, SHELF_PAGE_SIZE, warmProfileId)
+      }
+      netflixTvDeferred     = same for TV_SHOWS
+
+    Why "warm" prefix: warmProfileId is the LOCALLY-REMEMBERED last profile (from
+    SessionManager — written on profile click). It's available instantly without
+    waiting for the profiles API. This lets the Netflix prefetch START in parallel
+    with the profiles list fetch instead of waiting for it.
+
+    Also in parallel:
+      trendingDeferred  = TrendingRepository().getTrending("day", 40)
+      trailersDeferred  = TrailerRepository().getLatestTrailers(100, 0)
+      profilesDeferred  = ApiClient.bluehiveApi.listProfiles()
+
+    After profiles resolves:
+      lastProfileId = max(last_login_at) profile from API response
+      cwDeferred    = platformApi.getWatchHistory(lastProfileId, 15, 0)
+      moviesDeferred = ShelfRepository().loadPage(MOVIES, POPULAR, 0, SHELF_PAGE_SIZE)
+
+    Await all, then:
+      guessMatched = (warmProfileId == lastProfileId)
+      netflixMovies  = if (guessMatched) netflixMoviesDeferred?.await() else null
+      netflixTvShows = if (guessMatched) netflixTvDeferred?.await() else null
+    If the guess was wrong (multi-profile household, different person picked),
+    the netflix slices are discarded. Home fetches live on first load.
+
+  Step 4: warmFirstPaintImages(trending backdrops, movie posters)
+    Decodes the first few visible images into Coil's memory cache.
+    TRENDING_IMAGES_TO_WARM = 3, MOVIE_POSTERS_TO_WARM = 8.
+    Capped low intentionally — warming everything causes GC pressure on the
+    low-powered TV hardware.
+
+  All steps wrapped in try/catch — warm-up failure never crashes the app.
+
+
+File:  app/LoadingScreenActivity.kt
+
+The cold-start splash screen. Plays a 4K branding video while warmup runs.
+Does NOT navigate on a hard timer anymore.
+
+LaunchedEffect(Unit):
+  val warmupJob = launch { AppWarmup.run(app) }
+  withTimeoutOrNull(LOADING_MAX_WAIT_MS) { warmupJob.join() }
+  warmupJob.cancel()   // no-op if finished; stops in-flight calls on timeout
+  val elapsed = System.currentTimeMillis() - startedAt
+  if (elapsed < LOADING_MIN_DISPLAY_MS) delay(LOADING_MIN_DISPLAY_MS - elapsed)
+  onLoadingComplete()
+
+Constants:
+  LOADING_MIN_DISPLAY_MS = 1_500   Minimum splash duration regardless of warmup speed.
+  LOADING_MAX_WAIT_MS    = 12_000  Safety cap. Only hit on a genuinely dead network.
+                                   On timeout: navigate anyway; profile screen's retry
+                                   banner handles offline state.
+
+This means: on a healthy network, the splash stays up exactly as long as the
+warmup takes (1.5s minimum). Both profiles AND the Netflix prefetch are done
+before the splash exits. The home screen gets everything from cache.
+
+
+File:  app/auth/SessionManager.kt
+
+Stores the last-selected profile ID to break the API-call dependency:
+  val lastProfileId: Int     get() = prefs.getInt(KEY_LAST_PROFILE_ID, -1)
+  fun setLastProfileId(id: Int)    prefs.edit().putInt(KEY_LAST_PROFILE_ID, id).apply()
+  KEY_LAST_PROFILE_ID = "last_profile_id"
+
+Written in: ProfileScreenActivity.goHome() — immediately before startActivity.
+Read in:    AppWarmup.run() — before any API call fires.
+Cleared in: SessionManager.clearSession() — on logout.
+
+
+File:  app/ProfileScreenActivity.kt
+
+  goHome(profileId, displayName, avatarResId):
+    1. CoroutineScope(IO).launch { platformApi.selectProfile(profileId) }
+       (non-blocking — stamps last_login_at on the server for profile ordering)
+    2. SessionManager.get().setLastProfileId(profileId)
+       (synchronous SharedPreferences write — available to next warmup immediately)
+    3. startActivity(HomeScreenCompose, PROFILE_ID=profileId, ...)
+
+  LaunchedEffect(isLoadingGrid, profiles.size): (focus fix)
+    Waits until focusRequesters is non-empty (i.e. profile card composables have
+    registered their requesters in the composition) BEFORE requesting focus.
+    Prevents the brief flash where focus lands on the "Create Profile" button
+    because the profile cards hadn't composed yet when the effect first ran.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 14 — END-TO-END DATA FLOW
+────────────────────────────────────────────────────────────────────────────────
+
+FLOW A: Returning user, app was closed (most common case)
+
+  1. App cold start → LoadingScreenActivity
+  2. AppWarmup fires:
+     a. Token prime (getMe)
+     b. In parallel: Netflix prefetch (using locally-stored lastProfileId),
+        trending, trailers, profiles list
+     c. Profiles resolves → continue watching + Popular movies
+     d. guessMatched check → Netflix slices stored or discarded
+     e. Image warming
+  3. warmup.join() — LoadingScreen exits when warmup is done (~2-3s)
+  4. ProfileScreenActivity:
+     - Profiles rendered from BlueHiveApplication prefetch (or live if TTL expired)
+     - First profile card focused (after focusRequesters registration guard)
+  5. User selects profile → setLastProfileId(profileId) → HomeScreenCompose
+  6. HomeScreenCompose mounts → showEntryTransition = true
+  7. ShelfRowContent(POPULAR): consumes moviesPopularPrefetch → items non-empty
+     → onFirstPageReady() → firstShelfDataReady = true
+  8. ShelfRowContent(NETFLIX): consumes netflixMoviesPrefetch(profileId)
+     → items non-empty immediately (no API call needed)
+  9. After 2s minimum → showEntryTransition = false → overlay fades
+ 10. User sees fully-loaded home screen with personalized Netflix cards already
+     in place.
+
+FLOW B: First-ever launch OR warmup took too long (12s safety cap)
+
+  1-5. Same but netflixMoviesPrefetch = null (cache miss or no lastProfileId)
+  6. ShelfRowContent(NETFLIX): no prefetch → loadPage(0) called live
+  7. API request fired: GET /api/provider-groups/netflix/media?sort_by=personalized
+  8. Backend: no profile_genre_weights rows → cold-start guard fires
+     → order = latest_release (not personalized blend)
+  9. Response returns 20 most recently updated Netflix titles
+ 10. overlay drops when POPULAR data arrives + 2s minimum
+ 11. Netflix row shows non-personalized but still quality-sorted content
+
+FLOW C: Profile has watch history, user watches more content (ongoing)
+
+  - User watches a movie via webviewer:
+    POST /api/bluehive/watch-history → creates row (progress_seconds = 0)
+    User closes webviewer → POST /api/bluehive/watch-history/{id}/stop
+    Row gains stopped_at, progress_seconds computed.
+  - That night at 2AM: run_genre_weight_job() runs
+    → reads all valid sessions for this profile
+    → computes decayed, capped, normalized genre weights
+    → TRUNCATE + INSERT profile_genre_weights
+  - Next app open: Netflix row hits the endpoint with profile_id
+    → profile_genre_weights has data → personalized_active = true
+    → 65% personalized (high final_score items) + 35% discovery (unexplored genres)
+    → user sees horror/thriller content floating up (or whatever they've been watching)
+    → discovery cards from genres they haven't explored yet
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 15 — CONFIGURATION REFERENCE
+────────────────────────────────────────────────────────────────────────────────
+
+BACKEND (platform-backend docker env):
+  WEIGHT_CUTOVER          Sessions before this date are excluded from weight job.
+                          Set to: your migration 002 deploy date (e.g. 2026-06-01)
+
+BACKEND (genre_weights.py — recompile/redeploy to change):
+  WEIGHT_CAP              4.0   Max genre weight. Lower = gentler personalization.
+  FAVORITE_BONUS_SECONDS  3600  Credit per favorited item (1 hour flat).
+  MAX_SECONDS_PER_TITLE   7200  Per-title rewatch cap (2 hours).
+  MIN_SESSION_SECONDS     30    Bounce session threshold.
+  RECENCY_HALF_LIFE_DAYS  90    Older watch = less credit. 90 days = half credit.
+
+BACKEND (TMDB_Api_Server.py — recompile/redeploy to change):
+  DISCOVERY_RATIO          0.35   35% of each page = discovery cards.
+  DISCOVERY_WEIGHT_CEILING 1.5    Items below this avg weight qualify as unexplored.
+
+ANDROID (ShelfStack.kt → ShelfRowContent):
+  pageSize        20   Items per API fetch. Must match AppWarmup.SHELF_PAGE_SIZE.
+  maxPages        2    Max pages in memory (max 40 items before eviction).
+  prefetchTrigger 15   Fetch next page when focused card hits index 15.
+  evictTrigger    20   Evict oldest page when focused card hits index 20.
+  reloadTrigger   5    Reload previous page when scrolling back to index 5.
+
+ANDROID (HomeScreenCompose.kt):
+  ENTRY_TRANSITION_MIN_MS   2000  Minimum overlay display time.
+  ENTRY_TRANSITION_TIMEOUT  6000  Safety cap — forces overlay off even if no data.
+
+ANDROID (LoadingScreenActivity.kt):
+  LOADING_MIN_DISPLAY_MS    1500  Splash shown at least this long.
+  LOADING_MAX_WAIT_MS       12000 Warmup safety cap on dead networks.
+
+ANDROID (BlueHiveApplication.kt):
+  HOME_PREFETCH_TTL_MS      90000 Prefetch expires after 90s.
+  TRENDING_IMAGES_TO_WARM   3     Backdrop images decoded at cold start.
+  MOVIE_POSTERS_TO_WARM     8     Poster images decoded at cold start.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 16 — KNOWN LIMITATIONS & FUTURE WORK
+────────────────────────────────────────────────────────────────────────────────
+
+1. GENRE WEIGHTS ARE MEDIA-TYPE-BLIND
+   Horror TV and horror movies share the same genre weight. A profile that loves
+   horror TV but never watches horror movies gets horror movies surfaced in both
+   the Netflix Movies and Netflix TV rows equally. Fix: add media_type to the
+   profile_genre_weights PK → (profile_id, genre_id, media_type). Requires schema
+   change, nightly job GROUP BY update, and endpoint join update.
+
+2. PERSONALIZATION IS ONLY APPLIED TO NETFLIX
+   Prime Video, Disney+, Hulu, etc. all use popularity sort. To extend personalization
+   to other providers: in MediaRecyclerViewData.kt, pass sortBy="personalized" and
+   profileId to their respective loadXxx methods.
+
+3. GENRE WEIGHTS UPDATE ONCE PER DAY
+   Maximum lag from watching something to seeing it affect the row: ~24 hours.
+   For immediate testing: docker exec -it platform-backend-platform-api-1
+                          python -m app.jobs.genre_weights
+
+4. PLATFORM RECENCY BOOST IS DORMANT ON EXISTING CATALOG
+   The provider_first_seen backfill set first_seen_at = release_date for all
+   existing content, which means the boost condition (first_seen > release + 30)
+   is false for almost everything. The boost will activate naturally as new
+   content is added to Netflix after deployment.
+
+5. MULTI-PROFILE COLD-START GUESS MAY MISS
+   AppWarmup prefetches Netflix for the "most recently used" profile. If a
+   different profile is selected, the Netflix prefetch is discarded (profile
+   mismatch) and the row loads live. On single-profile devices this never happens.
+   Fix: fire a secondary prefetch at the moment of profile click in
+   ProfileScreenActivity, before launching HomeScreenCompose.
+
+6. OFFSET PAGINATION STALENESS (deferred)
+   If a scraper run updates latest_release_at for a Netflix-group title between
+   two page fetches during a single scroll session, the sort order shifts slightly
+   and one card may appear twice or be skipped. Mitigated by PageWindow.getAllItems()
+   applying .distinctBy { it.tmdbId } — duplicates are silently dropped. True
+   keyset pagination would fully eliminate this but requires significant changes
+   to the paging state machine (PageWindow, ShelfRowContent, API contract).
+
+7. TASTE RECENCY DECAY IS BOUNDED BY WEIGHT_CUTOVER
+   Sessions before WEIGHT_CUTOVER are entirely excluded. Sessions after it are
+   decay-weighted. If WEIGHT_CUTOVER is set too recently, early watch history
+   is permanently lost to weight calculations.
+
+================================================================================
+  END OF DOCUMENT
+================================================================================

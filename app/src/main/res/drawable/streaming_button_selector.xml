@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Focused state with glow -->
+    <item android:state_focused="true">
+        <layer-list>
+            <!-- Glow effect -->
+            <item>
+                <shape android:shape="rectangle">
+                    <solid android:color="#F2F1FF" />
+                    <corners android:radius="3dp" />
+                </shape>
+            </item>
+        </layer-list>
+    </item>
+
+    <!-- Pressed state -->
+    <item android:state_pressed="true">
+        <shape android:shape="rectangle">
+            <solid android:color="#07052F" />
+            <corners android:radius="3dp" />
+        </shape>
+    </item>
+
+
+
+    <!-- Normal state with shadow -->
+    <item>
+        <layer-list>
+            <item>
+                <shape android:shape="rectangle">
+                    <solid android:color="#50000000" />
+                    <corners android:radius="4dp" />
+                </shape>
+            </item>
+
+            <!-- Shadow layer (keeps your color) -->
+            <item>
+                <inset android:insetBottom="6dp">
+                    <shape android:shape="rectangle">
+                        <solid android:color="#372B67" />
+                        <corners android:radius="3dp" />
+                    </shape>
+                </inset>
+            </item>
+
+            <!-- Main button with INSET instead of android:bottom -->
+            <item>
+                <inset android:insetBottom="5dp">
+                    <shape android:shape="rectangle">
+                        <solid android:color="#0004FF" />
+                        <corners android:radius="3dp" />
+                    </shape>
+                </inset>
+            </item>
+        </layer-list>
+    </item>
+
+</selector>
