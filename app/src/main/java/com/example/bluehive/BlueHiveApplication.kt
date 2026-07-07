@@ -2,6 +2,7 @@ package com.example.bluehive
 
 import android.app.ActivityManager
 import android.app.Application
+import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.Intent
 import android.media.SoundPool
@@ -26,6 +27,8 @@ import com.example.bluehive.webview.BeeLogo
 import com.example.bluehive.webview.GeckoWebViewManager
 import com.example.bluehive.auth.DeviceEventStream
 import com.example.bluehive.auth.SessionManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 
 
 /**
@@ -53,7 +56,14 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
 
         // Image cache configuration
         private const val DISK_CACHE_SIZE_MB     = 300L
-        private const val MEMORY_CACHE_MAX_MB  = 25  // 25% of app heap (Coil's own default) ≈ 96 MB here, vs the old 25 MB hard cap
+        // Memory cache is PERCENT-of-heap, not a fixed cap. The old 25 MB hard
+        // cap couldn't hold even the visible home screen imagery, so Coil was
+        // constantly evicting + re-decoding (thrash = jank). Hardware bitmaps
+        // live in graphics memory, not the Java heap, so a bigger cache does
+        // NOT cause GC churn. Low-RAM boxes (2 GB onn / Firestick report
+        // isLowRamDevice) get the smaller share.
+        private const val MEMORY_CACHE_PERCENT         = 0.25
+        private const val MEMORY_CACHE_PERCENT_LOW_RAM = 0.15
 
         lateinit var coilImageLoader: ImageLoader
         private var soundPool: SoundPool? = null
@@ -341,6 +351,7 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
     }
 
     // ── Application entry point ────────────────────────────────────────────────
+    @OptIn(ExperimentalCoroutinesApi::class)   // Dispatchers.IO.limitedParallelism
     override fun onCreate() {
         super.onCreate()
 
@@ -448,13 +459,21 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
         }
 
         // ── Image loader ───────────────────────────────────────────────────────
+        // fetcher/decoder parallelism is capped HARD. Coil's default runs image
+        // work on unbounded Dispatchers.IO — on a 4-core 2 GB box a cold home
+        // screen fires 30-40 downloads+decodes at once, saturating every core
+        // and starving the main thread (the first-launch "everything at once"
+        // lag). 4 fetches keeps the network pipe full; 2 decodes always leaves
+        // cores free for the UI. Total fill time barely changes — network was
+        // the bottleneck — but frames stop dropping.
+        val lowRam = (getSystemService(ACTIVITY_SERVICE) as ActivityManager).isLowRamDevice
         val imageLoader = ImageLoader.Builder(this)
             .components {
                 add(SvgDecoder.Factory())
             }
             .memoryCache {
                 MemoryCache.Builder(this)
-                    .maxSizeBytes(MEMORY_CACHE_MAX_MB * 1024 * 1024)
+                    .maxSizePercent(if (lowRam) MEMORY_CACHE_PERCENT_LOW_RAM else MEMORY_CACHE_PERCENT)
                     .build()
             }
             .diskCache {
@@ -463,6 +482,8 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
                     .maxSizeBytes(DISK_CACHE_SIZE_MB * 1024 * 1024)
                     .build()
             }
+            .fetcherDispatcher(Dispatchers.IO.limitedParallelism(4))
+            .decoderDispatcher(Dispatchers.IO.limitedParallelism(2))
             .respectCacheHeaders(false)
             .allowHardware(true)
             .crossfade(true)
@@ -471,7 +492,9 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
         Coil.setImageLoader(imageLoader)
         coilImageLoader = imageLoader
 
-        logCacheStats()
+        // Walks the whole 300 MB disk-cache directory — never on the main
+        // thread during startup (it was a cold-start hitch all by itself).
+        Thread { logCacheStats() }.start()
         initSoundPool(this)
 
         // Warm the loading-overlay bee logo on a background thread now, at launch,
@@ -533,7 +556,8 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
 
         Log.d(TAG, "───────────────────────────────────────")
         Log.d(TAG, "💾 MEMORY CACHE STATS")
-        Log.d(TAG, "  Allocation: $MEMORY_CACHE_MAX_MB MB (hard cap)")
+        val memMaxMB = (coilImageLoader.memoryCache?.maxSize ?: 0) / (1024.0 * 1024.0)
+        Log.d(TAG, "  Allocation: %.0f MB (percent-of-heap)".format(memMaxMB))
         Log.d(TAG, "═══════════════════════════════════════")
 
         listOf(
@@ -571,8 +595,15 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
         return processName == packageName
     }
 
+    // Deferred 8s: Gecko init spawns child processes + loads native libs — a
+    // huge CPU spike that used to land exactly while the splash's carousel
+    // prefetch and first paint were fighting for the same 4 cores. 8s lands it
+    // on the (static) profile picker. Playback can't be reached that fast from
+    // a cold start, and getNewSession() fails soft if it ever were.
+    private val GECKO_INIT_DELAY_MS = 8_000L
+
     private fun initializeGeckoOnMainThread() {
-        Handler(Looper.getMainLooper()).post {
+        Handler(Looper.getMainLooper()).postDelayed({
             // GeckoView ships only armeabi-v7a native libs in this build. On a device
             // whose ABI can't load them (e.g. the x86_64 Baseline Profile generation
             // emulator), GeckoThread crashes the ENTIRE process from its own internal
@@ -581,19 +612,45 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
             // initializes normally.
             if (Build.SUPPORTED_ABIS.none { it == "armeabi-v7a" }) {
                 Log.w(TAG, "Skipping GeckoWebView init — no armeabi-v7a ABI here (${Build.SUPPORTED_ABIS.joinToString()})")
-                return@post
+                return@postDelayed
             }
             try {
-                Log.d(TAG, "Initializing GeckoWebViewManager")
+                Log.d(TAG, "Initializing GeckoWebViewManager (deferred ${GECKO_INIT_DELAY_MS}ms)")
                 GeckoWebViewManager.initialize(this)
                 Log.d(TAG, "GeckoWebViewManager initialized")
             } catch (e: Throwable) {
                 Log.e(TAG, "Failed to initialize GeckoWebView (continuing without it)", e)
             }
-        }
+        }, GECKO_INIT_DELAY_MS)
     }
 
     override fun newImageLoader(): ImageLoader = coilImageLoader
+
+    // ── Memory pressure ────────────────────────────────────────────────────────
+    // When RAM runs low, Android first ASKS every app to give memory back
+    // (this callback); if that doesn't free enough, the Low Memory Killer
+    // starts executing processes — biggest consumers first. On a 2 GB box
+    // running Gecko, BlueHive is a prime target. Our most replaceable holding
+    // is Coil's MEMORY cache: every image in it also lives in the 300 MB disk
+    // cache, so clearing it costs a ~30ms re-decode per poster on the
+    // throttled background threads — versus the process dying mid-movie.
+    //
+    // Levels: RUNNING_LOW/CRITICAL = foreground pressure (we're visible and
+    // the system is struggling). BACKGROUND+ = we're backgrounded and on the
+    // cull list. UI_HIDDEN fires on every Home press with NO actual pressure —
+    // clearing there would wipe the cache on every resume-in-place, so skip it.
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (!isMainProcess()) return   // helper/Gecko processes never init the image loader
+
+        val underPressure = level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW ||
+                level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL ||
+                level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND
+        if (underPressure) {
+            Log.w(TAG, "🧹 onTrimMemory(level=$level) — clearing image memory cache to dodge the LMK")
+            coilImageLoader.memoryCache?.clear()
+        }
+    }
 
     override fun onTerminate() {
         super.onTerminate()

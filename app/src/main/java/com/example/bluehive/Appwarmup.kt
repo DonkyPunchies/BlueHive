@@ -18,10 +18,14 @@ package com.example.bluehive
 //      Once the profile list resolves, the most-recently-used profile
 //      (highest last_login_at) drives the profile-specific calls:
 //      continue watching + movies "popular" shelf page 1.
-//   4. Image warming — decode ONLY first-paint images into Coil's memory
-//      cache (first few trending backdrops + first row of movie posters).
-//      Capped low on purpose: warming everything causes GC churn on cheap
-//      TV boxes the moment the home screen mounts.
+//   4. Carousel image prefetch — trending + trailers are PROFILE-AGNOSTIC and
+//      static until the backend refreshes them, so the ENTIRE image set for
+//      both carousels is pulled here, during the bee-logo splash. First-paint
+//      images stay memory-resident; the rest fill the DISK cache only
+//      (READ_ONLY memory policy) so a 2 GB box's memory cache isn't churned
+//      by images that won't show for minutes. At runtime the carousels'
+//      ±CAROUSEL_PRELOAD_RADIUS window promotes each image disk→memory just
+//      before it's shown — network never touches a carousel tick again.
 //
 // Everything is best-effort. Any failure leaves that slice null and the home
 // screen falls back to its normal fetch. Nothing here can block navigation —
@@ -29,25 +33,61 @@ package com.example.bluehive
 // ─────────────────────────────────────────────────────────────────────────────
 
 import android.util.Log
+import coil.request.CachePolicy
 import coil.request.ImageRequest
+import coil.request.SuccessResult
 import com.example.bluehive.api.ApiClient
+import com.example.bluehive.api.TrendingItem
+import com.example.bluehive.homeScreenSectionRules.TRAILER_THUMB_PX_H
+import com.example.bluehive.homeScreenSectionRules.TRAILER_THUMB_PX_W
+import com.example.bluehive.homeScreenSectionRules.TRENDING_BACKDROP_PX_H
+import com.example.bluehive.homeScreenSectionRules.TRENDING_BACKDROP_PX_W
+import com.example.bluehive.homeScreenSectionRules.trailerThumbMemoryKey
+import com.example.bluehive.homeScreenSectionRules.trailerThumbUrl
+import com.example.bluehive.homeScreenSectionRules.trendingBackdropMemoryKey
+import com.example.bluehive.homeScreenSectionRules.trendingBackdropUrl
+import com.example.bluehive.models.LatestTrailer
 import com.example.bluehive.repository.TrailerRepository
 import com.example.bluehive.singleShelfComponents.ContentShelf
 import com.example.bluehive.singleShelfComponents.MediaType
 import com.example.bluehive.singleShelfComponents.ShelfRepository
 import com.example.bluehive.trendingComponents.TrendingRepository
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 object AppWarmup {
 
     private const val TAG = "AppWarmup"
 
-    // Item 4 — first-paint only. Keep these small.
-    private const val TRENDING_IMAGES_TO_WARM = 3   // carousel shows one at a time
-    private const val MOVIE_POSTERS_TO_WARM   = 8   // first visible shelf row
+    // First-paint memory residents — what's on screen the instant home mounts.
+    // Everything past these counts is disk-only during the splash.
+    private const val TRENDING_MEMORY_WARM  = 6   // hero backdrop + first few ticks
+    private const val TRAILER_MEMORY_WARM   = 4
+    private const val MOVIE_POSTERS_TO_WARM = 8   // first visible shelf row
 
     private const val SHELF_PAGE_SIZE = 20   // MUST match ShelfRowContent's pageSize
+
+    // Gentle spacing between enqueues — the ImageLoader's capped fetcher (4) /
+    // decoder (2) dispatchers do the real throttling; this just avoids dumping
+    // 140 requests into Coil's queue in one frame. Budget matters: the spacing
+    // alone puts a (items × spacing) floor on the splash, so 10ms keeps the
+    // whole enqueue pass (~1.4s for 140 images) inside LOADING_MIN_DISPLAY_MS —
+    // zero perceived cost on a warm cache. 25ms was adding ~3.5s to EVERY cold
+    // start, downloads or not.
+    private const val PREFETCH_SPACING_MS = 10L
+
+    // The carousel prefetch runs HERE, not in the caller's scope: the
+    // LoadingScreen cancels run() at its hard cap, but this scope survives, so
+    // on a slow network the remaining images keep trickling into the disk
+    // cache behind the profile picker instead of being abandoned.
+    private val imagePrefetchScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /**
      * Runs the full warm-up. Suspends until all best-effort work finishes OR
@@ -178,8 +218,19 @@ object AppWarmup {
                 )
                 Log.d(TAG, "📦 Home prefetch stored (profile=$lastProfileId, guessMatched=$guessMatched, trending=${trending.size}, trailers=${trailers.size}, cw=${cw?.size}, movies=${movies?.items?.size}, nflxMovies=${netflixMovies?.items?.size}, nflxTv=${netflixTvShows?.items?.size})")
 
-                // ── Step 4: image warming (first-paint only) ────────────────
-                warmFirstPaintImages(app, trending.mapNotNull { it.backdropPath }, movies?.items?.mapNotNull { it.posterUrl } ?: emptyList())
+                // ── Step 4: carousel image prefetch (FULL set) ──────────────
+                // Launched in imagePrefetchScope so the splash's timeout can't
+                // kill the tail; join() lets a normal network finish while the
+                // bee logo is still on screen.
+                val imageJob = imagePrefetchScope.launch {
+                    prefetchCarouselImages(
+                        app          = app,
+                        trending     = trending,
+                        trailers     = trailers,
+                        moviePosters = movies?.items?.mapNotNull { it.posterUrl } ?: emptyList(),
+                    )
+                }
+                imageJob.join()
             }
         } catch (e: Exception) {
             // Catch-all: warm-up is never allowed to crash the splash.
@@ -188,36 +239,72 @@ object AppWarmup {
     }
 
     /**
-     * Decodes a small number of first-paint images into Coil's memory cache so
-     * the home screen's first row renders instantly instead of popping in.
-     * Capped deliberately (item 4) to avoid GC churn on memory-limited boxes.
+     * Pulls the COMPLETE trending + trailer image sets during the splash.
+     *
+     * Every request is built with the shared spec helpers from
+     * homeScreenSectionRules, so the bytes land under the exact disk/memory
+     * keys the carousels ask for. Memory policy is tiered for 2 GB boxes:
+     * the first-paint window is memory-ENABLED (instant first frame); the
+     * rest are READ_ONLY — they fill the disk cache without evicting what's
+     * on screen. Suspends until every request reaches a terminal state, so
+     * the LoadingScreen's join() genuinely means "the carousels are local."
      */
-    private fun warmFirstPaintImages(
+    private suspend fun prefetchCarouselImages(
         app: BlueHiveApplication,
-        trendingBackdrops: List<String>,
+        trending: List<TrendingItem>,
+        trailers: List<LatestTrailer>,
         moviePosters: List<String>,
     ) {
         val loader = BlueHiveApplication.coilImageLoader
+        val jobs = mutableListOf<Deferred<*>>()
 
-        trendingBackdrops.take(TRENDING_IMAGES_TO_WARM).forEach { url ->
-            loader.enqueue(
+        // Trending backdrops — the hero panel, so it goes first.
+        trending.forEachIndexed { i, item ->
+            val url = item.backdropPath ?: return@forEachIndexed
+            jobs += loader.enqueue(
                 ImageRequest.Builder(app)
-                    // Match the transform the trending carousel applies so the
-                    // warmed cache key lines up with what the UI requests.
-                    .data(url.replace("/w1280/", "/w780/"))
+                    .data(trendingBackdropUrl(url))
+                    .size(TRENDING_BACKDROP_PX_W, TRENDING_BACKDROP_PX_H)
+                    .memoryCacheKey(trendingBackdropMemoryKey(item.trendingId))
+                    .memoryCachePolicy(if (i < TRENDING_MEMORY_WARM) CachePolicy.ENABLED else CachePolicy.READ_ONLY)
+                    .diskCachePolicy(CachePolicy.ENABLED)
+                    .allowRgb565(true)
+                    .allowHardware(true)
                     .build()
-            )
+            ).job
+            delay(PREFETCH_SPACING_MS)
         }
 
+        // Trailer thumbs — full set, same tiering.
+        trailers.forEachIndexed { i, t ->
+            jobs += loader.enqueue(
+                ImageRequest.Builder(app)
+                    .data(trailerThumbUrl(t.imgSrc))
+                    .size(TRAILER_THUMB_PX_W, TRAILER_THUMB_PX_H)
+                    .memoryCacheKey(trailerThumbMemoryKey(t.id))
+                    .memoryCachePolicy(if (i < TRAILER_MEMORY_WARM) CachePolicy.ENABLED else CachePolicy.READ_ONLY)
+                    .diskCachePolicy(CachePolicy.ENABLED)
+                    .allowRgb565(true)
+                    .allowHardware(true)
+                    .build()
+            ).job
+            delay(PREFETCH_SPACING_MS)
+        }
+
+        // First shelf row posters — memory-resident, same as the old warm.
         moviePosters.take(MOVIE_POSTERS_TO_WARM).forEach { url ->
-            loader.enqueue(
+            jobs += loader.enqueue(
                 ImageRequest.Builder(app)
                     .data(url)
                     .build()
-            )
+            ).job
         }
 
-        Log.d(TAG, "🖼️ Warming ${minOf(trendingBackdrops.size, TRENDING_IMAGES_TO_WARM)} backdrops + ${minOf(moviePosters.size, MOVIE_POSTERS_TO_WARM)} posters")
+        val results = jobs.awaitAll()
+        val ok = results.count { it is SuccessResult }
+        Log.d(TAG, "🖼️ Carousel prefetch done: $ok/${jobs.size} images local " +
+                "(${trending.size} backdrops, ${trailers.size} trailer thumbs, " +
+                "${minOf(moviePosters.size, MOVIE_POSTERS_TO_WARM)} posters)")
     }
 
     /**

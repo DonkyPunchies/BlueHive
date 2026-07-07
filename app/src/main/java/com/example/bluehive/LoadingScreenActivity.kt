@@ -49,7 +49,13 @@ import androidx.core.net.toUri
 import kotlinx.coroutines.withTimeoutOrNull
 
 private const val LOADING_MIN_DISPLAY_MS = 1_500L   // branding video shows at least this long
-private const val LOADING_MAX_WAIT_MS    = 12_000L  // dead-network safety cap only
+// Warm-up now includes the FULL trending + trailer image prefetch (both
+// sections are profile-agnostic, so the splash is the one place it can happen
+// once for everyone). Only a true first install on slow WiFi ever approaches
+// this cap — warm launches are all disk hits and exit in a couple of seconds.
+// On timeout the prefetch keeps running in AppWarmup's own scope behind the
+// profile picker; nothing is abandoned.
+private const val LOADING_MAX_WAIT_MS    = 20_000L
 
 class LoadingScreenActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -120,11 +126,13 @@ fun LoadingScreen(onLoadingComplete: () -> Unit) {
         val startedAt = System.currentTimeMillis()
 
         // Wait for the warm-up to actually FINISH — profiles, trending, the
-        // Netflix prefetch, and first-paint image warming are all done before
-        // we leave this screen. No blind timer. Two guards keep it sane:
+        // Netflix prefetch, and the FULL carousel image prefetch are all done
+        // before we leave this screen. No blind timer. Two guards keep it sane:
         //   • MIN_DISPLAY — a fast warm-up can't make the splash flash by.
         //   • MAX_WAIT — genuine dead-network backstop so it can't hang forever;
-        //     on timeout the profile screen's own retry banner takes over.
+        //     on timeout the profile screen's own retry banner takes over, and
+        //     the image prefetch (which runs in AppWarmup's OWN scope) keeps
+        //     trickling into the disk cache — this cancel doesn't kill it.
         val warmupJob = launch { AppWarmup.run(app) }
         withTimeoutOrNull(LOADING_MAX_WAIT_MS) { warmupJob.join() }
         warmupJob.cancel()   // no-op if it finished; cleans up on timeout

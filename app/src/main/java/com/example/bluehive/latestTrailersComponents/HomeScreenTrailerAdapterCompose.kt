@@ -23,6 +23,10 @@ import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import coil.request.CachePolicy
 import coil.request.ImageRequest
+import com.example.bluehive.homeScreenSectionRules.TRAILER_THUMB_PX_H
+import com.example.bluehive.homeScreenSectionRules.TRAILER_THUMB_PX_W
+import com.example.bluehive.homeScreenSectionRules.trailerThumbMemoryKey
+import com.example.bluehive.homeScreenSectionRules.trailerThumbUrl
 import com.example.bluehive.models.LatestTrailer
 import com.example.bluehive.utilities.AppTypography
 import androidx.compose.ui.platform.LocalContext
@@ -33,9 +37,9 @@ private val TRAILER_SCRIM = Brush.verticalGradient(
 )
 private val BADGE_SHAPE = RoundedCornerShape(3.dp)
 
-// Stable decode dimensions for 325dp×182dp viewport at 2× density
-private const val TRAILER_PX_W = 488
-private const val TRAILER_PX_H = 273
+// Decode dimensions + URL transform + cache key all come from the SHARED spec
+// in homeScreenSectionRules — the window preloader and AppWarmup's splash
+// prefetch build byte-identical requests, so this render is always a cache hit.
 private val BADGE_COUNT_BG = Color(0xCC000000)
 
 
@@ -58,14 +62,14 @@ fun HomeScreenTrailerAdapterCompose(
     ) {
         AsyncImage(
             model = ImageRequest.Builder(context)
-                .data(trailer.imgSrc.replace("/w1280/", "/w500/").replace("/original/", "/w500/"))
+                .data(trailerThumbUrl(trailer.imgSrc))
                 .memoryCachePolicy(CachePolicy.ENABLED)
                 .diskCachePolicy(CachePolicy.ENABLED)
                 .allowRgb565(true)
                 .allowHardware(true)
-                .size(TRAILER_PX_W, TRAILER_PX_H)
+                .size(TRAILER_THUMB_PX_W, TRAILER_THUMB_PX_H)
                 .crossfade(150)
-                .memoryCacheKey("trailer_thumb_${trailer.id}_${TRAILER_PX_W}x${TRAILER_PX_H}")
+                .memoryCacheKey(trailerThumbMemoryKey(trailer.id))
                 .build(),
             contentDescription = trailer.title,
             modifier = Modifier.fillMaxSize(),

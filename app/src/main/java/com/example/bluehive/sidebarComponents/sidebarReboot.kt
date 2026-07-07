@@ -64,13 +64,22 @@ object SidebarReboot {
     private fun executeReboot(activity: Activity) {
         releaseSoundPool()
 
-        val intent = Intent(Intent.ACTION_MAIN).apply {
-            addCategory(Intent.CATEGORY_HOME)
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK
-        }
-        activity.startActivity(intent)
+        // Hand the relaunch to RebootActivity, which runs in its OWN process
+        // (:phoenix) and therefore survives the kill below. It restarts BlueHive
+        // through HostEntryActivity — fresh host token + the self-update check,
+        // so a newly published build installs right on reboot.
+        activity.startActivity(Intent(activity, RebootActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        })
 
-        activity.finishAffinity()
+        // Hard-kill ONLY BlueHive's main process — a genuine cold restart:
+        // fresh singletons, fresh Gecko, full splash + warm-up. OGD's task is
+        // untouched and stays right behind us, where Back expects it.
+        //
+        // (The old implementation launched ACTION_MAIN/CATEGORY_HOME — the
+        // system LAUNCHER — then exitProcess'd with no relaunch. That's why
+        // "reboot" used to dump the user on the TV home screen looking like
+        // BlueHive AND OGD had both crashed shut.)
         exitProcess(0)
     }
 }

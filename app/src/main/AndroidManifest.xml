@@ -64,6 +64,18 @@
             android:screenOrientation="landscape"
             android:theme="@style/Theme.BlueHive" />
 
+        <!-- Phoenix relauncher for the sidebar Reboot button. android:process
+             puts it in a SEPARATE process so it survives SidebarReboot killing
+             the main process, then relaunches BlueHive via HostEntryActivity
+             (front door = fresh host token + self-update check) and exits.
+             exported=false — only BlueHive itself starts it. -->
+        <activity
+            android:name=".sidebarComponents.RebootActivity"
+            android:process=":phoenix"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.BlueHive" />
+
 
 
         <!-- BlueHive's host-launch front door. The host (Off-Grid Drive) targets this

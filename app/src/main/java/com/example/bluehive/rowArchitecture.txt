@@ -51,7 +51,10 @@ COLD START (app opens):
           │                      ShelfRepository.loadPage(NETFLIX, MOVIES, profileId=warmProfileId)  ← new
           │                      ShelfRepository.loadPage(NETFLIX, TV_SHOWS, profileId=warmProfileId) ← new
           ├── Step 3: Await all — store in BlueHiveApplication.HomeScreenPrefetch
-          └── Step 4: warmFirstPaintImages() — prime Coil image cache
+          └── Step 4: prefetchCarouselImages() — FULL trending + trailer image
+                      sets pulled to disk during the splash (first-paint window
+                      memory-resident); runs in AppWarmup's own scope so the
+                      splash timeout can't kill the tail
     └── Navigate to ProfileScreenActivity (when warmup finishes, not on a timer)
 
 PROFILE SELECTION:
@@ -1021,11 +1024,21 @@ Sequence:
     If the guess was wrong (multi-profile household, different person picked),
     the netflix slices are discarded. Home fetches live on first load.
 
-  Step 4: warmFirstPaintImages(trending backdrops, movie posters)
-    Decodes the first few visible images into Coil's memory cache.
-    TRENDING_IMAGES_TO_WARM = 3, MOVIE_POSTERS_TO_WARM = 8.
-    Capped low intentionally — warming everything causes GC pressure on the
-    low-powered TV hardware.
+  Step 4: prefetchCarouselImages(trending, trailers, movie posters)
+    Trending + trailers are PROFILE-AGNOSTIC and static per backend refresh,
+    so the ENTIRE image set for both carousels downloads here, during the
+    splash. Requests are built from the shared spec in homeScreenSectionRules
+    (trendingBackdropUrl/trailerThumbUrl + memory keys + px sizes) so the
+    bytes land under the exact keys the carousels read.
+    Memory tiering for 2 GB boxes:
+      TRENDING_MEMORY_WARM = 6, TRAILER_MEMORY_WARM = 4  → memory ENABLED
+      everything after that → memory READ_ONLY (disk-fill only, no eviction
+      churn); the runtime ±CAROUSEL_PRELOAD_RADIUS window promotes each image
+      disk→memory just before display.
+    MOVIE_POSTERS_TO_WARM = 8 (first shelf row, unchanged).
+    Runs in imagePrefetchScope (SupervisorJob) — survives the LoadingScreen
+    cancelling run() at its hard cap; a slow first install keeps trickling
+    into the disk cache behind the profile picker.
 
   All steps wrapped in try/catch — warm-up failure never crashes the app.
 
@@ -1045,9 +1058,11 @@ LaunchedEffect(Unit):
 
 Constants:
   LOADING_MIN_DISPLAY_MS = 1_500   Minimum splash duration regardless of warmup speed.
-  LOADING_MAX_WAIT_MS    = 12_000  Safety cap. Only hit on a genuinely dead network.
-                                   On timeout: navigate anyway; profile screen's retry
-                                   banner handles offline state.
+  LOADING_MAX_WAIT_MS    = 20_000  Safety cap. Warm launches (disk cache full) exit in
+                                   ~2-3s; only a true first install on slow WiFi
+                                   approaches the cap. On timeout: navigate anyway; the
+                                   carousel image prefetch continues in AppWarmup's own
+                                   scope; profile screen's retry banner handles offline.
 
 This means: on a healthy network, the splash stays up exactly as long as the
 warmup takes (1.5s minimum). Both profiles AND the Netflix prefetch are done
@@ -1174,7 +1189,7 @@ ANDROID (LoadingScreenActivity.kt):
 
 ANDROID (BlueHiveApplication.kt):
   HOME_PREFETCH_TTL_MS      90000 Prefetch expires after 90s.
-  TRENDING_IMAGES_TO_WARM   3     Backdrop images decoded at cold start.
+  TRENDING_MEMORY_WARM      6     Backdrops memory-resident at cold start (rest disk-only).
   MOVIE_POSTERS_TO_WARM     8     Poster images decoded at cold start.
 
 

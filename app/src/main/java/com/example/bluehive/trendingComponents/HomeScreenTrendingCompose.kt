@@ -66,6 +66,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.rememberCoroutineScope
 import com.example.bluehive.homeScreenSectionRules.CAROUSEL_AUTO_CYCLE_ANIMATION_MS
+import com.example.bluehive.homeScreenSectionRules.TRENDING_BACKDROP_PX_H
+import com.example.bluehive.homeScreenSectionRules.TRENDING_BACKDROP_PX_W
+import com.example.bluehive.homeScreenSectionRules.trendingBackdropMemoryKey
+import com.example.bluehive.homeScreenSectionRules.trendingBackdropUrl
 import com.example.bluehive.homeScreenSectionRules.CAROUSEL_MANUAL_NAVIGATION_ANIMATION_MS
 import com.example.bluehive.homeScreenSectionRules.CAROUSEL_NAVIGATION_RATE_MS
 import com.example.bluehive.homeScreenSectionRules.CAROUSEL_PRELOAD_RADIUS
@@ -88,8 +92,9 @@ sealed class TrendingFrameState {
 // ─────────────────────────────────────────────────────────────────────────────
 
 
-private const val BACKDROP_PX_W = 848
-private const val BACKDROP_PX_H = 438
+// Decode dimensions + URL transform + cache key come from the SHARED spec in
+// homeScreenSectionRules — the window preloader and AppWarmup's splash prefetch
+// build byte-identical requests, so renders here are always cache hits.
 
 // Hoisted gradient — single allocation for the lifetime of the process.
 // Brush.verticalGradient inside a composable allocates on every recompose.
@@ -116,14 +121,14 @@ private fun TrendingItemAdapterCompose(
         // Backdrop image (w1280 already baked into the URL from the server)
         AsyncImage(
             model = ImageRequest.Builder(context)
-                .data(item.backdropPath?.replace("/w1280/", "/w780/"))
+                .data(item.backdropPath?.let { trendingBackdropUrl(it) })
                 .memoryCachePolicy(CachePolicy.ENABLED)
                 .diskCachePolicy(CachePolicy.ENABLED)
                 .allowRgb565(true)
                 .allowHardware(true)
                 .crossfade(150)
-                .size(BACKDROP_PX_W, BACKDROP_PX_H)
-                .memoryCacheKey("trending_backdrop_${item.trendingId}")
+                .size(TRENDING_BACKDROP_PX_W, TRENDING_BACKDROP_PX_H)
+                .memoryCacheKey(trendingBackdropMemoryKey(item.trendingId))
                 .build(),
             contentDescription = item.title,
             modifier = Modifier.fillMaxSize(),
@@ -285,7 +290,9 @@ private fun TrendingNavigationCompose(
         }
     }
 
-    // Preload window
+    // Preload window — shared image spec, so with AppWarmup having disk-filled
+    // the whole set during the splash, this just promotes disk→memory right
+    // before each backdrop is shown. Network never rides on a carousel tick.
     LaunchedEffect(items, currentIndex) {
         if (items.isEmpty()) return@LaunchedEffect
         val start = maxOf(0, currentIndex - CAROUSEL_PRELOAD_RADIUS)
@@ -294,13 +301,13 @@ private fun TrendingNavigationCompose(
             val url = items[i].backdropPath ?: continue
             context.imageLoader.enqueue(
                 ImageRequest.Builder(context)
-                    .data(url.replace("/w1280/", "/w780/"))
+                    .data(trendingBackdropUrl(url))
                     .memoryCachePolicy(CachePolicy.ENABLED)
                     .diskCachePolicy(CachePolicy.ENABLED)
                     .allowHardware(true)
                     .allowRgb565(true)
-                    .size(BACKDROP_PX_W, BACKDROP_PX_H)
-                    .memoryCacheKey("trending_backdrop_${items[i].trendingId}")
+                    .size(TRENDING_BACKDROP_PX_W, TRENDING_BACKDROP_PX_H)
+                    .memoryCacheKey(trendingBackdropMemoryKey(items[i].trendingId))
                     .build()
             )
             delay(10)

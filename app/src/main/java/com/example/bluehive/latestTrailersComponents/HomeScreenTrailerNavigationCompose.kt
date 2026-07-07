@@ -35,6 +35,11 @@ import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.graphics.graphicsLayer
 import com.example.bluehive.homeScreenSectionRules.CAROUSEL_AUTO_CYCLE_ANIMATION_MS
+import com.example.bluehive.homeScreenSectionRules.CAROUSEL_TRAILER_PHASE_OFFSET_MS
+import com.example.bluehive.homeScreenSectionRules.TRAILER_THUMB_PX_H
+import com.example.bluehive.homeScreenSectionRules.TRAILER_THUMB_PX_W
+import com.example.bluehive.homeScreenSectionRules.trailerThumbMemoryKey
+import com.example.bluehive.homeScreenSectionRules.trailerThumbUrl
 import com.example.bluehive.homeScreenSectionRules.CAROUSEL_MANUAL_NAVIGATION_ANIMATION_MS
 import com.example.bluehive.homeScreenSectionRules.CAROUSEL_NAVIGATION_RATE_MS
 import com.example.bluehive.homeScreenSectionRules.CAROUSEL_PRELOAD_RADIUS
@@ -87,6 +92,12 @@ fun HomeScreenTrailerNavigationCompose(
     val interactiveState    = rememberUpdatedState(isInteractive)
     val trailerPlayingState = rememberUpdatedState(isTrailerPlaying)
     LaunchedEffect(cycleTick) {
+        // Half-beat phase offset (see CAROUSEL_TRAILER_PHASE_OFFSET_MS): trending
+        // slides on the tick, trailers 3s later, so the two full-panel slide
+        // animations never share frames. The pause/interactive gates are read
+        // AFTER the delay so they reflect the moment this slide would actually
+        // start (e.g. sidebar opened during the offset window → skip cleanly).
+        delay(CAROUSEL_TRAILER_PHASE_OFFSET_MS)
         if (!interactiveState.value && !trailerPlayingState.value && !pausedState.value && trailers.isNotEmpty()) {
             slideDir           = 1
             isManualNavigation = false
@@ -96,7 +107,12 @@ fun HomeScreenTrailerNavigationCompose(
 
 
 
-    // Preload window around currentIndex (Compose version of your old sliding window)
+    // Preload window around currentIndex. Built from the SHARED image spec
+    // (homeScreenSectionRules) so it hits the exact same disk/memory keys the
+    // adapter renders from. It previously fetched the raw w1280/original URL
+    // at 650×364 with no cache key — images the UI never read, so every tick
+    // downloaded twice. With AppWarmup having disk-filled the whole set, this
+    // window now just promotes disk→memory right before display.
     LaunchedEffect(trailers, currentIndex) {
         if (trailers.isEmpty()) return@LaunchedEffect
 
@@ -104,10 +120,11 @@ fun HomeScreenTrailerNavigationCompose(
         val end = minOf(trailers.lastIndex, currentIndex + CAROUSEL_PRELOAD_RADIUS)
 
         for (i in start..end) {
-            val url = trailers[i].imgSrc
+            val trailer = trailers[i]
             val req = ImageRequest.Builder(context)
-                .data(url)
-                .size(650, 364)            // matches 325dp×182dp at 2× density
+                .data(trailerThumbUrl(trailer.imgSrc))
+                .size(TRAILER_THUMB_PX_W, TRAILER_THUMB_PX_H)
+                .memoryCacheKey(trailerThumbMemoryKey(trailer.id))
                 .memoryCachePolicy(CachePolicy.ENABLED)
                 .diskCachePolicy(CachePolicy.ENABLED)
                 .allowHardware(true)       // GPU memory, not Java heap
