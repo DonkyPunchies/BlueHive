@@ -91,11 +91,14 @@ object UpdateManager {
             ?.forEach { it.delete() }
 
         val out = File(context.cacheDir, "update-${manifest.latestVersionCode}.apk")
+        // Rebuild the download URL from our configured base — the manifest's apk_url
+        // is absolute with the server's baked-in host, wrong once the server moves.
+        val apkUrl = ServerConfig.updateBaseUrl + "/apk/" + manifest.apkUrl.substringAfterLast('/')
         try {
-            val req = Request.Builder().url(manifest.apkUrl).get().build()
+            val req = Request.Builder().url(apkUrl).get().build()
             downloadHttp.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) {
-                    Log.w(TAG, "APK HTTP ${resp.code} from ${manifest.apkUrl}")
+                    Log.w(TAG, "APK HTTP ${resp.code} from $apkUrl")
                     return@withContext null
                 }
                 val body = resp.body ?: return@withContext null
@@ -164,7 +167,7 @@ object UpdateManager {
     }
 
     private fun fetchManifest(): Manifest? {
-        val url = BuildConfig.UPDATE_BASE_URL.trimEnd('/') + "/bluehive/version"
+        val url = ServerConfig.updateBaseUrl + "/bluehive/version"
         return try {
             val req = Request.Builder().url(url).get().build()
             manifestHttp.newCall(req).execute().use { resp ->
@@ -172,7 +175,9 @@ object UpdateManager {
                     Log.w(TAG, "Manifest HTTP ${resp.code} from $url")
                     return null
                 }
-                val body = resp.body?.string() ?: return null
+                // Strip a leading UTF-8 BOM if the server ever emits one — org.json
+                // does not skip it and would otherwise throw on an otherwise-valid manifest.
+                val body = (resp.body?.string() ?: return null).removePrefix("﻿")
                 val j = JSONObject(body)
                 Manifest(
                     latestVersionCode = j.getInt("latest_version_code"),
