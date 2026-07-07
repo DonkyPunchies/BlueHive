@@ -213,8 +213,20 @@ fun ProfileScreen(
         try {
             val fetched = ApiClient.bluehiveApi.listProfiles()
             Log.d("ProfileScreen", "✅ Fetched ${fetched.size} profiles: ${fetched.map { it.display_name }}")
+
+            // LOCAL-ONLY ordering: the profile last selected ON THIS DEVICE leads
+            // the grid. Reads SessionManager.lastProfileId — already persisted by
+            // goHome() on every selection — so there's no backend involvement and
+            // the set of profiles is untouched. sortedByDescending on a Boolean is
+            // a STABLE sort: the match floats to slot 1, everyone else keeps the
+            // server's order. First launch (lastProfileId == -1) matches nothing
+            // → server order unchanged. Bonus: the grid auto-focuses slot 1, so
+            // the remote's OK button now means "continue as me."
+            val lastId  = SessionManager.get().lastProfileId
+            val ordered = fetched.sortedByDescending { it.id == lastId }
+
             profiles.clear()
-            profiles.addAll(fetched)
+            profiles.addAll(ordered)
         } catch (e: Exception) {
             Log.e("ProfileScreen", "❌ Failed to load profiles: ${e.message}")
             // Only surface the retry banner when the device is genuinely offline.

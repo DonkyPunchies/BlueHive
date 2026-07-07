@@ -35,6 +35,22 @@ class HostEntryActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // ── Resume-in-place guard ─────────────────────────────────────────────
+        // If this HostEntry is NOT the task root, BlueHive is ALREADY RUNNING
+        // beneath us — the user pressed Home, went back through OGD, and hit
+        // Launch again. Android stacked this fresh entry on top of the living
+        // task; running the cold-start flow from here would CLEAR_TASK the whole
+        // thing and dump the user back at the splash. Instead: step aside and
+        // reveal the app exactly where they left it. Fresh tokens are pulled on
+        // demand (401 → host), and updates install on the next cold entry or
+        // sidebar Reboot.
+        if (!isTaskRoot) {
+            Log.i(TAG, "BlueHive already running — resuming in place (skipping cold-start flow)")
+            finish()
+            return
+        }
+
         hostConn = HostConnection(applicationContext)
 
         Log.i(TAG, "Launched by host. action=${intent?.action}")
@@ -134,7 +150,9 @@ class HostEntryActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        hostConn.unbind()
+        // hostConn is never initialized on the resume-in-place path (the
+        // !isTaskRoot early-finish above) — guard the lateinit.
+        if (::hostConn.isInitialized) hostConn.unbind()
     }
 }
 
