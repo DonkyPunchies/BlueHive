@@ -6,13 +6,13 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.os.IBinder
 import android.util.Log
+import com.example.bluehive.auth.SessionManager
 import io.bluehive.host.BlueHiveHostContract
 import io.bluehive.host.IBlueHiveHost
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 private const val TAG = "HostTokenProvider"
-private const val HOST_PACKAGE = "com.offgriddrive.tv"
 private const val BIND_TIMEOUT_SECONDS = 5L
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -84,8 +84,12 @@ object HostTokenProvider {
             }
             override fun onServiceDisconnected(name: ComponentName?) { host = null }
         }
+        val hostPackage = SessionManager.get().hostPackage ?: run {
+            Log.e(TAG, "No host package resolved — cannot bind for token refresh")
+            return null
+        }
         val intent = Intent(BlueHiveHostContract.ACTION_BIND_HOST).apply {
-            setPackage(HOST_PACKAGE)
+            setPackage(hostPackage)
         }
         val ok = try {
             ctx.bindService(intent, oneShot, Context.BIND_AUTO_CREATE)

@@ -2,8 +2,8 @@
 <!--
     AndroidManifest.xml — host-model (Phase 2)
     Entry point: .host.HostEntryActivity only (io.bluehive.host.action.LAUNCH).
-    No LEANBACK_LAUNCHER tile — BlueHive is reachable solely through the host
-    (Off-Grid Drive). LoadingScreenActivity → ProfileScreenActivity → HomeScreenCompose
+    No LEANBACK_LAUNCHER tile — BlueHive is reachable solely through a host
+    app. LoadingScreenActivity → ProfileScreenActivity → HomeScreenCompose
     is the internal flow once the host injects a token.
 -->
 <manifest xmlns:tools="http://schemas.android.com/tools"
@@ -25,10 +25,14 @@
         <intent>
             <action android:name="android.speech.RecognitionService" />
         </intent>
-        <!-- Allows BlueHive to see + bind to the Off-Grid Drive host service
-             (IBlueHiveHost) on Android 11+. Without this, bindService() to the
-             host silently fails because package visibility is restricted. -->
-        <package android:name="com.offgriddrive.tv" />
+        <!-- Lets BlueHive see + bind to ANY installed host that exposes the
+             IBlueHiveHost service (action BIND_HOST) on Android 11+. Declared by
+             ACTION, so no specific host package is named. Without a <queries>
+             match, queryIntentServices()/bindService() to the host silently
+             return nothing because package visibility is restricted. -->
+        <intent>
+            <action android:name="io.bluehive.host.action.BIND_HOST" />
+        </intent>
     </queries>
 
     <uses-feature
@@ -53,7 +57,7 @@
         android:theme="@style/Theme.BlueHive">
 
         <!-- PHASE 2: BlueHive has no independent launcher tile. Identity lives in
-             the host (Off-Grid Drive); BlueHive is only reachable via the host's
+             the host app; BlueHive is only reachable via the host's
              io.bluehive.host.action.LAUNCH intent (see .host.HostEntryActivity).
              LoadingScreenActivity is now an internal-only entry point started by
              HostEntryActivity after the host injects a token, so it's no longer
@@ -91,7 +95,7 @@
 
 
 
-        <!-- BlueHive's host-launch front door. The host (Off-Grid Drive) targets this
+        <!-- BlueHive's host-launch front door. The host app targets this
          via io.bluehive.host.action.LAUNCH. exported=true is required because a
          different app (the host) starts it. NO LEANBACK_LAUNCHER here — this is not
          a home-screen entry point; it's only reachable via the host intent. -->

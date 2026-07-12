@@ -59,7 +59,7 @@ import kotlinx.coroutines.launch
  * runtime snapshot) through the same pipeline crash reports use.
  *
  * DELIBERATELY NO server/connectivity rows here: BlueHive's UI stays fully
- * separated from Off-Grid infrastructure — the uploaded logcat already tells
+ * separated from host + backend infrastructure — the uploaded logcat already tells
  * support everything about connectivity without the UI advertising it.
  */
 class DiagnosticsActivity : ComponentActivity() {

@@ -48,7 +48,7 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
     // expiry event can tear BlueHive down (finishAffinity → drops back to the
     // host) without needing an Activity reference at the call site. PHASE 2:
     // BlueHive owns no pairing screen, so "session expired" means "close and
-    // return to OGD," not "launch LoginScreenActivity."
+    // return to the host," not "launch LoginScreenActivity."
     private var foregroundActivity: java.lang.ref.WeakReference<android.app.Activity>? = null
 
     companion object {
@@ -438,7 +438,7 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
         // ── Session expired ────────────────────────────────────────────────────
         // PHASE 2: identity loss (host revoked/unpaired) means BlueHive closes
         // and hands control back to the host, which owns re-pairing. We finish
-        // the foreground Activity's whole task; the user lands back on OGD.
+        // the foreground Activity's whole task; the user lands back on the host.
         // HomeScreenCompose also catches this via its own returnToHost(); this
         // Application-level listener is the catch-all for every other screen.
         SessionExpiredBus.register {
@@ -454,7 +454,7 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
 
         // ── Lockout ────────────────────────────────────────────────────────────
         // PHASE 2: nothing sits beneath the lockout screen anymore. Back-press
-        // from LockoutActivity finishAffinity()s back to the host (OGD).
+        // from LockoutActivity finishAffinity()s back to the host.
         LockoutBus.register { reason ->
             if (LockoutActivity.isOnTop) {
                 Log.d(TAG, "🔒 Lockout posted but already on LockoutActivity — ignoring")

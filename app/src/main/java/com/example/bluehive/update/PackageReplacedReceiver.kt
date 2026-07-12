@@ -8,7 +8,7 @@ import android.util.Log
 /**
  * Fires after BlueHive is replaced by a self-update.
  *
- * PRIMARY relaunch is handled by the HOST (OGD's PackageReplacedReceiver), which
+ * PRIMARY relaunch is handled by the HOST (the host's own PackageReplacedReceiver), which
  * has foreground context at this moment and can legally startActivity. BlueHive
  * cannot relaunch itself here — a broadcast receiver with no visible window is
  * blocked by Android's background-activity-launch rules (BAL_BLOCK, API 29+).

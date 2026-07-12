@@ -5,7 +5,7 @@
     nonMinifiedRelease is the build type the androidx baselineprofile plugin
     creates purely for generating Baseline Profiles on the Gradle-managed
     emulator. BlueHive has no launcher tile (companion app), and the emulator
-    has no Off-Grid Drive host to fire the companion intent — so the generator
+    has no host app to fire the companion intent — so the generator
     enters through LoadingScreenActivity directly, which requires it to be
     exported in THIS variant.
 

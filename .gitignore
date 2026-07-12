@@ -9,6 +9,10 @@
 /.idea/assetWizardSettings.xml
 .DS_Store
 /build
+# Belt-and-suspenders: ignore every module's build/ output at any depth, so a
+# newly added module (like baselineprofile) can't leak Gradle artifacts even if
+# it's missing its own .gitignore.
+build/
 /captures
 .externalNativeBuild
 .cxx
@@ -16,3 +20,8 @@
 local.properties
 
 keystore.properties
+
+# Local developer notes (LAN IPs, machine paths, private backend workflow) —
+# never publish. Kept at the repo root for convenience but out of src/ so it
+# ships in neither the APK nor the repo.
+/How_To_Run

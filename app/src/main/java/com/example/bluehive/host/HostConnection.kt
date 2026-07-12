@@ -7,17 +7,13 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.os.IBinder
 import android.util.Log
+import com.example.bluehive.auth.SessionManager
 import io.bluehive.host.BlueHiveHostContract
 import io.bluehive.host.IBlueHiveHost
 import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
 
 private const val TAG = "HostConnection"
-
-// The host package we bind to. For now this is Off-Grid Drive's id. Later, when
-// BlueHive supports arbitrary hosts, the launching host's package can be read
-// from the launch intent / referrer instead of hardcoding it.
-private const val HOST_PACKAGE = "com.offgriddrive.tv"
 
 /**
  * Wraps binding to the host's IBlueHiveHost service.
@@ -37,8 +33,14 @@ class HostConnection(private val context: Context) {
      * (host not installed / service not found).
      */
     suspend fun bind(): IBlueHiveHost? = suspendCancellableCoroutine { cont ->
+        val hostPackage = SessionManager.get().hostPackage
+        if (hostPackage == null) {
+            Log.e(TAG, "No host package resolved — cannot bind (launch BlueHive from a host app)")
+            if (cont.isActive) cont.resume(null)
+            return@suspendCancellableCoroutine
+        }
         val intent = Intent(BlueHiveHostContract.ACTION_BIND_HOST).apply {
-            setPackage(HOST_PACKAGE)
+            setPackage(hostPackage)
         }
 
         val conn = object : ServiceConnection {

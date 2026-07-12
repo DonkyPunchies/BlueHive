@@ -429,7 +429,7 @@ interface BluehiveApiService {
      * + X-API-Key); the server reads user_id/device_id as opaque ints from the
      * JWT and takes the device_fingerprint from the body. This lives on
      * bluehiveApi (NOT platformApi) on purpose: BlueHive's telemetry stays in
-     * BlueHive's backend, never the Off-Grid platform DB. Sent by CrashReporter
+     * BlueHive's backend, never the shared platform DB. Sent by CrashReporter
      * ('crash', launch after a crash) and Send Logs ('diagnostic').
      */
     @POST("/api/bluehive/reports")

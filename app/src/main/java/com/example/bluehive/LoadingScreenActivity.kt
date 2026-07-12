@@ -92,10 +92,10 @@ class LoadingScreenActivity : ComponentActivity() {
                         finish()
                     } else {
                         // PHASE 2: BlueHive has no pairing screen of its own —
-                        // identity lives in the host (OGD). A direct launcher
+                        // identity lives in the host. A direct launcher
                         // open with no host-injected token can't do anything
                         // useful, so close and let the user enter via the host.
-                        Log.d("SessionCheck", "→ No session and no host token — closing (launch via Off-Grid Drive)")
+                        Log.d("SessionCheck", "→ No session and no host token — closing (launch via your host app)")
                         finishAffinity()
                     }
                 }

@@ -111,7 +111,7 @@ class LockoutActivity : ComponentActivity() {
             override fun handleOnBackPressed() {
                 // PHASE 2: nothing sits beneath the lockout screen and BlueHive
                 // owns no pairing front door. Back closes BlueHive's task and
-                // drops the user back to the host (OGD).
+                // drops the user back to the host.
                 DeviceEventStream.stopAndMarkExited()
                 finishAffinity()
             }

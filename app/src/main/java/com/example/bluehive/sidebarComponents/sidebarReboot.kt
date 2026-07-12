@@ -73,13 +73,13 @@ object SidebarReboot {
         })
 
         // Hard-kill ONLY BlueHive's main process — a genuine cold restart:
-        // fresh singletons, fresh Gecko, full splash + warm-up. OGD's task is
+        // fresh singletons, fresh Gecko, full splash + warm-up. The host's task is
         // untouched and stays right behind us, where Back expects it.
         //
         // (The old implementation launched ACTION_MAIN/CATEGORY_HOME — the
         // system LAUNCHER — then exitProcess'd with no relaunch. That's why
         // "reboot" used to dump the user on the TV home screen looking like
-        // BlueHive AND OGD had both crashed shut.)
+        // BlueHive AND the host had both crashed shut.)
         exitProcess(0)
     }
 }

@@ -38,7 +38,7 @@ class HostEntryActivity : ComponentActivity() {
 
         // ── Resume-in-place guard ─────────────────────────────────────────────
         // If this HostEntry is NOT the task root, BlueHive is ALREADY RUNNING
-        // beneath us — the user pressed Home, went back through OGD, and hit
+        // beneath us — the user pressed Home, went back through the host, and hit
         // Launch again. Android stacked this fresh entry on top of the living
         // task; running the cold-start flow from here would CLEAR_TASK the whole
         // thing and dump the user back at the splash. Instead: step aside and
@@ -53,19 +53,33 @@ class HostEntryActivity : ComponentActivity() {
 
         hostConn = HostConnection(applicationContext)
 
+        // Resolve WHICH app is acting as our host (the launcher, else the sole
+        // installed host) and remember it, so background token refreshes can
+        // rebind without a launch intent. Companion apps trust the host that
+        // launched them; nothing here names a specific host. Best-effort — if it
+        // can't be resolved we still run the update check below, then the bind
+        // step fails cleanly with a "couldn't reach the host" message.
+        val resolvedHost = HostDiscovery.resolveFromLaunch(this)
+        if (resolvedHost != null) {
+            SessionManager.get().setHostPackage(resolvedHost)
+            Log.i(TAG, "Host resolved: $resolvedHost")
+        } else {
+            Log.w(TAG, "No host could be resolved at launch")
+        }
+
         Log.i(TAG, "Launched by host. action=${intent?.action}")
 
-        // The primary update path is now HOST-orchestrated: OGD checks the
+        // The primary update path is now HOST-orchestrated: the host checks the
         // manifest and updates BlueHive (if needed) BEFORE firing this launch
-        // intent, setting EXTRA_SKIP_UPDATE_CHECK=true — see BluehiveUpdater
-        // and BlueHiveLaunch.kt on the OGD side. That path is gap-free because
-        // OGD's own process never dies while installing BlueHive.
+        // intent, setting EXTRA_SKIP_UPDATE_CHECK=true — see the host's launch +
+        // updater code. That path is gap-free because the host's own process
+        // never dies while installing BlueHive.
         //
         // This in-app check remains as the FALLBACK for any host that doesn't
         // orchestrate updates (the flag defaults to false/absent), and for
         // direct launches (adb, debugging). It still has the known compile-gap
         // blind spot documented in SelfUpdateActivity, which is exactly why
-        // OGD-orchestration is preferred whenever the host supports it.
+        // host-orchestration is preferred whenever the host supports it.
         val skipUpdate = intent?.getBooleanExtra(
             BlueHiveHostContract.EXTRA_SKIP_UPDATE_CHECK, false
         ) ?: false
@@ -115,7 +129,7 @@ class HostEntryActivity : ComponentActivity() {
                 BlueHiveHostContract.IDENTITY_STATE_HOST_BUSY ->
                     toastAndFinish("Host is still setting up — try again shortly.")
                 else ->
-                    toastAndFinish("Set up BlueHive in Off-Grid Drive first.")
+                    toastAndFinish("Set up BlueHive in your host app first.")
             }
         }
     }
@@ -130,7 +144,7 @@ class HostEntryActivity : ComponentActivity() {
 
         if (token.isNullOrEmpty()) {
             Log.w(TAG, "Host READY but token null/empty — treating as not paired")
-            toastAndFinish("Set up BlueHive in Off-Grid Drive first.")
+            toastAndFinish("Set up BlueHive in your host app first.")
             return
         }
 

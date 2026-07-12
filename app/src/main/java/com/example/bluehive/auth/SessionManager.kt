@@ -76,6 +76,14 @@ class SessionManager private constructor(context: Context) {
         get() = prefs.getString(KEY_DEVICE_FP, null)
             ?: error("DeviceFingerprint missing — was SessionManager.init() called in Application.onCreate()?")
 
+    /** Package name of the host app that launched BlueHive, resolved dynamically
+     *  at cold start (see HostDiscovery). Persisted so the background token
+     *  provider can rebind to the same host on a 401 — where no launch intent /
+     *  referrer is available. Null until a host has been resolved at least once.
+     *  BlueHive is a companion: it trusts whichever host launched it, and names
+     *  no specific host anywhere. */
+    val hostPackage: String? get() = prefs.getString(KEY_HOST_PACKAGE, null)
+
     // PHASE 2: In the host model BlueHive holds no refresh token of its own —
     // the host owns the only device-bound refresh token. Authentication is
     // satisfied by having either a host-injected access token OR a legacy
@@ -148,6 +156,15 @@ class SessionManager private constructor(context: Context) {
         }
     }
 
+    /** Remember which host app launched us (see [hostPackage]). Written with
+     *  commit() so it's on disk before the launch flow hands off and before any
+     *  background token refresh needs it. */
+    fun setHostPackage(pkg: String) {
+        val success = prefs.edit().putString(KEY_HOST_PACKAGE, pkg).commit()
+        if (success) Log.d(TAG, "Host package set to $pkg")
+        else Log.e(TAG, "❌ Host package write FAILED")
+    }
+
     /** Remember which profile was just selected, so the next cold-start
      *  warm-up can prefetch its personalized rows immediately. */
     fun setLastProfileId(profileId: Int) {
@@ -156,14 +173,21 @@ class SessionManager private constructor(context: Context) {
     }
 
     /**
-     * Wipes all session data except the device fingerprint.
-     * The fingerprint must survive logout so re-pairing still works.
+     * Wipes all session data except the device fingerprint and the resolved host
+     * package. Both are stable device configuration, not session state: the
+     * fingerprint must survive logout so re-pairing still works, and the host
+     * package must survive so the next launch/refresh still knows where to rebind
+     * (it is re-confirmed on every cold start anyway).
      */
     fun clearSession() {
         DeviceEventStream.stop()
         val fp = prefs.getString(KEY_DEVICE_FP, null)
+        val host = prefs.getString(KEY_HOST_PACKAGE, null)
         prefs.edit().clear().apply()
-        if (fp != null) prefs.edit().putString(KEY_DEVICE_FP, fp).apply()
+        prefs.edit().apply {
+            if (fp != null) putString(KEY_DEVICE_FP, fp)
+            if (host != null) putString(KEY_HOST_PACKAGE, host)
+        }.apply()
         Log.d(TAG, "Session cleared")
     }
 
@@ -179,6 +203,7 @@ class SessionManager private constructor(context: Context) {
         private const val KEY_EMAIL         = "email"
         private const val KEY_DEVICE_FP     = "device_fingerprint"
         private const val KEY_LAST_PROFILE_ID = "last_profile_id"
+        private const val KEY_HOST_PACKAGE  = "host_package"
 
         @Volatile private var INSTANCE: SessionManager? = null
 

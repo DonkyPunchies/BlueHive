@@ -226,7 +226,7 @@ class HomeScreenCompose : ComponentActivity() {
     // PHASE 2: under the host model BlueHive owns no pairing screen. A genuine
     // session loss (host reports revoked) means the HOST must handle re-pairing.
     // BlueHive's job is simply to stop and hand control back. We finishAffinity()
-    // to tear down BlueHive's task; the user is dropped back to the host (OGD),
+    // to tear down BlueHive's task; the user is dropped back to the host,
     // which owns the pairing front door. LoginScreenActivity is never launched.
     private fun returnToHost() {
         Log.w("HomeScreenCompose", "Session ended — returning to host")

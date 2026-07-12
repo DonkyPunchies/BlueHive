@@ -115,13 +115,13 @@ class SelfUpdateActivity : ComponentActivity() {
             // installs + AOT-compiles the APK (dex2oat) — on a 2GB TV box this
             // can take a while for a ~200MB app. Hold an indeterminate "Installing"
             // state here so the user sees a purposeful screen the whole time,
-            // instead of falling back to OGD / a blank screen. The process is
-            // killed by the OS when the replace completes; the host (OGD) then
+            // instead of falling back to the host / a blank screen. The process is
+            // killed by the OS when the replace completes; the host then
             // relaunches BlueHive. We flip to installing AFTER a brief beat so the
             // system confirm dialog is what the user acts on first.
             isInstalling.value = true
             status.value = "Installing update…"
-            // Success -> process replaced -> OGD relaunches. This coroutine never
+            // Success -> process replaced -> the host relaunches. This coroutine never
             // returns normally; it's killed with the process.
             // Cancel/fail -> UpdateInstallBus -> proceedToApp() (resets state).
         }
