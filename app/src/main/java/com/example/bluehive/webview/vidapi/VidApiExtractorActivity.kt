@@ -1,4 +1,4 @@
-package com.example.bluehive.webview.cinesrc
+package com.example.bluehive.webview.vidapi
 
 import android.content.Intent
 import android.os.Bundle
@@ -10,16 +10,17 @@ import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 
 /**
- * Transparent, content-less host for the cinesrc extraction. Runs in its own
- * process (see manifest android:process) so the WebView gets a whole main thread,
- * and is killed afterward to reclaim its memory — same pattern as MiruroExtractorActivity.
+ * Transparent, content-less host for the VidApi (embed) extraction. Runs in its
+ * own process (see manifest android:process) so the WebView gets a whole main
+ * thread, and is killed afterward to reclaim its memory — same pattern as
+ * MiruroExtractorActivity.
  */
-class CineSrcExtractorActivity : ComponentActivity() {
+class VidApiExtractorActivity : ComponentActivity() {
 
     companion object {
-        private const val TAG = "scraper-cine"
+        private const val TAG = "scraper-vidapi"
 
-        const val EXTRA_URL = "CINE_URL"
+        const val EXTRA_URL = "VIDAPI_URL"
 
         const val RESULT_M3U8     = "RESULT_M3U8"
         const val RESULT_REFERER  = "RESULT_REFERER"
@@ -38,14 +39,14 @@ class CineSrcExtractorActivity : ComponentActivity() {
 
         val url = intent.getStringExtra(EXTRA_URL)
         if (url.isNullOrBlank()) {
-            Log.e(TAG, "CineSrcExtractorActivity: missing URL")
+            Log.e(TAG, "VidApiExtractorActivity: missing URL")
             finishAndKill(RESULT_CANCELED, Intent()
                 .putExtra(RESULT_FAILED, true)
                 .putExtra(RESULT_REASON, "No embed URL was provided."))
             return
         }
 
-        Log.d(TAG, "🧩 cine extractor up (pid=${Process.myPid()}) url=$url")
+        Log.d(TAG, "🧩 vidapi extractor up (pid=${Process.myPid()}) url=$url")
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -54,10 +55,10 @@ class CineSrcExtractorActivity : ComponentActivity() {
             }
         })
 
-        CineSrcStreamExtractorWebView.extract(
+        VidApiStreamExtractorWebView.extract(
             context = this,
             url = url,
-            listener = object : CineSrcStreamExtractorWebView.ExtractionListener {
+            listener = object : VidApiStreamExtractorWebView.ExtractionListener {
                 override fun onStatusUpdate(status: String) { Log.d(TAG, "status: $status") }
 
                 override fun onM3u8Found(m3u8Url: String, subtitleUrl: String?, headers: Map<String, String>) {
@@ -85,7 +86,7 @@ class CineSrcExtractorActivity : ComponentActivity() {
         setResult(resultCode, data)
         finish()
         Handler(Looper.getMainLooper()).postDelayed({
-            Log.d(TAG, "💀 killing :cineextractor process (pid=${Process.myPid()})")
+            Log.d(TAG, "💀 killing :vidapiextractor process (pid=${Process.myPid()})")
             Process.killProcess(Process.myPid())
         }, 300)
     }

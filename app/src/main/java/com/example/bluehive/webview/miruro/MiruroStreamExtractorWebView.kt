@@ -56,8 +56,15 @@ import java.util.concurrent.atomic.AtomicBoolean
 class MiruroStreamExtractorWebView private constructor() {
 
     interface ExtractionListener {
-        /** MAIN thread. The master m3u8 + headers ExoPlayer should send. */
-        fun onM3u8Found(m3u8Url: String, headers: Map<String, String>)
+        /**
+         * MAIN thread. The master m3u8 + headers ExoPlayer should send.
+         *
+         * [servers] is the provider list read in the SAME pass, populated only
+         * when the caller asked for it (captureServers=true, default server) and
+         * the read succeeded — null otherwise. Lets the caller cache the list so a
+         * later "choose a server" needs no second webview pass.
+         */
+        fun onM3u8Found(m3u8Url: String, headers: Map<String, String>, servers: List<ServerInfo>?)
 
         /** MAIN thread. Failure or timeout. */
         fun onExtractionFailed(reason: String)
@@ -131,6 +138,56 @@ class MiruroStreamExtractorWebView private constructor() {
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
                     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
+        // ── Provider-dropdown JS (single source of truth) ────────────────────
+        // Shared by ENUMERATE, named-server EXTRACT, and the post-capture list
+        // read so the three can never drift apart.
+
+        /** Clicks the "Provider" trigger open. Returns 'opened' or 'no-trigger'. */
+        private val PROVIDER_OPEN_JS = """
+        (function() {
+            var t = document.querySelector('button[aria-label="Provider"]');
+            if (!t) return 'no-trigger';
+            try { t.click(); } catch(e){}
+            return 'opened';
+        })();
+        """.trimIndent()
+
+        /** Reads the open Provider listbox → {status, servers:[{name,tags,isDefault}]}. */
+        private val PROVIDER_READ_JS = """
+        (function() {
+            var t = document.querySelector('button[aria-label="Provider"]');
+            if (!t) return JSON.stringify({status:'no-trigger'});
+            var container = t.parentElement;
+            var menu = null;
+            while (container && !menu) {
+                menu = container.querySelector('[role="listbox"]');
+                if (!menu) container = container.parentElement;
+            }
+            if (!menu) return JSON.stringify({status:'no-menu'});
+            var opts = Array.prototype.slice.call(menu.querySelectorAll('[role="option"]'));
+            if (opts.length === 0) return JSON.stringify({status:'no-options'});
+            var servers = [];
+            for (var i = 0; i < opts.length; i++) {
+                var o = opts[i];
+                var nameEl = o.querySelector('[class*="itemName"]') || o.querySelector('[class*="itemLead"]');
+                var name = nameEl ? (nameEl.textContent || '').trim() : (o.textContent || '').trim();
+                if (!name) continue;
+                var tags = [];
+                var tagRow = o.querySelector('[class*="tagRow"]');
+                if (tagRow) {
+                    var kids = tagRow.children;
+                    for (var k = 0; k < kids.length; k++) {
+                        var tt = (kids[k].textContent || '').trim();
+                        if (tt) tags.push(tt);
+                    }
+                }
+                var isDefault = o.getAttribute('aria-selected') === 'true';
+                servers.push({ name: name, tags: tags, isDefault: isDefault });
+            }
+            return JSON.stringify({status:'ok', servers: servers});
+        })();
+        """.trimIndent()
+
         /** Process-wide single-flight guard. A plain boolean — holds no Context. */
         @Volatile
         private var busy = false
@@ -146,6 +203,7 @@ class MiruroStreamExtractorWebView private constructor() {
             dub: Boolean = false,
             serverName: String? = null,        // non-null → select this provider before playing
             episodeNumber: Int? = null,        // non-null → TV: click this episode first
+            captureServers: Boolean = false,   // true → also read the provider list (default server only)
             listener: ExtractionListener
         ) {
             if (busy) {
@@ -163,6 +221,7 @@ class MiruroStreamExtractorWebView private constructor() {
                     mode            = Mode.EXTRACT,
                     serverName      = serverName,
                     episodeNumber   = episodeNumber,
+                    captureServers  = captureServers,
                     extractListener = listener,
                     enumListener    = null
                 )
@@ -202,6 +261,7 @@ class MiruroStreamExtractorWebView private constructor() {
                     mode            = Mode.ENUMERATE,
                     serverName      = null,
                     episodeNumber   = episodeNumber,
+                    captureServers  = false,
                     extractListener = null,
                     enumListener    = listener
                 )
@@ -243,6 +303,14 @@ class MiruroStreamExtractorWebView private constructor() {
     private var episodeNumber: Int? = null    // non-null → TV: click this episode before anything
     private var enumListener: EnumerationListener? = null
 
+    // EXTRACT + captureServers: after the m3u8 is captured, read the provider list
+    // in the same pass so the caller can cache it. Best-effort — a failed read just
+    // hands back null servers; the m3u8 is never sacrificed for it.
+    @Volatile private var captureServers = false
+    private var serversCaptured: List<ServerInfo>? = null
+    private var pendingM3u8Url: String? = null
+    private var pendingM3u8Headers: Map<String, String>? = null
+
     @Volatile
     private var active = false
 
@@ -255,6 +323,7 @@ class MiruroStreamExtractorWebView private constructor() {
         mode: Mode,
         serverName: String?,
         episodeNumber: Int?,
+        captureServers: Boolean,
         extractListener: ExtractionListener?,
         enumListener: EnumerationListener?
     ) {
@@ -264,6 +333,9 @@ class MiruroStreamExtractorWebView private constructor() {
         this.mode = mode
         this.serverName = serverName
         this.episodeNumber = episodeNumber
+        // Only meaningful for a default-server EXTRACT — with a named server the
+        // caller already has the list, and ENUMERATE never reaches deliver().
+        this.captureServers = captureServers && mode == Mode.EXTRACT && serverName.isNullOrBlank()
         // If a specific server is requested, hold manifest capture shut until we
         // actually switch to it — otherwise the DEFAULT stream the player loads
         // first gets grabbed before the switch (the bug). No server requested →
@@ -729,16 +801,7 @@ class MiruroStreamExtractorWebView private constructor() {
             failAndCleanup("No server list available")
             return
         }
-        val openJs = """
-        (function() {
-            var t = document.querySelector('button[aria-label="Provider"]');
-            if (!t) return 'no-trigger';
-            try { t.click(); } catch(e){}
-            return 'opened';
-        })();
-        """.trimIndent()
-
-        view.evaluateJavascript(openJs) { raw ->
+        view.evaluateJavascript(PROVIDER_OPEN_JS) { raw ->
             val result = raw?.trim()?.removeSurrounding("\"") ?: "?"
             if (result != "opened") {
                 Log.d(sCRAPE, "🗂 provider trigger not ready (attempt $attempt) — retrying")
@@ -752,46 +815,11 @@ class MiruroStreamExtractorWebView private constructor() {
 
     private fun readProviderOptions(view: WebView?, attempt: Int) {
         if (view == null || !active) return
-        // Scope strictly to the Provider trigger's own listbox so we never read
-        // the Language menu by accident. Name lives in the "itemName" span; tags
-        // are the children of the "tagRow" span. aria/role + semantic class
-        // fragments only — no hashed module class names.
-        val readJs = """
-        (function() {
-            var t = document.querySelector('button[aria-label="Provider"]');
-            if (!t) return JSON.stringify({status:'no-trigger'});
-            var container = t.parentElement;
-            var menu = null;
-            while (container && !menu) {
-                menu = container.querySelector('[role="listbox"]');
-                if (!menu) container = container.parentElement;
-            }
-            if (!menu) return JSON.stringify({status:'no-menu'});
-            var opts = Array.prototype.slice.call(menu.querySelectorAll('[role="option"]'));
-            if (opts.length === 0) return JSON.stringify({status:'no-options'});
-            var servers = [];
-            for (var i = 0; i < opts.length; i++) {
-                var o = opts[i];
-                var nameEl = o.querySelector('[class*="itemName"]') || o.querySelector('[class*="itemLead"]');
-                var name = nameEl ? (nameEl.textContent || '').trim() : (o.textContent || '').trim();
-                if (!name) continue;
-                var tags = [];
-                var tagRow = o.querySelector('[class*="tagRow"]');
-                if (tagRow) {
-                    var kids = tagRow.children;
-                    for (var k = 0; k < kids.length; k++) {
-                        var tt = (kids[k].textContent || '').trim();
-                        if (tt) tags.push(tt);
-                    }
-                }
-                var isDefault = o.getAttribute('aria-selected') === 'true';
-                servers.push({ name: name, tags: tags, isDefault: isDefault });
-            }
-            return JSON.stringify({status:'ok', servers: servers});
-        })();
-        """.trimIndent()
-
-        view.evaluateJavascript(readJs) { raw ->
+        // PROVIDER_READ_JS scopes strictly to the Provider trigger's own listbox
+        // so we never read the Language menu by accident (name in the "itemName"
+        // span, tags in the "tagRow" span; aria/role + semantic class fragments
+        // only — no hashed module class names).
+        view.evaluateJavascript(PROVIDER_READ_JS) { raw ->
             val json = decodeJsString(raw)
             val parsed = try { JSONObject(json) } catch (e: Exception) { null }
             val status = parsed?.optString("status") ?: "?"
@@ -850,16 +878,7 @@ class MiruroStreamExtractorWebView private constructor() {
             failAndCleanup("Couldn't open server list")
             return
         }
-        val openJs = """
-        (function() {
-            var t = document.querySelector('button[aria-label="Provider"]');
-            if (!t) return 'no-trigger';
-            try { t.click(); } catch(e){}
-            return 'opened';
-        })();
-        """.trimIndent()
-
-        view.evaluateJavascript(openJs) { raw ->
+        view.evaluateJavascript(PROVIDER_OPEN_JS) { raw ->
             val result = raw?.trim()?.removeSurrounding("\"") ?: "?"
             if (result != "opened") {
                 handler.postDelayed({ openProviderForSelect(view, server, attempt + 1) }, PROVIDER_RETRY_INTERVAL)
@@ -930,6 +949,78 @@ class MiruroStreamExtractorWebView private constructor() {
                 }
             }
         }
+    }
+
+    // ── Post-capture server-list read (best effort) ─────────────────────────
+    // Runs AFTER the m3u8 is already latched. Mirrors ENUMERATE's open→read using
+    // the SAME shared JS (so a cached list matches what the picker would show),
+    // but never calls failAndCleanup: on any misstep it hands back null and the
+    // stream is delivered without a list. delivered is already true here, so the
+    // timeout can't fire and no second manifest can slip in during the read.
+    private fun readProvidersBestEffort(view: WebView?, onResult: (List<ServerInfo>?) -> Unit) {
+        openProviderForCapture(view, 1, onResult)
+    }
+
+    private fun openProviderForCapture(
+        view: WebView?, attempt: Int, onResult: (List<ServerInfo>?) -> Unit
+    ) {
+        if (view == null || !active) { onResult(null); return }
+        if (attempt > MAX_PROVIDER_TRIGGER_ATTEMPTS) {
+            Log.w(sCRAPE, "🗂 (capture) Provider button never appeared — no list cached")
+            onResult(null); return
+        }
+        view.evaluateJavascript(PROVIDER_OPEN_JS) { raw ->
+            val result = raw?.trim()?.removeSurrounding("\"") ?: "?"
+            if (result != "opened") {
+                handler.postDelayed({ openProviderForCapture(view, attempt + 1, onResult) }, PROVIDER_RETRY_INTERVAL)
+                return@evaluateJavascript
+            }
+            handler.postDelayed({ readProviderForCapture(view, 1, onResult) }, DROPDOWN_OPEN_DELAY)
+        }
+    }
+
+    private fun readProviderForCapture(
+        view: WebView?, attempt: Int, onResult: (List<ServerInfo>?) -> Unit
+    ) {
+        if (view == null || !active) { onResult(null); return }
+        view.evaluateJavascript(PROVIDER_READ_JS) { raw ->
+            val parsed = try { JSONObject(decodeJsString(raw)) } catch (e: Exception) { null }
+            when (parsed?.optString("status")) {
+                "ok" -> {
+                    val list = parseServers(parsed.optJSONArray("servers"))
+                    onResult(if (list.isEmpty()) null else list)
+                }
+                "no-options", "no-menu", "no-trigger" -> {
+                    if (attempt >= MAX_PROVIDER_OPTION_ATTEMPTS) onResult(null)
+                    else handler.postDelayed(
+                        { readProviderForCapture(view, attempt + 1, onResult) },
+                        PROVIDER_RETRY_INTERVAL
+                    )
+                }
+                else -> onResult(null)
+            }
+        }
+    }
+
+    /** Parse the PROVIDER_READ_JS "servers" array into ServerInfo. */
+    private fun parseServers(arr: JSONArray?): List<ServerInfo> {
+        val list = ArrayList<ServerInfo>()
+        if (arr != null) {
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val name = obj.optString("name").trim()
+                if (name.isEmpty()) continue
+                val tags = ArrayList<String>()
+                obj.optJSONArray("tags")?.let { ta ->
+                    for (j in 0 until ta.length()) {
+                        val tg = ta.optString(j).trim()
+                        if (tg.isNotEmpty()) tags.add(tg)
+                    }
+                }
+                list.add(ServerInfo(name, tags, obj.optBoolean("isDefault", false)))
+            }
+        }
+        return list
     }
 
 
@@ -1088,17 +1179,42 @@ class MiruroStreamExtractorWebView private constructor() {
         Log.d(sCRAPE, "  url     : $url")
         Log.d(sCRAPE, "  referer : ${headers["Referer"]}")
         Log.d(sCRAPE, "  elapsed : ${elapsed}ms after $clickAttempts play attempts")
-        handler.post {
-            try {
-                listener?.onStatusUpdate("Stream found — starting player…")
-                listener?.onM3u8Found(url, headers)
-            } catch (e: Exception) {
-                // A throw here (e.g. startActivity failing) must NOT skip cleanup,
-                // or busy stays true and every future extraction is blocked.
-                Log.e(sCRAPE, "❌ onM3u8Found threw — cleaning up anyway", e)
-            } finally {
-                cleanup()
+        // Hand off on the main thread. delivered is already latched, so no second
+        // manifest and no timeout can interrupt while we (optionally) read servers.
+        handler.post { onCapturedM3u8(url, headers) }
+    }
+
+    // ── Post-capture: optionally read the provider list, then finalize ──────
+    // The m3u8 is already in hand. If the caller asked to capture the server list
+    // (default server only), open the Provider dropdown and read it in this same
+    // pass — best effort. Any failure just finalizes with null servers; playback
+    // is never blocked on the list.
+    private fun onCapturedM3u8(url: String, headers: Map<String, String>) {
+        if (captureServers && serversCaptured == null && active && webView != null) {
+            pendingM3u8Url = url
+            pendingM3u8Headers = headers
+            Log.d(sCRAPE, "🗂 capturing server list before handing back the stream…")
+            listener?.onStatusUpdate("Saving server list…")
+            readProvidersBestEffort(webView) { list ->
+                serversCaptured = list
+                Log.d(sCRAPE, "🗂 server list capture done (${list?.size ?: 0} servers)")
+                finalizeM3u8(pendingM3u8Url ?: url, pendingM3u8Headers ?: headers)
             }
+        } else {
+            finalizeM3u8(url, headers)
+        }
+    }
+
+    private fun finalizeM3u8(url: String, headers: Map<String, String>) {
+        try {
+            listener?.onStatusUpdate("Stream found — starting player…")
+            listener?.onM3u8Found(url, headers, serversCaptured)
+        } catch (e: Exception) {
+            // A throw here (e.g. startActivity failing) must NOT skip cleanup,
+            // or busy stays true and every future extraction is blocked.
+            Log.e(sCRAPE, "❌ onM3u8Found threw — cleaning up anyway", e)
+        } finally {
+            cleanup()
         }
     }
 

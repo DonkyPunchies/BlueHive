@@ -431,6 +431,11 @@ private fun getStreamingSources(
     return when (mediaType) {
         "tv" -> listOf(
             TVShowsDetailsScreenCompose.StreamingSource(
+                "Purple Stream",
+                "VidSpark",
+                "https://ww2.moviesapi.to/tv/$mediaId/$seasonNumber/$episodeNumber"
+            ),
+            TVShowsDetailsScreenCompose.StreamingSource(
                 "Queen Stream",
                 "VidFast",
                  "https://vidfast.pro/tv/$mediaId/$seasonNumber/$episodeNumber?autoPlay=true"
@@ -447,13 +452,13 @@ private fun getStreamingSources(
             ),
             TVShowsDetailsScreenCompose.StreamingSource(
                 "Colony Stream",
-                "VidRock",
-                "https://vidrock.net/tv/$mediaId/$seasonNumber/$episodeNumber"
+                "VidSuper",
+                "https://vidsuper.net/tv/$mediaId/$seasonNumber/$episodeNumber"
             ),
             TVShowsDetailsScreenCompose.StreamingSource(
                 "Honeycomb",
-                "CineSrc",
-                "https://cinesrc.st/embed/tv/$mediaId?s=$seasonNumber&e=$episodeNumber"
+                "VidApi",
+                "https://vaplayer.ru/embed/tv/$mediaId?s=$seasonNumber&e=$episodeNumber"
             )
         )
         else -> emptyList()
@@ -683,9 +688,13 @@ fun TVShowsDetailsScreenContent(
 
     var selectedEpisodeOverlayIndex by remember { mutableIntStateOf(-1) }
 
-    // ✅ Focus requesters for overlay buttons
+    // ✅ Focus requesters for overlay buttons.
+    // Pool sized to the largest provider set we might show — the tv source list
+    // (the anime overlay shows fewer). Deriving the size from getStreamingSources()
+    // means adding a source there also grows this pool, so the inline grid can
+    // never index past it. coerceAtLeast(2) keeps the anime DuB/SuB pair safe.
     val providerFocusRequesters = remember {
-        List(5) { FocusRequester() }
+        List(getStreamingSources(mediaType, mediaId, 1, 1).size.coerceAtLeast(2)) { FocusRequester() }
     }
 
     // ✅ Position of the selected episode still in root coordinates
@@ -791,6 +800,13 @@ fun TVShowsDetailsScreenContent(
     var serverDefaultIdx   by remember { mutableIntStateOf(0) }
     var lastStreamFocusRequester by remember { mutableStateOf<FocusRequester?>(null) }
 
+    // Server lists captured during a DEFAULT extraction, cached for the lifetime
+    // of this detail screen. Keyed by url + audio (url carries ?ep=, so each
+    // episode caches its own list) so "Choose a server" can skip the enumerate
+    // webview pass when the list is already known. Value = (options, defaultIndex).
+    val serverListCache = remember { mutableMapOf<String, Pair<List<ServerOption>, Int>>() }
+    fun serverCacheKey(url: String, dub: Boolean) = "$url|${if (dub) "dub" else "sub"}"
+
     // Back closes whichever prompt/picker is open instead of leaving the screen.
     BackHandler(enabled = showDefaultPrompt || showServerPicker) {
         when {
@@ -854,6 +870,26 @@ fun TVShowsDetailsScreenContent(
                         }
                     }
                 }
+
+                // ── Cache any server list captured in this same pass ─────────
+                // A default extraction (captureServers=true) also carries the
+                // provider list on the RESULT_SERVER_* extras. Save it (keyed by
+                // this episode's url + audio) so "Choose a server" is instant.
+                val capNames = data?.getStringArrayListExtra(MiruroExtractorActivity.RESULT_SERVER_NAMES)
+                val capTags  = data?.getStringArrayListExtra(MiruroExtractorActivity.RESULT_SERVER_TAGS)
+                val capDef   = data?.getIntExtra(MiruroExtractorActivity.RESULT_SERVER_DEFAULT_INDEX, 0) ?: 0
+                val capUrl   = pendingUrl
+                if (!capNames.isNullOrEmpty() && capUrl != null) {
+                    val opts = capNames.mapIndexed { i, name ->
+                        val tagStr = capTags?.getOrNull(i) ?: ""
+                        val tagList = if (tagStr.isBlank()) emptyList()
+                            else tagStr.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+                        ServerOption(name = name, tags = tagList)
+                    }
+                    serverListCache[serverCacheKey(capUrl, pendingDub)] =
+                        opts to capDef.coerceIn(0, opts.size - 1)
+                    Log.d("scraper", "🗂 cached ${opts.size} servers from default extract")
+                }
             } else {
                 Log.e("scraper", "M Extract: OK result but no m3u8")
                 showServerError = true
@@ -890,6 +926,12 @@ fun TVShowsDetailsScreenContent(
                 serverOptions    = options
                 serverDefaultIdx = defIdx.coerceIn(0, options.size - 1)
                 showServerPicker = true
+                // Cache so re-opening the picker for this same episode+audio is
+                // instant and a later default play won't re-read the list either.
+                pendingUrl?.let { u ->
+                    serverListCache[serverCacheKey(u, pendingDub)] =
+                        options to defIdx.coerceIn(0, options.size - 1)
+                }
             } else {
                 Log.w("scraper", "M Enumerate: OK but empty server list")
                 showServerError = true
@@ -922,6 +964,10 @@ fun TVShowsDetailsScreenContent(
                     .putExtra(MiruroExtractorActivity.EXTRA_MODE, MiruroExtractorActivity.MODE_EXTRACT)
                 if (!server.isNullOrBlank()) {
                     intent.putExtra(MiruroExtractorActivity.EXTRA_SERVER_NAME, server)
+                } else if (serverListCache[serverCacheKey(url, dub)] == null) {
+                    // Default server, list not cached yet → grab the provider list
+                    // in this same pass so "Choose a server" is instant afterward.
+                    intent.putExtra(MiruroExtractorActivity.EXTRA_CAPTURE_SERVERS, true)
                 }
                 extractorLauncher.launch(intent)
             }
@@ -1037,8 +1083,8 @@ fun TVShowsDetailsScreenContent(
     // ✅ Log again when recommendations load — also off the main thread.
     LaunchedEffect(recommendations) {
         if (recommendations.isNotEmpty()) {
-            // 1 backdrop + 1 logo + 20 recommendations + 5 provider buttons
-            val totalImages = 1 + 1 + recommendations.size + 5
+            // 1 backdrop + 1 logo + 20 recommendations + 6 provider buttons
+            val totalImages = 1 + 1 + recommendations.size + 6
 
             withContext(Dispatchers.IO) {
                 CacheMonitor.logCacheStats(
@@ -2073,15 +2119,13 @@ fun TVShowsDetailsScreenContent(
                         .offset(x = gridOffsetX, y = gridOffsetY)
                 ) {
                     if (isJapaneseAnimation(genres, originalLanguage)) {
-                        // Anime: exactly DuB / SuB / VidFast. DuB+SuB run the Miruro
-                        // flow (the URL already carries ?ep=, so the extractor clicks
-                        // the right episode); VidFast goes through the web player.
-                        val miruroUrl     = episodeSources.firstOrNull { it.name.equals("Miruro", true) }?.url
-                        val vidFastSource = episodeSources.firstOrNull { it.name.equals("VidFast", true) }
+                        // Anime: exactly DuB / SuB. DuB+SuB run the Miruro flow
+                        // (the URL already carries ?ep=, so the extractor clicks
+                        // the right episode).
+                        val miruroUrl = episodeSources.firstOrNull { it.name.equals("Miruro", true) }?.url
                         AnimeEpisodeProviderButtons(
                             passionFont     = passionFont,
                             miruroUrl       = miruroUrl,
-                            vidFastSource   = vidFastSource,
                             focusRequesters = providerFocusRequesters,
                             onDub = { url ->
                                 val epName = selectedEpisode.title
@@ -2104,11 +2148,6 @@ fun TVShowsDetailsScreenContent(
                                 pendingEpisode     = episodeNumber
                                 pendingEpisodeName = epName
                                 showDefaultPrompt  = true
-                            },
-                            onVidFast = { source ->
-                                val epName = selectedEpisode.title
-                                onEpisodeSelected(selectedSeason, episodeNumber, epName)
-                                onStreamingSourceSelected(source)
                             },
                             onBack = {
                                 selectedEpisodeOverlayIndex = -1
@@ -2244,7 +2283,18 @@ fun TVShowsDetailsScreenContent(
                         awaitFrame()
                         try { lastStreamFocusRequester?.requestFocus() } catch (_: Exception) {}
                     }
-                    pendingUrl?.let { launchEnumerate(it, pendingDub) }
+                    // If the default extraction already captured this episode's
+                    // server list, skip the enumerate webview pass and open the
+                    // picker instantly. Otherwise fall back to enumerating.
+                    val cached = pendingUrl?.let { serverListCache[serverCacheKey(it, pendingDub)] }
+                    if (cached != null) {
+                        Log.d("scraper", "🗂 server picker from cache (${cached.first.size} servers)")
+                        serverOptions    = cached.first
+                        serverDefaultIdx = cached.second
+                        showServerPicker = true
+                    } else {
+                        pendingUrl?.let { launchEnumerate(it, pendingDub) }
+                    }
                 }
             )
         }
@@ -2690,7 +2740,9 @@ private fun EpisodeProviderInlineButtons(
 
     LaunchedEffect(sources) {
         safeSources.clear()
-        safeSources.addAll(sources.take(5))
+        // Cap to the focus-requester pool so we never index past it; the pool is
+        // sized to the source list, so in practice this keeps every source.
+        safeSources.addAll(sources.take(focusRequesters.size))
     }
 
     LaunchedEffect(safeSources.size) {
@@ -2709,66 +2761,29 @@ private fun EpisodeProviderInlineButtons(
             .offset(x = 0.3.dp) // how far left or right the entire section of button goes!!!
             .focusGroup()
     ) {
-        if (safeSources.size >= 2) {
+        // Two per row, laid out FROM the source list — adding/removing a source
+        // now just adds/removes a button (an odd count leaves a lone left button)
+        // with no per-index Row block to keep in sync.
+        safeSources.chunked(2).forEachIndexed { rowIndex, rowSources ->
             Row(
                 horizontalArrangement = Arrangement.spacedBy((-2).dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                EpisodeOverlayStreamerButton(
-                    index = 0,
-                    source = safeSources[0],
-                    passionFont = passionFont,
-                    focusRequesters = focusRequesters,
-                    onClick = { onSourceSelected(safeSources[0]) },
-                    onBack = onBack,             // ✅ pass through
-                )
-                EpisodeOverlayStreamerButton(
-                    index = 1,
-                    offsetX = (-1.5).dp,  // how far the button goes to the left or right the streaming buttons are
-                    source = safeSources[1],
-                    passionFont = passionFont,
-                    focusRequesters = focusRequesters,
-                    onClick = { onSourceSelected(safeSources[1]) },
-                    onBack = onBack,
-                )
+                rowSources.forEachIndexed { colIndex, source ->
+                    val i = rowIndex * 2 + colIndex
+                    EpisodeOverlayStreamerButton(
+                        index = i,
+                        total = safeSources.size,
+                        // right column nudged left the same 1.5.dp as before
+                        offsetX = if (colIndex == 0) (-1).dp else (-1.5).dp,
+                        source = source,
+                        passionFont = passionFont,
+                        focusRequesters = focusRequesters,
+                        onClick = { onSourceSelected(source) },
+                        onBack = onBack,
+                    )
+                }
             }
-        }
-
-        if (safeSources.size >= 4) {
-            Row(
-                horizontalArrangement = Arrangement.spacedBy((-2).dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                EpisodeOverlayStreamerButton(
-                    index = 2,
-                    source = safeSources[2],
-                    passionFont = passionFont,
-                    focusRequesters = focusRequesters,
-                    onClick = { onSourceSelected(safeSources[2]) },
-                    onBack = onBack,
-                )
-                EpisodeOverlayStreamerButton(
-                    index = 3,
-                    offsetX = (-1.5).dp,  // how far the button goes to the left or right the streaming buttons are
-                    source = safeSources[3],
-                    passionFont = passionFont,
-                    focusRequesters = focusRequesters,
-                    onClick = { onSourceSelected(safeSources[3]) },
-                    onBack = onBack,
-                )
-            }
-        }
-
-        if (safeSources.size >= 5) {
-            EpisodeOverlayStreamerButton(
-                index = 4,
-                offsetX = (-385).dp,   // how far the button goes to the left or right the streaming buttons are
-                source = safeSources[4],
-                passionFont = passionFont,
-                focusRequesters = focusRequesters,
-                onClick = { onSourceSelected(safeSources[4]) },
-                onBack = onBack,
-            )
         }
     }
 }
@@ -2779,6 +2794,7 @@ private fun EpisodeProviderInlineButtons(
 @Composable
 private fun EpisodeOverlayStreamerButton(
     index: Int,
+    total: Int,                       // total buttons in the grid — drives edge-aware D-pad nav
     offsetX: Dp = (-1).dp,
     source: TVShowsDetailsScreenCompose.StreamingSource,
     passionFont: FontFamily,
@@ -2814,63 +2830,42 @@ private fun EpisodeOverlayStreamerButton(
             .onPreviewKeyEvent { event ->
                 if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
 
+                // 2-column grid: col = index % 2, row = index / 2. Targets are
+                // computed so the nav is correct for ANY button count (adding a
+                // source can't leave a stale index mapping behind). -1 = edge → the
+                // key is consumed with no move and no sound, exactly as before.
                 when (event.key) {
                     Key.DirectionLeft -> {
-                        val target = when (index) {
-                            1 -> 0
-                            3 -> 2
-                            4 -> 2
-                            else -> null
-                        }
-
-                        target?.let { idx ->
-                            focusRequesters.getOrNull(idx)?.requestFocus()
+                        val target = if (index % 2 == 1) index - 1 else -1   // right col → left neighbour
+                        if (target >= 0) {
+                            focusRequesters.getOrNull(target)?.requestFocus()
                             BlueHiveApplication.playHoverSound()   // 🔊 play on successful move
                         }
                         true
                     }
 
                     Key.DirectionRight -> {
-                        val target = when (index) {
-                            0 -> 1
-                            2 -> 3
-                            4 -> 3
-                            else -> null
-                        }
-
-                        target?.let { idx ->
-                            focusRequesters.getOrNull(idx)?.requestFocus()
+                        val target = if (index % 2 == 0 && index + 1 < total) index + 1 else -1  // left col → right neighbour
+                        if (target >= 0) {
+                            focusRequesters.getOrNull(target)?.requestFocus()
                             BlueHiveApplication.playHoverSound()
                         }
                         true
                     }
 
                     Key.DirectionUp -> {
-                        val target = when (index) {
-                            2 -> 0
-                            3 -> 1
-                            4 -> 2
-                            else -> null
-                        }
-
-                        target?.let { idx ->
-                            focusRequesters.getOrNull(idx)?.requestFocus()
+                        val target = index - 2                               // one row up, same column
+                        if (target >= 0) {
+                            focusRequesters.getOrNull(target)?.requestFocus()
                             BlueHiveApplication.playHoverSound()
                         }
                         true
                     }
 
                     Key.DirectionDown -> {
-                        val target = when (index) {
-                            0 -> 2
-                            1 -> 3
-                            2 -> 4
-                            3 -> 4
-                            else -> null
-                        }
-
-                        target?.let { idx ->
-                            focusRequesters.getOrNull(idx)?.requestFocus()
+                        val target = index + 2                               // one row down, same column
+                        if (target < total) {
+                            focusRequesters.getOrNull(target)?.requestFocus()
                             BlueHiveApplication.playHoverSound()
                         }
                         true
@@ -3005,11 +3000,9 @@ fun SeasonButton(
 private fun AnimeEpisodeProviderButtons(
     passionFont: FontFamily,
     miruroUrl: String?,                                            // null if AniList resolve failed → DuB/SuB inert
-    vidFastSource: TVShowsDetailsScreenCompose.StreamingSource?,
-    focusRequesters: List<FocusRequester>,                         // [0]=DuB, [1]=SuB, [2]=VidFast
+    focusRequesters: List<FocusRequester>,                         // [0]=DuB, [1]=SuB
     onDub: (String) -> Unit,
     onSub: (String) -> Unit,
-    onVidFast: (TVShowsDetailsScreenCompose.StreamingSource) -> Unit,
     onBack: () -> Unit,
 ) {
     // Auto-focus DuB when the overlay opens (matches EpisodeProviderInlineButtons).
@@ -3040,7 +3033,7 @@ private fun AnimeEpisodeProviderButtons(
                     if (e.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                     when (e.key) {
                         Key.DirectionRight -> moveTo(1)
-                        Key.DirectionDown  -> moveTo(2)
+                        Key.DirectionDown  -> true
                         Key.DirectionLeft  -> true
                         Key.DirectionUp    -> true
                         Key.Back           -> { onBack(); true }
@@ -3059,7 +3052,7 @@ private fun AnimeEpisodeProviderButtons(
                     if (e.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                     when (e.key) {
                         Key.DirectionLeft  -> moveTo(0)
-                        Key.DirectionDown  -> moveTo(2)
+                        Key.DirectionDown  -> true
                         Key.DirectionRight -> true
                         Key.DirectionUp    -> true
                         Key.Back           -> { onBack(); true }
@@ -3069,25 +3062,6 @@ private fun AnimeEpisodeProviderButtons(
                 onClick = { miruroUrl?.let(onSub) }
             )
         }
-        AnimeOverlayButton(
-            text = "Watch on VidFast",
-            passionFont = passionFont,
-            focusRequester = focusRequesters[2],
-            mainDefault = Color(0xFF0004FF), mainToggled = Color(0xFF07052F),
-            secondDefault = Color(0xFF471C98), secondFocused = Color(0xFF342180),
-            modifier = Modifier.onPreviewKeyEvent { e ->
-                if (e.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
-                when (e.key) {
-                    Key.DirectionUp    -> moveTo(0)
-                    Key.DirectionLeft  -> true
-                    Key.DirectionRight -> true
-                    Key.DirectionDown  -> true
-                    Key.Back           -> { onBack(); true }
-                    else               -> false
-                }
-            },
-            onClick = { vidFastSource?.let(onVidFast) }
-        )
     }
 }
 

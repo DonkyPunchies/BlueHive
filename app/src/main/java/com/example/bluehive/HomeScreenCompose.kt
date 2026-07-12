@@ -911,7 +911,9 @@ fun HomeScreenComposeContent(
             },
             onSettingsClick = {
                 Log.d("SIDEBAR", "Settings clicked")
-                // TODO: Open settings screen
+                context.startActivity(
+                    Intent(context, com.example.bluehive.settings.SettingsActivity::class.java)
+                )
             },
             onFavoritesClick = { openFavoritesScreen(context, profileId) },
             onLiveTvClick = {

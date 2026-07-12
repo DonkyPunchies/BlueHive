@@ -20,6 +20,7 @@ class MiruroExtractorActivity : ComponentActivity() {
         const val EXTRA_MODE        = "MIRURO_MODE"
         const val EXTRA_SERVER_NAME = "MIRURO_SERVER"
         const val EXTRA_EPISODE     = "MIRURO_EPISODE"   // TV only; <= 0 means none
+        const val EXTRA_CAPTURE_SERVERS = "MIRURO_CAPTURE_SERVERS" // EXTRACT: also read the server list in the same pass
 
         // Values for EXTRA_MODE
         const val MODE_EXTRACT   = "EXTRACT"
@@ -59,11 +60,13 @@ class MiruroExtractorActivity : ComponentActivity() {
         val mode       = intent.getStringExtra(EXTRA_MODE) ?: MODE_EXTRACT
         val serverName = intent.getStringExtra(EXTRA_SERVER_NAME)
         val episode    = intent.getIntExtra(EXTRA_EPISODE, -1).takeIf { it > 0 }
+        val captureServers = intent.getBooleanExtra(EXTRA_CAPTURE_SERVERS, false)
 
         Log.d(
             TAG,
             "🧩 extractor up (pid=${Process.myPid()}) mode=$mode dub=$dub " +
-                    "server=${serverName ?: "default"} episode=${episode ?: "n/a"} url=$url"
+                    "server=${serverName ?: "default"} episode=${episode ?: "n/a"} " +
+                    "captureServers=$captureServers url=$url"
         )
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
@@ -77,28 +80,56 @@ class MiruroExtractorActivity : ComponentActivity() {
         if (mode == MODE_ENUMERATE) {
             startEnumerate(url, dub, episode)
         } else {
-            startExtract(url, dub, serverName, episode)
+            startExtract(url, dub, serverName, episode, captureServers)
         }
     }
 
-    private fun startExtract(url: String, dub: Boolean, serverName: String?, episodeNumber: Int?) {
+    private fun startExtract(
+        url: String,
+        dub: Boolean,
+        serverName: String?,
+        episodeNumber: Int?,
+        captureServers: Boolean
+    ) {
         MiruroStreamExtractorWebView.extract(
-            context       = this,
-            url           = url,
-            sourceName    = "Miruro",
-            dub           = dub,
-            serverName    = serverName,
-            episodeNumber = episodeNumber,
-            listener      = object : MiruroStreamExtractorWebView.ExtractionListener {
+            context        = this,
+            url            = url,
+            sourceName     = "Miruro",
+            dub            = dub,
+            serverName     = serverName,
+            episodeNumber  = episodeNumber,
+            captureServers = captureServers,
+            listener       = object : MiruroStreamExtractorWebView.ExtractionListener {
                 override fun onStatusUpdate(status: String) {
                     Log.d(TAG, "status: $status")
                 }
 
-                override fun onM3u8Found(m3u8Url: String, headers: Map<String, String>) {
+                override fun onM3u8Found(
+                    m3u8Url: String,
+                    headers: Map<String, String>,
+                    servers: List<MiruroStreamExtractorWebView.ServerInfo>?
+                ) {
                     val data = Intent()
                         .putExtra(RESULT_M3U8,    m3u8Url)
                         .putExtra(RESULT_REFERER, headers["Referer"])
                         .putExtra(RESULT_UA,      headers["User-Agent"])
+                    // If the server list was captured in this same pass, pass it
+                    // back on the SAME result extras ENUMERATE uses so the caller
+                    // can cache it (parallel arrays + default index).
+                    if (!servers.isNullOrEmpty()) {
+                        val names = ArrayList<String>(servers.size)
+                        val tags  = ArrayList<String>(servers.size)
+                        var defaultIndex = -1
+                        servers.forEachIndexed { i, s ->
+                            names.add(s.name)
+                            tags.add(s.tags.joinToString(","))
+                            if (s.isDefault && defaultIndex == -1) defaultIndex = i
+                        }
+                        data.putStringArrayListExtra(RESULT_SERVER_NAMES, names)
+                        data.putStringArrayListExtra(RESULT_SERVER_TAGS, tags)
+                        data.putExtra(RESULT_SERVER_DEFAULT_INDEX, if (defaultIndex == -1) 0 else defaultIndex)
+                        Log.d(TAG, "🗂 EXTRACT also carried ${names.size} servers")
+                    }
                     finishAndKill(RESULT_OK, data)
                 }
 

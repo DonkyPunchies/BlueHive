@@ -377,10 +377,20 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
         }
 
         // Everything below this point runs ONLY in the main process.
+
+        // Crash reporting FIRST — anything that crashes during the rest of
+        // startup should be captured too. install() only hooks the handler;
+        // it needs nothing initialised.
+        com.example.bluehive.diagnostics.CrashReporter.install(this)
+
         SessionManager.init(this)
         com.example.bluehive.host.HostTokenProvider.init(this)
         Log.d("BlueHiveApplication", "HostTokenProvider initialised")
         Log.d(TAG, "✅ SessionManager initialised")
+
+        // Upload any crash reports persisted by a previous run (fire-and-forget,
+        // delayed a few seconds so cold-start and token refresh settle first).
+        com.example.bluehive.diagnostics.CrashReporter.flushPendingAsync(this)
 
         // Track the foreground Activity for the SessionExpiredBus listener below.
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {

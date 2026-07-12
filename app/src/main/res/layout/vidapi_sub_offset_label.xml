@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Read-out of the current subtitle timing offset, styled like the position
+     time text in the control bar. -->
+<TextView xmlns:android="http://schemas.android.com/apk/res/android"
+    style="@style/ExoStyledControls.TimeText.Position"
+    android:layout_gravity="center_vertical"
+    android:gravity="center"
+    android:minWidth="64dp"
+    android:textColor="#FFFFFFFF"
+    android:text="+0.00s" />

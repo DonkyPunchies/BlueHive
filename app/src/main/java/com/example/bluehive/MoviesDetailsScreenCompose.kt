@@ -65,8 +65,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.android.awaitFrame
 import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.RoundedCornerShape
-import com.example.bluehive.webview.cinesrc.CineSrcExtractorActivity
-import com.example.bluehive.webview.cinesrc.CineSrcPlayerActivity
+import com.example.bluehive.webview.vidapi.VidApiExtractorActivity
+import com.example.bluehive.webview.vidapi.VidApiPlayerActivity
 
 
 
@@ -95,7 +95,11 @@ class MoviesDetailsScreenCompose : ComponentActivity() {
     data class StreamingSource(
         val coverName: String,
         val name: String,
-        val url: String
+        val url: String,
+        // true → play via the headless m3u8 extractor (ExoPlayer); false → the
+        // WebView player. A property of the source, not its display name, so
+        // renaming the button can't route it to the wrong path.
+        val useExtractor: Boolean = false
     )
 
     companion object {
@@ -386,6 +390,11 @@ private fun getStreamingSources(mediaType: String, mediaId: Int): List<MoviesDet
     return when(mediaType) {
         "movie" -> listOf(
             MoviesDetailsScreenCompose.StreamingSource(
+                "Purple Stream",
+                "VidSpark",
+                    "https://ww2.moviesapi.to/movie/$mediaId"
+            ),
+            MoviesDetailsScreenCompose.StreamingSource(
                 "Queen Stream",
                 "VidFast",
                 "https://vidfast.pro/movie/$mediaId?autoPlay=true"
@@ -402,13 +411,14 @@ private fun getStreamingSources(mediaType: String, mediaId: Int): List<MoviesDet
             ),
             MoviesDetailsScreenCompose.StreamingSource(
                 "Colony Stream",
-                "VidRock",
-                "https://vidrock.net/movie/$mediaId"
+                "VidSuper",
+                "https://vidsuper.net/movie/$mediaId"
             ),
             MoviesDetailsScreenCompose.StreamingSource(
                 "Honeycomb",
-                "CineSrc",
-                "https://cinesrc.st/embed/movie/$mediaId"
+                "VidApi",
+                "https://vaplayer.ru/embed/movie/$mediaId",
+                useExtractor = true   // vaplayer embed → headless m3u8 extraction
             )
         )
         else -> listOf()
@@ -487,14 +497,22 @@ fun MoviesDetailsScreenContent(
     var serverOptions     by remember { mutableStateOf<List<ServerOption>>(emptyList()) }
     var serverDefaultIdx  by remember { mutableIntStateOf(0) }
 
+    // Server lists captured during a DEFAULT extraction, cached for the lifetime
+    // of this detail screen (cleared when the user navigates away). Keyed by
+    // url + audio so "Choose a server" can skip the enumerate webview pass when
+    // the list is already known. Value = (options, defaultIndex). Plain map — only
+    // read/written from callbacks, never during composition, so no snapshot state.
+    val serverListCache = remember { mutableMapOf<String, Pair<List<ServerOption>, Int>>() }
+    fun serverCacheKey(url: String, dub: Boolean) = "$url|${if (dub) "dub" else "sub"}"
+
     // Named requesters for DuB/Sub so we know exactly where to send focus back.
     val animeDubFocusRequester = remember { FocusRequester() }
     val animeSubFocusRequester = remember { FocusRequester() }
     // Whichever button the user pressed last — restored when any overlay closes.
     var lastStreamFocusRequester by remember { mutableStateOf<FocusRequester?>(null) }
 
-    // CineSrc m3u8-extraction error reason (shown as a toast; auto-dismisses).
-    var cineError by remember { mutableStateOf<String?>(null) }
+    // Extractor m3u8-extraction error reason (shown as a toast; auto-dismisses).
+    var vidApiError by remember { mutableStateOf<String?>(null) }
 
     // Back closes whichever picker/prompt is open instead of leaving the screen.
     BackHandler(enabled = showDefaultPrompt || showServerPicker) {
@@ -570,6 +588,27 @@ fun MoviesDetailsScreenContent(
                         }
                     }
                 }
+
+                // ── Cache any server list captured in this same pass ─────────
+                // A default extraction (captureServers=true) also carries the
+                // provider list on the RESULT_SERVER_* extras. Save it so a later
+                // "Choose a server" skips its own enumerate webview pass while we
+                // stay on this page.
+                val capNames = data?.getStringArrayListExtra(MiruroExtractorActivity.RESULT_SERVER_NAMES)
+                val capTags  = data?.getStringArrayListExtra(MiruroExtractorActivity.RESULT_SERVER_TAGS)
+                val capDef   = data?.getIntExtra(MiruroExtractorActivity.RESULT_SERVER_DEFAULT_INDEX, 0) ?: 0
+                val capUrl   = pendingUrl
+                if (!capNames.isNullOrEmpty() && capUrl != null) {
+                    val opts = capNames.mapIndexed { i, name ->
+                        val tagStr = capTags?.getOrNull(i) ?: ""
+                        val tagList = if (tagStr.isBlank()) emptyList()
+                            else tagStr.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+                        ServerOption(name = name, tags = tagList)
+                    }
+                    serverListCache[serverCacheKey(capUrl, pendingDub)] =
+                        opts to capDef.coerceIn(0, opts.size - 1)
+                    Log.d("scraper", "🗂 cached ${opts.size} servers from default extract")
+                }
             } else {
                 Log.e("scraper", "M Extract: OK result but no m3u8")
                 showServerError = true
@@ -606,6 +645,12 @@ fun MoviesDetailsScreenContent(
                 serverOptions    = options
                 serverDefaultIdx = defIdx.coerceIn(0, options.size - 1)
                 showServerPicker = true
+                // Cache so re-opening the picker for this same episode+audio is
+                // instant and a later default play won't re-read the list either.
+                pendingUrl?.let { u ->
+                    serverListCache[serverCacheKey(u, pendingDub)] =
+                        options to defIdx.coerceIn(0, options.size - 1)
+                }
             } else {
                 Log.w("scraper", "M Enumerate: OK but empty server list")
                 showServerError = true
@@ -624,34 +669,43 @@ fun MoviesDetailsScreenContent(
 
 
 
-    // ── CineSrc m3u8 extraction (movies only) ────────────────────────────────
+    // ── Extractor-source m3u8 extraction (movies only) ───────────────────────
     // Reuses the isExtracting/extractStage overlay. Separate launcher from the
-    // Miruro one so the anime flow is untouched.
-    val cineExtractorLauncher = rememberLauncherForActivityResult(
+    // Miruro one so the anime flow is untouched. The source name + embed URL are
+    // captured at launch so the result callback can label watch-history correctly
+    // and pass EMBED_URL for CDN failover (token refresh on a mid-play error).
+    var vidApiSourceName by remember { mutableStateOf("VidApi") }
+    var vidApiEmbedUrl   by remember { mutableStateOf<String?>(null) }
+    // English subtitle fetch, kicked off in parallel with extraction when a VidApi
+    // source is played.
+    val vidApiExtractorLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         isExtracting   = false
         extractPending = false
         if (result.resultCode == Activity.RESULT_OK) {
             val data     = result.data
-            val m3u8     = data?.getStringExtra(CineSrcExtractorActivity.RESULT_M3U8)
-            val referer  = data?.getStringExtra(CineSrcExtractorActivity.RESULT_REFERER)
-            val ua       = data?.getStringExtra(CineSrcExtractorActivity.RESULT_UA)
-            val subtitle = data?.getStringExtra(CineSrcExtractorActivity.RESULT_SUBTITLE)
+            val m3u8     = data?.getStringExtra(VidApiExtractorActivity.RESULT_M3U8)
+            val referer  = data?.getStringExtra(VidApiExtractorActivity.RESULT_REFERER)
+            val ua       = data?.getStringExtra(VidApiExtractorActivity.RESULT_UA)
             if (!m3u8.isNullOrBlank()) {
-                // TESTING: Spectrum Shield off → no relay. Hand the raw CDN m3u8
-                // (and raw subtitle) straight to ExoPlayer, which talks to the
-                // CDN directly with the captured Referer/UA. Swap back to the
-                // /api/hls/proxy wrapping when testing against ISP filtering.
-                Log.d("scraper-cine", "▶️ direct CDN play: $m3u8 (sub=${subtitle ?: "none"})")
+                // Direct CDN play. Captions are fetched ON DEMAND in the player when
+                // the CC button is pressed, so we just pass the tmdb id along (the
+                // extractor's own RESULT_SUBTITLE — vaplayer's thumbnail track — is
+                // intentionally unused).
+                Log.d("scraper-vidapi", "▶️ direct CDN play: $m3u8")
                 context.startActivity(
-                    Intent(context, CineSrcPlayerActivity::class.java)
+                    Intent(context, VidApiPlayerActivity::class.java)
                         .putExtra("M3U8_URL", m3u8)
                         .putExtra("REFERER", referer)
                         .putExtra("UA", ua)
-                        .putExtra("SUBTITLE_URL", subtitle)
+                        .putExtra("TMDB_ID", tmdbId)         // for on-demand caption fetch
+                        // EMBED_URL lets the player re-extract a fresh token on a
+                        // mid-play CDN error (important for token'd embeds).
+                        .putExtra("EMBED_URL", vidApiEmbedUrl)
                 )
                 if (favoriteProfileId != -1 && tmdbId != 0) {
+                    val histSource = vidApiSourceName
                     kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
                         try {
                             ApiClient.bluehiveApi.logWatchHistory(
@@ -659,45 +713,47 @@ fun MoviesDetailsScreenContent(
                                     profile_id     = favoriteProfileId,
                                     media_tmdb_id  = tmdbId,
                                     media_type     = mediaType,
-                                    source_name    = "CineSrc",
+                                    source_name    = histSource,
                                     media_title    = mediaTitle,
                                     season_number  = null,
                                     episode_number = null,
                                     episode_name   = null,
                                 )
                             )
-                            Log.d("scraper-cine", "✅ watch history logged tmdbId=$tmdbId (CineSrc)")
+                            Log.d("scraper-vidapi", "✅ watch history logged tmdbId=$tmdbId ($histSource)")
                         } catch (e: Exception) {
-                            Log.w("scraper-cine", "⚠️ history log failed (non-fatal): ${e.message}")
+                            Log.w("scraper-vidapi", "⚠️ history log failed (non-fatal): ${e.message}")
                         }
                     }
                 }
             } else {
-                Log.e("scraper-cine", "OK result but no m3u8")
-                cineError = "Couldn't find a playable stream on CineSrc — try another source."
+                Log.e("scraper-vidapi", "OK result but no m3u8")
+                vidApiError = "Couldn't find a playable stream — try another source."
             }
         } else {
             val data   = result.data
-            val failed = data?.getBooleanExtra(CineSrcExtractorActivity.RESULT_FAILED, false) == true
-            val reason = data?.getStringExtra(CineSrcExtractorActivity.RESULT_REASON)
+            val failed = data?.getBooleanExtra(VidApiExtractorActivity.RESULT_FAILED, false) == true
+            val reason = data?.getStringExtra(VidApiExtractorActivity.RESULT_REASON)
             when {
-                failed -> { Log.w("scraper-cine", "failed: $reason"); cineError = reason ?: "CineSrc extraction failed — try another source." }
-                else   -> { Log.w("scraper-cine", "user cancelled") /* silent */ }
+                failed -> { Log.w("scraper-vidapi", "failed: $reason"); vidApiError = reason ?: "Extraction failed — try another source." }
+                else   -> { Log.w("scraper-vidapi", "user cancelled") /* silent */ }
             }
         }
     }
 
-    val launchCineExtract: (String) -> Unit = { url ->
-        Log.d("scraper-cine", "CineSrc Extract → $url")
+    val launchVidApiExtract: (String, String) -> Unit = { name, url ->
+        Log.d("scraper-vidapi", "$name Extract → $url")
         if (!isExtracting && !extractPending && !isCheckingServers) {
             extractPending = true
+            vidApiSourceName = name          // label watch-history + failover with this
+            vidApiEmbedUrl   = url           // embed URL for CDN failover re-extraction
             coroutineScope.launch {
                 delay(200)
                 isExtracting = true
                 try { BlueHiveApplication.coilImageLoader.memoryCache?.clear() } catch (_: Exception) {}
-                cineExtractorLauncher.launch(
-                    Intent(context, CineSrcExtractorActivity::class.java)
-                        .putExtra(CineSrcExtractorActivity.EXTRA_URL, url)
+                vidApiExtractorLauncher.launch(
+                    Intent(context, VidApiExtractorActivity::class.java)
+                        .putExtra(VidApiExtractorActivity.EXTRA_URL, url)
                 )
             }
         }
@@ -723,6 +779,10 @@ fun MoviesDetailsScreenContent(
                     .putExtra(MiruroExtractorActivity.EXTRA_MODE, MiruroExtractorActivity.MODE_EXTRACT)
                 if (!server.isNullOrBlank()) {
                     intent.putExtra(MiruroExtractorActivity.EXTRA_SERVER_NAME, server)
+                } else if (serverListCache[serverCacheKey(url, dub)] == null) {
+                    // Default server, list not cached yet → grab the provider list
+                    // in this same pass so "Choose a server" is instant afterward.
+                    intent.putExtra(MiruroExtractorActivity.EXTRA_CAPTURE_SERVERS, true)
                 }
                 extractorLauncher.launch(intent)
             }
@@ -751,8 +811,8 @@ fun MoviesDetailsScreenContent(
     }
 
 
-    LaunchedEffect(cineError) {
-        if (cineError != null) { delay(3500); cineError = null }
+    LaunchedEffect(vidApiError) {
+        if (vidApiError != null) { delay(3500); vidApiError = null }
     }
 
     LaunchedEffect(tmdbId, mediaType, favoriteProfileId) {
@@ -770,8 +830,8 @@ fun MoviesDetailsScreenContent(
 
 
     // Get streaming sources based on media type.
-    // Japanese animation (anime) → dedicated 2-button set (Miruro + VidFast).
-    // Everything else keeps the standard 5 buttons.
+    // Japanese animation (anime) → dedicated DuB / SuB set.
+    // Everything else keeps the standard 6 buttons.
     val isAnime = remember(genres, originalLanguage) {
         val result = isJapaneseAnimation(genres, originalLanguage)
         Log.d("AnimeDetect", "genres='$genres' | originalLanguage='$originalLanguage' | isAnime=$result")
@@ -861,8 +921,8 @@ fun MoviesDetailsScreenContent(
     // ✅ Log again when recommendations load — also off the main thread.
     LaunchedEffect(recommendations) {
         if (recommendations.isNotEmpty()) {
-            // 1 backdrop + 1 logo + 20 recommendations + 5 provider buttons
-            val totalImages = 1 + 1 + recommendations.size + 5
+            // 1 backdrop + 1 logo + 20 recommendations + 6 provider buttons
+            val totalImages = 1 + 1 + recommendations.size + 6
 
             withContext(Dispatchers.IO) {
                 CacheMonitor.logCacheStats(
@@ -1374,7 +1434,7 @@ fun MoviesDetailsScreenContent(
 
         if (!isExtrasToggled) {
             if (isAnime) {
-                // ── Anime: DuB / SuB / VidFast V-layout ─────────────────
+                // ── Anime: DuB / SuB ────────────────────────────────────
                 AnimeDubButton(
                     fontFamily = passionFont,
                     focusRequester = animeDubFocusRequester,
@@ -1407,76 +1467,38 @@ fun MoviesDetailsScreenContent(
                         }
                     }
                 )
-                if (sources.size > 1) {
-                    MoviesStreamerButton(
-                        source = sources[1],
-                        fontFamily = passionFont,
-                        focusRequester = remember { FocusRequester() },
-                        offsetX = 128.dp, offsetY = 388.dp,
-                        disableLeftSound = false, disableRightSound = false, disableDownSound = true,
-                        onClick = {
-                            isTrailerPlaying = false
-                            hasTrailerBeenPlayed = false
-                            onStreamingSourceSelected(sources[1])
-                        }
-                    )
-                }
             } else {
-                // ── Non-anime: original 5-button layout ──────────────────
-                if (sources.isNotEmpty()) {
-                    MoviesStreamerButton(
-                        source = sources[0],
-                        fontFamily = passionFont,
-                        focusRequester = remember { FocusRequester() },
-                        offsetX = 27.75.dp, offsetY = 332.5.dp,
-                        disableLeftSound = true, disableRightSound = false,
-                        onClick = { isTrailerPlaying = false; hasTrailerBeenPlayed = false; onStreamingSourceSelected(sources[0]) }
-                    )
+                // ── Non-anime: 2-column grid laid out FROM the sources list ──
+                // Adding/removing an entry in getStreamingSources() now "just
+                // works" — no per-index block to keep in sync (that mismatch is
+                // what silently dropped the 6th button). Column X and the first
+                // rows' Y are the exact legacy offsets, so nothing moves on screen;
+                // a 7th+ source simply continues the grid downward.
+                val colX = listOf(27.75.dp, 228.dp)          // [left column, right column]
+                val rowY = listOf(332.5.dp, 388.dp, 443.dp)  // exact legacy row offsets
+                val streamerFocus = remember(sources.size) {
+                    List(sources.size) { FocusRequester() }
                 }
-                if (sources.size > 1) {
+                sources.forEachIndexed { i, source ->
+                    val col = i % 2
+                    val row = i / 2
                     MoviesStreamerButton(
-                        source = sources[1],
+                        source = source,
                         fontFamily = passionFont,
-                        focusRequester = remember { FocusRequester() },
-                        offsetX = 228.dp, offsetY = 332.5.dp,
-                        disableLeftSound = false, disableRightSound = true,
-                        onClick = { isTrailerPlaying = false; hasTrailerBeenPlayed = false; onStreamingSourceSelected(sources[1]) }
-                    )
-                }
-                if (sources.size > 2) {
-                    MoviesStreamerButton(
-                        source = sources[2],
-                        fontFamily = passionFont,
-                        focusRequester = remember { FocusRequester() },
-                        offsetX = 27.75.dp, offsetY = 388.dp,
-                        disableLeftSound = true, disableRightSound = false,
-                        onClick = { isTrailerPlaying = false; hasTrailerBeenPlayed = false; onStreamingSourceSelected(sources[2]) }
-                    )
-                }
-                if (sources.size > 3) {
-                    MoviesStreamerButton(
-                        source = sources[3],
-                        fontFamily = passionFont,
-                        focusRequester = remember { FocusRequester() },
-                        offsetX = 228.dp, offsetY = 388.dp,
-                        disableLeftSound = false, disableRightSound = true,
-                        onClick = { isTrailerPlaying = false; hasTrailerBeenPlayed = false; onStreamingSourceSelected(sources[3]) }
-                    )
-                }
-                if (sources.size > 4) {
-                    MoviesStreamerButton(
-                        source = sources[4],
-                        fontFamily = passionFont,
-                        focusRequester = remember { FocusRequester() },
-                        offsetX = 131.dp, offsetY = 443.dp,
-                        disableLeftSound = false, disableRightSound = false, disableDownSound = true,
+                        focusRequester = streamerFocus[i],
+                        offsetX = colX[col],
+                        offsetY = if (row < rowY.size) rowY[row]
+                                  else rowY.last() + 55.dp * (row - rowY.lastIndex),
+                        disableLeftSound  = col == 0,               // left column → mute left edge
+                        disableRightSound = col == 1,               // right column → mute right edge
+                        disableDownSound  = i + 2 >= sources.size,  // no button directly below → mute down
                         onClick = {
                             isTrailerPlaying = false; hasTrailerBeenPlayed = false
-                            val s = sources[4]
-                            // CineSrc → headless m3u8 extraction + ExoPlayer (overlay shows
-                            // progress). Everything else keeps the WebView path.
-                            if (s.name == "CineSrc") launchCineExtract(s.url)
-                            else onStreamingSourceSelected(s)
+                            // Extractor sources → headless m3u8 extraction + ExoPlayer
+                            // (overlay shows progress); everything else keeps the WebView
+                            // path. Keyed off the source flag, not its name/slot.
+                            if (source.useExtractor) launchVidApiExtract(source.name, source.url)
+                            else onStreamingSourceSelected(source)
                         }
                     )
                 }
@@ -1559,7 +1581,18 @@ fun MoviesDetailsScreenContent(
                         awaitFrame()
                         try { lastStreamFocusRequester?.requestFocus() } catch (_: Exception) {}
                     }
-                    pendingUrl?.let { launchEnumerate(it, pendingDub) }
+                    // If the default extraction already captured this episode's
+                    // server list, skip the enumerate webview pass and open the
+                    // picker instantly. Otherwise fall back to enumerating.
+                    val cached = pendingUrl?.let { serverListCache[serverCacheKey(it, pendingDub)] }
+                    if (cached != null) {
+                        Log.d("scraper", "🗂 server picker from cache (${cached.first.size} servers)")
+                        serverOptions    = cached.first
+                        serverDefaultIdx = cached.second
+                        showServerPicker = true
+                    } else {
+                        pendingUrl?.let { launchEnumerate(it, pendingDub) }
+                    }
                 }
             )
         }
@@ -1598,10 +1631,10 @@ fun MoviesDetailsScreenContent(
             )
         }
 
-        // ── CineSrc extraction error toast ──────────────────────────────────
-        if (cineError != null) {
+        // ── Extractor error toast ───────────────────────────────────────────
+        if (vidApiError != null) {
             Text(
-                cineError!!,
+                vidApiError!!,
                 color = Color.White,
                 fontSize = 18.sp,
                 fontFamily = dongleRegular,
@@ -2058,7 +2091,7 @@ fun MoviesStreamerButton(
                         }
                         Key.DirectionDown -> {
                             if (disableDownSound) {
-                                // for sources[4]: no sound, but allow navigation
+                                // bottom-row buttons: no sound, but allow navigation
                                 false
                             } else {
                                 BlueHiveApplication.playHoverSound()

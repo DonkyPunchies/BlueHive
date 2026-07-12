@@ -245,6 +245,13 @@ data class MediaDetailResponse(
 )
 
 
+data class ImdbIdResponse(
+    val tmdb_id:    Int?    = null,
+    val media_type: String? = null,
+    val imdb_id:    String? = null,
+)
+
+
 data class FavoriteRequest(
     val profile_id:    Int,
     val media_tmdb_id: Int,
@@ -307,6 +314,29 @@ interface PlatformApiService {
     ): SimpleOkResponse
 }
 
+// ── Device report payloads (see bluehive-api bluehive_plugin/reports.py) ─────
+
+data class DeviceReportBody(
+    val report_type: String,                 // 'crash' | 'diagnostic'
+    val occurred_at_ms: Long,                // client clock at capture time
+    val app_version_name: String?,
+    val app_version_code: Int?,
+    val device_model: String?,
+    val android_sdk: Int?,
+    val device_fingerprint: String?,         // fallback identity; server prefers its own device row
+    val exception_class: String? = null,
+    val exception_message: String? = null,
+    val stack_trace: String? = null,
+    val thread_name: String? = null,
+    val log_lines: String? = null,
+    val meta: Map<String, Any?> = emptyMap(),
+)
+
+data class DeviceReportAck(
+    val ok: Boolean,
+    val report_id: Long,
+)
+
 
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -316,6 +346,16 @@ interface PlatformApiService {
 // Routed through ApiClient.bluehiveApi (Bearer + silent refresh + X-API-Key).
 // ══════════════════════════════════════════════════════════════════════════════
 interface BluehiveApiService {
+
+    // Media endpoint served by the same backend (TMDB_Api_Server). Lives on this
+    // interface so it rides the proven bluehiveApi client (hardcoded base URL +
+    // X-API-Key) rather than trailerApi's BuildConfig URL. Resolves a tmdb id to
+    // its imdb_id (TMDB external_ids, server-side) for subtitle lookups.
+    @GET("/api/media/{tmdb_id}/imdb")
+    suspend fun getMediaImdb(
+        @Path("tmdb_id")     tmdbId:    Int,
+        @Query("media_type") mediaType: String,
+    ): ImdbIdResponse
 
     @GET("/api/bluehive/profiles/{profileId}/watch-history")
     suspend fun getWatchHistory(
@@ -382,6 +422,20 @@ interface BluehiveApiService {
         @Path("profileId") profileId: Int,
         @Body body: ProfileUpdateRequest,
     ): ProfileResponse
+
+    /**
+     * Crash / diagnostic report ingest — hits bluehive-api (:8000), which
+     * writes bluehive.device_reports. Auth is the bluehiveApi pair (Bearer JWT
+     * + X-API-Key); the server reads user_id/device_id as opaque ints from the
+     * JWT and takes the device_fingerprint from the body. This lives on
+     * bluehiveApi (NOT platformApi) on purpose: BlueHive's telemetry stays in
+     * BlueHive's backend, never the Off-Grid platform DB. Sent by CrashReporter
+     * ('crash', launch after a crash) and Send Logs ('diagnostic').
+     */
+    @POST("/api/bluehive/reports")
+    suspend fun submitDeviceReport(
+        @Body body: DeviceReportBody,
+    ): Response<DeviceReportAck>
 }
 
 

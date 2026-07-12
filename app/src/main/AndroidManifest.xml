@@ -76,6 +76,19 @@
             android:screenOrientation="landscape"
             android:theme="@style/Theme.BlueHive" />
 
+        <!-- Settings (sidebar → Settings) and its Diagnostics page (version,
+             connectivity, storage, Send Logs). Internal-only screens. -->
+        <activity
+            android:name=".settings.SettingsActivity"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.BlueHive" />
+        <activity
+            android:name=".diagnostics.DiagnosticsActivity"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.BlueHive" />
+
 
 
         <!-- BlueHive's host-launch front door. The host (Off-Grid Drive) targets this
@@ -139,13 +152,13 @@
 
 
         <activity
-            android:name=".webview.cinesrc.CineSrcExtractorActivity"
+            android:name=".webview.vidapi.VidApiExtractorActivity"
             android:exported="false"
-            android:process=":cineextractor"
+            android:process=":vidapiextractor"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
         <activity
-            android:name=".webview.cinesrc.CineSrcPlayerActivity"
+            android:name=".webview.vidapi.VidApiPlayerActivity"
             android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />

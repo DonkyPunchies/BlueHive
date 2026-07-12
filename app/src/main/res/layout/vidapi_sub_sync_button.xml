@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A control-bar button matched to media3's CC button (size/margins/padding/
+     focus come from the shared style). The icon is set at runtime. -->
+<ImageButton xmlns:android="http://schemas.android.com/apk/res/android"
+    style="@style/ExoStyledControls.Button.Bottom.CC" />
