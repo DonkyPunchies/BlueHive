@@ -14395,7 +14395,7 @@ HSPLcom/example/bluehive/host/HostToken$Unavailable;-><init>()V
 Lcom/example/bluehive/host/HostTokenProvider;
 HSPLcom/example/bluehive/host/HostTokenProvider;-><clinit>()V
 HSPLcom/example/bluehive/host/HostTokenProvider;-><init>()V
-HSPLcom/example/bluehive/host/HostTokenProvider;->ensureBound()Lio/bluehive/host/IBlueHiveHost;
+HSPLcom/example/bluehive/host/HostTokenProvider;->ensureBound()Lio/companion/host/ICompanionHost;
 HSPLcom/example/bluehive/host/HostTokenProvider;->fetchFreshToken()Lcom/example/bluehive/host/HostToken;
 HSPLcom/example/bluehive/host/HostTokenProvider;->init(Landroid/content/Context;)V
 Lcom/example/bluehive/host/HostTokenProvider$connection$1;

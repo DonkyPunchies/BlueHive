@@ -2,6 +2,7 @@ package com.example.bluehive.webview
 
 import android.annotation.SuppressLint
 import android.app.ActivityManager
+import android.content.ComponentCallbacks2
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
@@ -310,6 +311,44 @@ object GeckoWebViewManager {
                 } catch (e: Exception) {
                     Log.e(TAG, "❌ Failed to install uBlock", e)
                 }
+            }
+        }
+    }
+
+    /**
+     * Forward the app's memory-pressure signal (Application.onTrimMemory) to
+     * Gecko so it releases its OWN caches.
+     *
+     * WHY THIS MATTERS: the app's onTrimMemory only clears Coil's image bitmaps.
+     * Gecko keeps a SEPARATE pool of native caches (network + image) that quietly
+     * grows over long uptimes — a top contributor to the slow memory creep that
+     * eventually lets the Low Memory Killer reap BlueHive on 2 GB boxes. Clearing
+     * them here gives Gecko back a chunk of RAM that Coil-clearing never touches.
+     *
+     * IMAGE_CACHE is always safe to drop. At the heavier / backgrounded levels we
+     * also drop NETWORK_CACHE (ALL_CACHES); mid-stream that can cost a small
+     * re-fetch, which is a fine trade when the alternative is the OS killing us.
+     *
+     * We deliberately do NOT close the active session here — that's owned by the
+     * player (MainWebViewer), which tears it down when you leave playback.
+     */
+    fun onTrimMemory(level: Int) {
+        val rt = geckoRuntime ?: return   // Gecko only lives in the main process
+
+        val aggressive = level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL ||
+                level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND
+        val flags = if (aggressive)
+            StorageController.ClearFlags.ALL_CACHES     // network + image
+        else
+            StorageController.ClearFlags.IMAGE_CACHE    // safe even mid-playback
+
+        // GeckoView APIs must run on the UI thread.
+        Handler(Looper.getMainLooper()).post {
+            try {
+                rt.storageController.clearData(flags)
+                Log.i(TAG, "🧹 onTrimMemory(level=$level) — cleared Gecko caches (flags=$flags)")
+            } catch (e: Exception) {
+                Log.w(TAG, "Gecko cache clear failed: ${e.message}")
             }
         }
     }

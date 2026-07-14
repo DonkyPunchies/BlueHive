@@ -7,8 +7,8 @@ import android.content.ServiceConnection
 import android.os.IBinder
 import android.util.Log
 import com.example.bluehive.auth.SessionManager
-import io.bluehive.host.BlueHiveHostContract
-import io.bluehive.host.IBlueHiveHost
+import io.companion.host.CompanionHostContract
+import io.companion.host.ICompanionHost
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -49,7 +49,7 @@ sealed class HostToken {
 object HostTokenProvider {
 
     @Volatile private var appContext: Context? = null
-    @Volatile private var host: IBlueHiveHost? = null
+    @Volatile private var host: ICompanionHost? = null
 
     fun init(context: Context) {
         appContext = context.applicationContext
@@ -58,7 +58,7 @@ object HostTokenProvider {
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
-            host = IBlueHiveHost.Stub.asInterface(binder)
+            host = ICompanionHost.Stub.asInterface(binder)
             Log.i(TAG, "Connected to host service: $name")
         }
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -68,7 +68,7 @@ object HostTokenProvider {
     }
 
     /** Ensures we're bound. Blocks up to BIND_TIMEOUT_SECONDS for the connection. */
-    private fun ensureBound(): IBlueHiveHost? {
+    private fun ensureBound(): ICompanionHost? {
         host?.let { return it }
         val ctx = appContext ?: run {
             Log.e(TAG, "Not initialised — call HostTokenProvider.init() in Application.onCreate()")
@@ -78,7 +78,7 @@ object HostTokenProvider {
         val latch = CountDownLatch(1)
         val oneShot = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
-                host = IBlueHiveHost.Stub.asInterface(binder)
+                host = ICompanionHost.Stub.asInterface(binder)
                 Log.i(TAG, "Bound to host (one-shot): $name")
                 latch.countDown()
             }
@@ -88,7 +88,7 @@ object HostTokenProvider {
             Log.e(TAG, "No host package resolved — cannot bind for token refresh")
             return null
         }
-        val intent = Intent(BlueHiveHostContract.ACTION_BIND_HOST).apply {
+        val intent = Intent(CompanionHostContract.ACTION_BIND_HOST).apply {
             setPackage(hostPackage)
         }
         val ok = try {

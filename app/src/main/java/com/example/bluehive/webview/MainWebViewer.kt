@@ -30,6 +30,7 @@ import android.os.Build
 import androidx.compose.ui.layout.onSizeChanged
 import com.example.bluehive.BlueHiveApplication
 import com.example.bluehive.api.LockoutBus
+import com.example.bluehive.diagnostics.CrashReporter
 import kotlinx.coroutines.launch
 
 class MainWebViewer : AppCompatActivity() {
@@ -44,6 +45,7 @@ class MainWebViewer : AppCompatActivity() {
     private var hasRetried = false
     private var isSessionAttached = false
     private var shutdownInitiated = false
+    private var contentGoneReported = false   // #3 report a content-process death only once
 
     private var sourceUrl: String? = null
     private var sourceName: String? = null
@@ -58,7 +60,7 @@ class MainWebViewer : AppCompatActivity() {
 
     // Shut down GeckoView immediately when the workspace locks out or a
     // session is revoked. MainWebViewer runs in its own task
-    // (taskAffinity="com.example.bluehive.video") so FLAG_ACTIVITY_CLEAR_TASK
+    // (taskAffinity="com.bluehive.tv.video") so FLAG_ACTIVITY_CLEAR_TASK
     // on the main task never reaches it — this listener is the only
     // reliable way to close it from outside.
     private val lockoutListener: (String?) -> Unit = { reason ->
@@ -225,6 +227,22 @@ class MainWebViewer : AppCompatActivity() {
                         isFullscreen = fullScreen
                     }
                 }
+
+                // #3 The content (child) process CRASHED. The MAIN app process is
+                // still alive here, so we can report + recover immediately.
+                override fun onCrash(session: GeckoSession) {
+                    Log.e(TAG, "💥 Gecko content process CRASHED")
+                    handleContentProcessGone(killed = false)
+                }
+
+                // #3 The system KILLED the content process — almost always the Low
+                // Memory Killer reaping it (the exact event behind the "app just
+                // vanished" OOM). This is our ONLY hook to see it: no Kotlin
+                // exception is thrown, so the crash reporter is otherwise blind.
+                override fun onKill(session: GeckoSession) {
+                    Log.e(TAG, "☠️ Gecko content process KILLED by system (likely OOM)")
+                    handleContentProcessGone(killed = true)
+                }
             }
 
             permissionDelegate = object : GeckoSession.PermissionDelegate {
@@ -288,6 +306,32 @@ class MainWebViewer : AppCompatActivity() {
         return super.dispatchKeyEvent(event)
     }
 
+    // #3 Content-process death handler (crash or system kill). Two jobs:
+    //   (b) REPORT it — the main process is alive, so upload right now (not on
+    //       next launch). This is the only field visibility we get into these
+    //       OOM/crash events; the crash reporter never sees them (no exception).
+    //   (a) RECOVER gracefully — the content is gone, so close the defunct session
+    //       and return to the previous screen instead of stranding the user on a
+    //       dead webview. Replaying starts a fresh session.
+    private fun handleContentProcessGone(killed: Boolean) {
+        if (!contentGoneReported) {
+            contentGoneReported = true
+            val host = runCatching { android.net.Uri.parse(sourceUrl).host }.getOrNull()
+            CrashReporter.reportContentProcessGone(
+                applicationContext,
+                killed = killed,
+                extraMeta = mapOf(
+                    "source" to "webview_content_process",
+                    "stream_host" to (host ?: "unknown"),
+                    "was_fullscreen" to isFullscreen,
+                ),
+            )
+        }
+        if (!shutdownInitiated) {
+            initiateGracefulShutdown()
+        }
+    }
+
     private fun initiateGracefulShutdown() {
         if (shutdownInitiated) return
         shutdownInitiated = true
@@ -339,6 +383,24 @@ class MainWebViewer : AppCompatActivity() {
         super.onResume()
         if (!isFinishing && !shutdownInitiated && isSessionAttached) {
             geckoSession?.setActive(true)
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // Leaving the player — pressing Home, or another activity fully covering
+        // us — tears the Gecko session DOWN instead of leaving its content process
+        // (hundreds of MB) alive in the background. That lingering process is a
+        // top driver of the slow memory compounding that lets the Low Memory
+        // Killer reap BlueHive on 2 GB boxes after long uptimes.
+        //
+        // Guarded so a normal Back-exit (which already ran initiateGracefulShutdown
+        // → shutdownInitiated = true) doesn't double-fire. onStop only reaches here
+        // when the user genuinely backgrounded the player; returning to BlueHive
+        // lands on the previous screen, and replaying starts a fresh session.
+        if (!isFinishing && !shutdownInitiated) {
+            Log.i(TAG, "▶️ Player backgrounded (onStop) — tearing down session to free memory")
+            initiateGracefulShutdown()
         }
     }
 

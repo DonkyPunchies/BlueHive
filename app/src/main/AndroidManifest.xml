@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
     AndroidManifest.xml — host-model (Phase 2)
-    Entry point: .host.HostEntryActivity only (io.bluehive.host.action.LAUNCH).
+    Entry point: .host.HostEntryActivity only (io.companion.host.action.LAUNCH).
     No LEANBACK_LAUNCHER tile — BlueHive is reachable solely through a host
     app. LoadingScreenActivity → ProfileScreenActivity → HomeScreenCompose
     is the internal flow once the host injects a token.
@@ -26,12 +26,12 @@
             <action android:name="android.speech.RecognitionService" />
         </intent>
         <!-- Lets BlueHive see + bind to ANY installed host that exposes the
-             IBlueHiveHost service (action BIND_HOST) on Android 11+. Declared by
+             ICompanionHost service (action BIND_HOST) on Android 11+. Declared by
              ACTION, so no specific host package is named. Without a <queries>
              match, queryIntentServices()/bindService() to the host silently
              return nothing because package visibility is restricted. -->
         <intent>
-            <action android:name="io.bluehive.host.action.BIND_HOST" />
+            <action android:name="io.companion.host.action.BIND_HOST" />
         </intent>
     </queries>
 
@@ -58,7 +58,7 @@
 
         <!-- PHASE 2: BlueHive has no independent launcher tile. Identity lives in
              the host app; BlueHive is only reachable via the host's
-             io.bluehive.host.action.LAUNCH intent (see .host.HostEntryActivity).
+             io.companion.host.action.LAUNCH intent (see .host.HostEntryActivity).
              LoadingScreenActivity is now an internal-only entry point started by
              HostEntryActivity after the host injects a token, so it's no longer
              exported and carries no LEANBACK_LAUNCHER category. -->
@@ -96,15 +96,15 @@
 
 
         <!-- BlueHive's host-launch front door. The host app targets this
-         via io.bluehive.host.action.LAUNCH. exported=true is required because a
+         via io.companion.host.action.LAUNCH. exported=true is required because a
          different app (the host) starts it. NO LEANBACK_LAUNCHER here — this is not
          a home-screen entry point; it's only reachable via the host intent. -->
         <activity
             android:name=".host.HostEntryActivity"
             android:exported="true">
             <intent-filter>
-                <action android:name="io.bluehive.host.action.LAUNCH" />
-                <category android:name="io.bluehive.host.category.COMPANION" />
+                <action android:name="io.companion.host.action.LAUNCH" />
+                <category android:name="io.companion.host.category.COMPANION" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
@@ -239,7 +239,7 @@
             android:screenOrientation="landscape"
             android:noHistory="true"
             android:launchMode="singleTask"
-            android:taskAffinity="com.example.bluehive.video"
+            android:taskAffinity="com.bluehive.tv.video"
             android:excludeFromRecents="false"
             android:exported="false"/>
 

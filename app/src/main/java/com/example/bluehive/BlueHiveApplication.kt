@@ -659,6 +659,10 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
         if (underPressure) {
             Log.w(TAG, "🧹 onTrimMemory(level=$level) — clearing image memory cache to dodge the LMK")
             coilImageLoader.memoryCache?.clear()
+            // Also forward the pressure to Gecko so it drops its OWN native caches.
+            // The embedded browser is the DOMINANT memory consumer on 2 GB boxes,
+            // and clearing Coil alone doesn't touch a byte of Gecko's memory.
+            com.example.bluehive.webview.GeckoWebViewManager.onTrimMemory(level)
         }
     }
 

@@ -12,7 +12,7 @@ import com.example.bluehive.LoadingScreenActivity
 import com.example.bluehive.auth.SessionManager
 import com.example.bluehive.update.SelfUpdateActivity
 import com.example.bluehive.update.UpdateManager
-import io.bluehive.host.BlueHiveHostContract
+import io.companion.host.CompanionHostContract
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -25,7 +25,7 @@ private const val TAG = "HostEntryActivity"
  *   0. Self-update check (unless EXTRA_SKIP_UPDATE_CHECK). If an update exists,
  *      route to SelfUpdateActivity and stop — the update screen owns the rest.
  *      Done BEFORE host bind so a fix ships even if the host handshake is broken.
- *   1. Bind to the host's IBlueHiveHost service.
+ *   1. Bind to the host's ICompanionHost service.
  *   2. Readiness gate: getIdentityState().
  *   3. READY -> getAccessToken(); inject into SessionManager; launch the app.
  */
@@ -81,7 +81,7 @@ class HostEntryActivity : ComponentActivity() {
         // blind spot documented in SelfUpdateActivity, which is exactly why
         // host-orchestration is preferred whenever the host supports it.
         val skipUpdate = intent?.getBooleanExtra(
-            BlueHiveHostContract.EXTRA_SKIP_UPDATE_CHECK, false
+            CompanionHostContract.EXTRA_SKIP_UPDATE_CHECK, false
         ) ?: false
 
         lifecycleScope.launch {
@@ -125,8 +125,8 @@ class HostEntryActivity : ComponentActivity() {
             }
 
             when (state) {
-                BlueHiveHostContract.IDENTITY_STATE_READY -> handleReady(host)
-                BlueHiveHostContract.IDENTITY_STATE_HOST_BUSY ->
+                CompanionHostContract.IDENTITY_STATE_READY -> handleReady(host)
+                CompanionHostContract.IDENTITY_STATE_HOST_BUSY ->
                     toastAndFinish("Host is still setting up — try again shortly.")
                 else ->
                     toastAndFinish("Set up BlueHive in your host app first.")
@@ -134,7 +134,7 @@ class HostEntryActivity : ComponentActivity() {
         }
     }
 
-    private suspend fun handleReady(host: io.bluehive.host.IBlueHiveHost) {
+    private suspend fun handleReady(host: io.companion.host.ICompanionHost) {
         val token = try {
             withContext(Dispatchers.IO) { host.accessToken }
         } catch (e: Exception) {
@@ -170,8 +170,8 @@ class HostEntryActivity : ComponentActivity() {
     }
 }
 
-private fun io.bluehive.host.IBlueHiveHost.contractVersionOrZero(): Int =
+private fun io.companion.host.ICompanionHost.contractVersionOrZero(): Int =
     try { hostContractVersion } catch (e: Exception) { 0 }
 
-private fun io.bluehive.host.IBlueHiveHost.identityStateSafe(): Int =
-    try { identityState } catch (e: Exception) { BlueHiveHostContract.IDENTITY_STATE_NOT_PAIRED }
+private fun io.companion.host.ICompanionHost.identityStateSafe(): Int =
+    try { identityState } catch (e: Exception) { CompanionHostContract.IDENTITY_STATE_NOT_PAIRED }

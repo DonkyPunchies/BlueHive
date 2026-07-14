@@ -177,6 +177,46 @@ object CrashReporter {
             }
         }
 
+    // ── 4. Content-process death (Gecko onCrash / onKill) ─────────────────────
+
+    /**
+     * Reports a Gecko content-process death RIGHT NOW. When onCrash/onKill fires,
+     * the MAIN app process is still alive — so, unlike a fatal Kotlin crash, we can
+     * upload immediately instead of persisting for next launch. report_type splits
+     * the two cases so they group separately in the dashboard:
+     *   killed = true  → 'oom'           (system reaped the process; usually the LMK)
+     *   killed = false → 'webview_crash' (the content process itself crashed)
+     * The captured logcat tail + memory snapshot travel with it, so you can see what
+     * the device looked like at the moment it happened — the visibility that a plain
+     * OOM otherwise denies you (no exception is ever thrown).
+     */
+    fun reportContentProcessGone(
+        context: Context,
+        killed: Boolean,
+        extraMeta: Map<String, Any?> = emptyMap(),
+    ) {
+        val reportType = if (killed) "oom" else "webview_crash"
+        ioScope.launch {
+            try {
+                val body = buildReport(context, reportType = reportType, extraMeta = extraMeta).copy(
+                    exception_class = if (killed) "GeckoContentProcessKilled" else "GeckoContentProcessCrashed",
+                    exception_message = if (killed)
+                        "The webview content process was killed by the system (low memory)."
+                    else
+                        "The webview content process crashed.",
+                )
+                val resp = ApiClient.bluehiveApi.submitDeviceReport(body)
+                if (resp.isSuccessful) {
+                    Log.i(TAG, "📤 Content-process '$reportType' reported (id=${resp.body()?.report_id})")
+                } else {
+                    Log.w(TAG, "Content-process report rejected: HTTP ${resp.code()}")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Content-process report failed: ${e.message}")
+            }
+        }
+    }
+
     // ── Report assembly ───────────────────────────────────────────────────────
 
     private fun buildReport(

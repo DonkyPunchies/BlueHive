@@ -135,7 +135,7 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.example.bluehive"
+        applicationId = "com.bluehive.tv"
         minSdk = 25
         targetSdk = 35
         versionCode = appVersionCode

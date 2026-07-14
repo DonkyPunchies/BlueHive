@@ -8,44 +8,44 @@ import android.content.ServiceConnection
 import android.os.IBinder
 import android.util.Log
 import com.example.bluehive.auth.SessionManager
-import io.bluehive.host.BlueHiveHostContract
-import io.bluehive.host.IBlueHiveHost
+import io.companion.host.CompanionHostContract
+import io.companion.host.ICompanionHost
 import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
 
 private const val TAG = "HostConnection"
 
 /**
- * Wraps binding to the host's IBlueHiveHost service.
+ * Wraps binding to the host's ICompanionHost service.
  *
- * Usage: call bind(), await the connected IBlueHiveHost, use it, then unbind()
+ * Usage: call bind(), await the connected ICompanionHost, use it, then unbind()
  * in onDestroy. Binding is async — bind() suspends until the service connects
  * (or fails/times out at the caller's discretion).
  */
 class HostConnection(private val context: Context) {
 
-    @Volatile private var host: IBlueHiveHost? = null
+    @Volatile private var host: ICompanionHost? = null
     private var connection: ServiceConnection? = null
 
     /**
      * Binds to the host service and suspends until connected.
-     * Returns the IBlueHiveHost proxy, or null if the bind couldn't be initiated
+     * Returns the ICompanionHost proxy, or null if the bind couldn't be initiated
      * (host not installed / service not found).
      */
-    suspend fun bind(): IBlueHiveHost? = suspendCancellableCoroutine { cont ->
+    suspend fun bind(): ICompanionHost? = suspendCancellableCoroutine { cont ->
         val hostPackage = SessionManager.get().hostPackage
         if (hostPackage == null) {
             Log.e(TAG, "No host package resolved — cannot bind (launch BlueHive from a host app)")
             if (cont.isActive) cont.resume(null)
             return@suspendCancellableCoroutine
         }
-        val intent = Intent(BlueHiveHostContract.ACTION_BIND_HOST).apply {
+        val intent = Intent(CompanionHostContract.ACTION_BIND_HOST).apply {
             setPackage(hostPackage)
         }
 
         val conn = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
-                val h = IBlueHiveHost.Stub.asInterface(binder)
+                val h = ICompanionHost.Stub.asInterface(binder)
                 host = h
                 Log.i(TAG, "Bound to host service: $name")
                 if (cont.isActive) cont.resume(h)

@@ -132,7 +132,7 @@ class SelfUpdateActivity : ComponentActivity() {
         startActivity(
             Intent(this, HostEntryActivity::class.java).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
-                putExtra(io.bluehive.host.BlueHiveHostContract.EXTRA_SKIP_UPDATE_CHECK, true)
+                putExtra(io.companion.host.CompanionHostContract.EXTRA_SKIP_UPDATE_CHECK, true)
             }
         )
         finish()
