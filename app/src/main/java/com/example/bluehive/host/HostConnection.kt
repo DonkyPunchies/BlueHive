@@ -48,6 +48,12 @@ class HostConnection(private val context: Context) {
                 val h = ICompanionHost.Stub.asInterface(binder)
                 host = h
                 Log.i(TAG, "Bound to host service: $name")
+                // Push-path: this is the bind that actually happens at startup
+                // (HostTokenProvider.ensureBound() is lazy — it only runs on a 401
+                // token refresh). Register here so the host can push
+                // onIdentityRevoked() the instant this device is removed. The host
+                // keys callbacks by binder, so registering from both paths is safe.
+                HostTokenProvider.registerRevocationCallback(h)
                 if (cont.isActive) cont.resume(h)
             }
 

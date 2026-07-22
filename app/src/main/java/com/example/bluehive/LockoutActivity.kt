@@ -226,7 +226,8 @@ fun LockoutScreen(
         state = RefreshState.Checking
         scope.launch {
             try {
-                val resp = ApiClient.platformApi.checkSlot()
+                // PHASE 3: slot state moved to bluehive-api (bluehive.device_sessions).
+                val resp = ApiClient.bluehiveApi.checkSlot()
                 when {
                     resp.isSuccessful -> {
                         onSlotFreed()

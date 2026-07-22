@@ -23,7 +23,8 @@ import java.util.concurrent.TimeUnit
  * DeviceEventStream
  *
  * Replaces HeartbeatManager entirely.  Maintains a long-lived SSE connection
- * to GET /api/android/events on the platform backend.
+ * to GET /api/android/events on bluehive-api (PHASE 3: moved off the platform
+ * identity backend — see BLUEHIVE_BASE below for why platform could never work).
  *
  * ── What it does ─────────────────────────────────────────────────────────────
  *
@@ -69,8 +70,19 @@ object DeviceEventStream {
     // never loses its token mid-connection.
     private const val TOKEN_REFRESH_BUFFER_S = 120L
 
-    // Platform base URL — must match ApiClient
-    private const val PLATFORM_BASE = com.example.bluehive.BuildConfig.PLATFORM_BASE_URL
+    // PHASE 3 (device-table split): the event stream now targets BLUEHIVE-API, not
+    // the platform identity backend. The old platform URL could never work in the
+    // host model: platform resolves the stream by (X-Device-Fingerprint, user_id)
+    // against platform_accounts.devices, but that row belongs to the HOST (OGD) —
+    // deviceFingerprint below is a hash of BlueHive's OWN ANDROID_ID, so platform
+    // answered 404 "Device not found" on every connect and the stream never opened.
+    // bluehive-api instead keys the session by the `device_id` claim in the
+    // host-injected JWT, so no fingerprint match is required.
+    //
+    // trimEnd('/') because BLUEHIVE_DEV_BASE_URL carries a trailing slash (unlike
+    // PLATFORM_BASE_URL) and the paths below are concatenated with a leading '/'.
+    private const val BLUEHIVE_BASE_RAW = com.example.bluehive.BuildConfig.API_BASE_URL
+    private val BLUEHIVE_BASE = BLUEHIVE_BASE_RAW.trimEnd('/')
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var job: Job? = null
@@ -331,7 +343,7 @@ fun start() {
         val fingerprint = session.deviceFingerprint
 
         val request = Request.Builder()
-            .url("$PLATFORM_BASE/api/android/events")
+            .url("$BLUEHIVE_BASE/api/android/events")
             .header("Authorization",        "Bearer $accessToken")
             .header("X-Device-Fingerprint", fingerprint)
             .header("Accept",               "text/event-stream")

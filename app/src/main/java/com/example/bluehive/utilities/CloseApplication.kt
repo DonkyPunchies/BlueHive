@@ -46,7 +46,14 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import android.util.Log
+import com.example.bluehive.api.ApiClient
 import com.example.bluehive.auth.DeviceEventStream
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 
 
 /**
@@ -178,13 +185,29 @@ fun CloseApplicationHandler(
  *    stream and re-occupy the device slot).
  */
 private fun performClose(activity: android.app.Activity) {
-    // Step 1 — stop stream and block any future start() calls this process
+    // Step 1 — stop stream and block any future start() calls this process.
     DeviceEventStream.stopAndMarkExited()
 
-    // PHASE 2: the direct platformApi.endSession() call is REMOVED. It targeted
-    // the platform identity backend, which no longer accepts BlueHive's host-
-    // injected token. Step 1 (stopAndMarkExited) already closes the SSE stream,
-    // and the server's SSE finally block sets is_device_active = false — that is
-    // now the sole, sufficient mechanism. We just close the task stack.
-    activity.finishAffinity()
+    // Step 2 (PHASE 3.1, RESTORED) — end-session ping, now to BLUEHIVE-API. The
+    // endpoint PHASE 2 removed targeted the platform backend, which stopped
+    // accepting BlueHive's token; bluehive-api owns device_sessions now. This is
+    // the PRIMARY "instant inactive" mechanism for a proper Back-button close.
+    // The SSE finally no longer writes is_device_active (it raced request
+    // cancellation), so WITHOUT this ping a clean close would wait ~15 min on the
+    // reaper. Step 3 (finishAffinity) runs in the finally so a slow/failed ping
+    // never traps the user inside the app; the 2s timeout caps the wait, and if
+    // the ping is lost the reaper is still the backstop.
+    CoroutineScope(Dispatchers.IO).launch {
+        try {
+            withTimeout(2_000) {
+                ApiClient.bluehiveApi.endSession()
+            }
+        } catch (e: Exception) {
+            Log.w("CloseApplication", "end-session ping failed (reaper backstop): ${e.message}")
+        } finally {
+            withContext(Dispatchers.Main) {
+                activity.finishAffinity()
+            }
+        }
+    }
 }

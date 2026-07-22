@@ -284,17 +284,14 @@ interface PlatformApiService {
         @Body body: AndroidRefreshRequest,
     ): Response<AndroidRefreshResponse>
 
-    @POST("/api/android/check-slot")
-    suspend fun checkSlot(): Response<CheckSlotResponse>
-
-    @POST("/api/android/end-session")
-    suspend fun endSession(): Response<SimpleOkResponse>
-
-    @POST("/api/android/background")
-    suspend fun background(): Response<SimpleOkResponse>
-
-    @POST("/api/android/foreground")
-    suspend fun foreground(): Response<SimpleOkResponse>
+    // PHASE 3 (device-table split): check-slot / end-session / background /
+    // foreground MOVED to BluehiveApiService. Streaming-session state now lives in
+    // bluehive.device_sessions, so those endpoints are served by bluehive-api.
+    // They are deliberately NOT left here as dead declarations — this interface is
+    // bound to PLATFORM_API_BASE_URL, so any surviving call would have gone on
+    // hitting the identity backend, which stopped accepting BlueHive's
+    // host-injected token (that is what silently broke is_device_active).
+    // refreshToken + getMe stay: those ARE platform identity concerns.
 
     @GET("/api/me")
     suspend fun getMe(): MeResponse
@@ -346,6 +343,29 @@ data class DeviceReportAck(
 // Routed through ApiClient.bluehiveApi (Bearer + silent refresh + X-API-Key).
 // ══════════════════════════════════════════════════════════════════════════════
 interface BluehiveApiService {
+
+    // ── Streaming-session / device-slot (PHASE 3, moved off PlatformApiService) ──
+    // These ride bluehiveHttpClient, which sends the host-supplied Bearer and
+    // refreshes it over IPC via hostTokenAuthenticator — exactly the auth shape
+    // bluehive-api expects. bluehive-api identifies the session from the JWT's
+    // `device_id` claim (and scopes the cap by `ws`), so unlike the old platform
+    // endpoints it needs no matching device_fingerprint row.
+    //
+    // NOTE: only checkSlot() currently has a caller (LockoutActivity). PHASE 2
+    // removed the background/foreground/end-session pings in favour of the SSE
+    // connect/disconnect lifecycle; they are declared here so that lifecycle can be
+    // re-driven explicitly if the SSE-only approach proves too coarse.
+    @POST("/api/android/check-slot")
+    suspend fun checkSlot(): Response<CheckSlotResponse>
+
+    @POST("/api/android/end-session")
+    suspend fun endSession(): Response<SimpleOkResponse>
+
+    @POST("/api/android/background")
+    suspend fun background(): Response<SimpleOkResponse>
+
+    @POST("/api/android/foreground")
+    suspend fun foreground(): Response<SimpleOkResponse>
 
     // Media endpoint served by the same backend (TMDB_Api_Server). Lives on this
     // interface so it rides the proven bluehiveApi client (hardcoded base URL +

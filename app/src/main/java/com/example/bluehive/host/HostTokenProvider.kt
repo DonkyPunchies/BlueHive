@@ -4,11 +4,15 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
+import com.example.bluehive.api.SessionExpiredBus
 import com.example.bluehive.auth.SessionManager
 import io.companion.host.CompanionHostContract
 import io.companion.host.ICompanionHost
+import io.companion.host.ICompanionHostCallback
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -67,6 +71,44 @@ object HostTokenProvider {
         }
     }
 
+    // ── Instant-revocation push-path ──────────────────────────────────────────
+    // The host (Off-Grid Drive) fires onIdentityRevoked() the MOMENT an admin
+    // kicks/removes this device — far sooner than the pull-path notices it (which
+    // only sees it on the next token fetch coming back empty → HostToken.Revoked).
+    //
+    // onIdentityRevoked() is a `oneway` AIDL method, so it arrives on a BINDER
+    // thread. We marshal to the main thread before touching session state or the
+    // UI bus, matching every other logout path in the app.
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private val revocationCallback = object : ICompanionHostCallback.Stub() {
+        override fun onIdentityRevoked() {
+            Log.w(TAG, "Host pushed onIdentityRevoked — dropping session")
+            mainHandler.post {
+                // Exactly what DeviceEventStream's 'unpaired' branch does.
+                SessionManager.get().clearSession()
+                SessionExpiredBus.post()
+            }
+        }
+    }
+
+    /**
+     * Register our revocation callback with the host. Safe to call on every bind:
+     * the host keys callbacks by binder (RemoteCallbackList), so re-registering the
+     * same object is a no-op. A host that returns false — or throws, or predates the
+     * push-path — simply means no instant push; the MANDATORY pull-path
+     * (fetchFreshToken → HostToken.Revoked) still covers logout either way.
+     */
+    fun registerRevocationCallback(h: ICompanionHost?) {
+        if (h == null) return
+        try {
+            val ok = h.registerCallback(revocationCallback)
+            Log.i(TAG, "Host revocation callback registered: $ok")
+        } catch (e: Exception) {
+            Log.w(TAG, "registerCallback failed — falling back to pull-path: ${e.message}")
+        }
+    }
+
     /** Ensures we're bound. Blocks up to BIND_TIMEOUT_SECONDS for the connection. */
     private fun ensureBound(): ICompanionHost? {
         host?.let { return it }
@@ -104,6 +146,9 @@ object HostTokenProvider {
             Log.e(TAG, "Timed out waiting for host binding")
             return null
         }
+        // Push-path: ask the host to tell us the INSTANT identity is revoked,
+        // instead of waiting to discover it on the next token pull.
+        registerRevocationCallback(host)
         return host
     }
 

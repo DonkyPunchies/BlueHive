@@ -1,37 +1,49 @@
 package com.example.bluehive
 
 import android.util.Log
+import com.example.bluehive.api.ApiClient
 import com.example.bluehive.auth.DeviceEventStream
 import com.example.bluehive.auth.SessionManager
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 /**
  * InactivityWatcher
  *
- * Handles the home-button background event. The 10-minute grace timer
- * now lives entirely on the server:
+ * Owns the Home-button (background) and return (foreground) signals. Restored in
+ * PHASE 3.1 and pointed at BLUEHIVE-API (not the platform identity backend that
+ * PHASE 2 could no longer reach). The 15-minute grace lives entirely on the
+ * server:
  *
- *   1. Client backgrounds → POST /api/android/background
- *   2. Server sets Redis key bh:bg:{fingerprint} EX 600
- *   3. Redis TTL expires at exactly 10 minutes (wall-clock, server-side)
- *   4. Python keyspace listener fires → is_device_active = False → slot_freed
+ *   1. Home button → POST /api/android/background → bluehive-api sets
+ *      bh:bg:{fingerprint} EX 900 (15 min, wall-clock, server-side).
+ *   2. If the user does NOT return, the Redis TTL expires and the keyspace
+ *      listener flips is_device_active = False + broadcasts slot_freed.
+ *   3. If the user returns → POST /api/android/foreground deletes the key, and
+ *      the SSE reconnect (startAfterUserReturn) re-activates through the cap.
  *
- * The client no longer owns a local countdown. Android's process freezer
- * made client-side coroutine timers unreliable — they only ticked when the
- * process had CPU, which could be minutes late or never. The server's wall
- * clock is immune to Android process lifecycle.
+ * These are EVENT-driven pings (only on background/foreground), not polling —
+ * they don't reintroduce any periodic server↔host chatter.
  *
- * When the user returns:
- *   - DeviceEventStream.startAfterUserReturn() opens a new SSE
- *   - SSE connect block DELetes bh:bg:{fingerprint} and clears backgrounded_at
- *   - The keyspace listener never fires for this background event
+ * Why the server owns the timer: Android's process freezer makes client-side
+ * countdowns unreliable (they only tick when the process has CPU). Redis' wall
+ * clock is immune to Android lifecycle. If the ping itself is lost (network
+ * blip), the stale-session reaper is the backstop — the device still flips
+ * inactive ~15 min after its last keepalive.
  */
 object InactivityWatcher {
 
     private const val TAG = "InactivityWatcher"
 
+    // Fire-and-forget scope for the lifecycle pings. Process-scoped (SupervisorJob
+    // so one failed ping never cancels the other), IO dispatcher for the network.
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
     /**
      * Called from ProcessLifecycleOwner.onStop — app is fully backgrounded.
-     * Fires POST /api/android/background to start the server-side grace timer.
+     * Fires POST /api/android/background to start the server-side 15-min grace.
      */
     fun onAppBackgrounded() {
         val authed = SessionManager.get().isAuthenticated
@@ -44,24 +56,29 @@ object InactivityWatcher {
             return
         }
         if (exited) {
+            // Back button already ran end-session (instant inactive). Sending a
+            // /background now would set a pointless grace key on a device that is
+            // already leaving. Skip.
             Log.d(TAG, "⏭  skip — back button already called end-session")
             return
         }
 
-        // PHASE 2: the platformApi.background() ping is REMOVED. It targeted the
-        // platform identity backend (/api/android/background) which no longer
-        // accepts BlueHive's host-injected token. The server-side grace timer is
-        // already driven by the SSE lifecycle: when the app backgrounds and the
-        // SSE connection drops (or its TCP times out ~90s), the server's SSE
-        // finally block marks the device inactive. No HTTP ping needed.
-        Log.d(TAG, "↪ background — relying on SSE disconnect for server-side grace timer")
+        // Home button → start the server-side 15-min grace timer.
+        scope.launch {
+            try {
+                val resp = ApiClient.bluehiveApi.background()
+                Log.d(TAG, "↪ background ping ok=${resp.isSuccessful} code=${resp.code()}")
+            } catch (e: Exception) {
+                // Best-effort — if this is lost, the reaper flips the device
+                // inactive ~15 min after the last keepalive anyway.
+                Log.w(TAG, "background ping failed (reaper is the backstop): ${e.message}")
+            }
+        }
     }
 
     /**
      * Called from ProcessLifecycleOwner.onStart — app is foregrounded.
-     * The SSE reconnect handles all server-side state (DEL grace key,
-     * clear backgrounded_at, set is_device_active = True). Nothing to do
-     * client-side except log for observability.
+     * Fires POST /api/android/foreground to cancel any pending grace timer.
      */
     fun onAppForegrounded() {
         val authed = SessionManager.get().isAuthenticated
@@ -72,18 +89,17 @@ object InactivityWatcher {
             return
         }
 
-        // PHASE 2: the platformApi.foreground() ping is REMOVED (same reason as
-        // background()). On foreground, DeviceEventStream.startAfterUserReturn()
-        // opens a fresh SSE, and the server's SSE connect block clears the grace
-        // key + sets is_device_active = true. That covers the reconnect case.
-        //
-        // KNOWN GAP (pre-existing, not host-specific): if the process is NOT
-        // killed and the SSE stays alive through a brief background, there's no
-        // explicit foreground signal — the grace key ticks until the next genuine
-        // reconnect. This was the original justification for this ping. If that
-        // gap matters in practice, the correct host-model fix is to expose a
-        // foreground signal over the SSE/host path, NOT to call platformApi here.
-        // Flagging rather than silently dropping the behavior.
-        Log.d(TAG, "↪ foreground — SSE reconnect drives server-side active state")
+        // Return → cancel the grace timer. This matters for the case where the SSE
+        // never dropped during a brief background (so there's no reconnect to clear
+        // the key) — without it the grace would expire and wrongly free the slot.
+        // Re-activation + cap check remain the SSE reconnect's job.
+        scope.launch {
+            try {
+                val resp = ApiClient.bluehiveApi.foreground()
+                Log.d(TAG, "↪ foreground ping ok=${resp.isSuccessful} code=${resp.code()}")
+            } catch (e: Exception) {
+                Log.w(TAG, "foreground ping failed: ${e.message}")
+            }
+        }
     }
 }

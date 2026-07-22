@@ -211,6 +211,13 @@ object ApiClient {
             // change with zero client update. Sent ONLY here — never on platform or
             // TMDB clients. versionCode is the integer the update manifest compares.
             req.header("X-BlueHive-Version", BuildConfig.VERSION_CODE.toString())
+            // Session-lifecycle endpoints (check-slot / end-session / background /
+            // foreground) are keyed by device fingerprint server-side. Send it on
+            // every bluehive-api call so they match the SSE connect's fingerprint.
+            // Guarded: deviceFingerprint throws if SessionManager isn't initialised.
+            runCatching { session.deviceFingerprint }.getOrNull()?.let {
+                req.header("X-Device-Fingerprint", it)
+            }
             chain.proceed(req.build())
         }
         .addInterceptor { chain ->
