@@ -659,7 +659,11 @@ fun HistoryRow(item: WatchHistoryResponse, modifier: Modifier = Modifier, isFirs
                                 .allowHardware(true)
                                 .memoryCachePolicy(CachePolicy.ENABLED)
                                 .diskCachePolicy(CachePolicy.ENABLED)
-                                .memoryCacheKey("history_thumb_${item.media_tmdb_id}_${item.media_type}")
+                                // Key per EPISODE, not per show. Keying by
+                                // media_tmdb_id alone made every episode of a
+                                // series collide on one cache entry, so all rows
+                                // showed whichever episode's still loaded first.
+                                .memoryCacheKey("history_thumb_${item.media_tmdb_id}_${item.media_type}_${item.season_number}_${item.episode_number}")
                                 .crossfade(150)
                                 .build(),
                             contentDescription = item.media_title,

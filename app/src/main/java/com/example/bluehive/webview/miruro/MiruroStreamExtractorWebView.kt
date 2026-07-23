@@ -120,6 +120,12 @@ class MiruroStreamExtractorWebView private constructor() {
         private const val MAX_DUB_CONFIRM_READS = 4        // tolerate a slow-to-update label
         private const val MAX_DUB_RECLICKS      = 2        // re-select dub if it still reads sub
         const val REASON_NO_DUB = "NO_DUB"                 // sentinel passed to onExtractionFailed
+        // The Language label flips to "Dub" a beat BEFORE the dub STREAM loads, so
+        // the manifest buffered at confirm-time is still SUB. After confirming dub
+        // we discard that buffer and wait for the FRESH dub manifest the source
+        // fetches on play; if none arrives in this window we fall back to the
+        // buffered one (better a sub stream than a hang).
+        private const val DUB_FRESH_MAX_WAIT_MS = 6_000L
 
         // ── Provider/server choreography (ENUMERATE + named-server EXTRACT) ─
         private const val PROVIDER_RETRY_INTERVAL       = 800L  // retry cadence while the Provider menu renders
@@ -285,16 +291,22 @@ class MiruroStreamExtractorWebView private constructor() {
     private var clickRunnable: Runnable? = null
     private var clickAttempts = 0
     private var dubReclicks = 0               // times we re-selected dub after it read sub
-    // Some sources fetch the dub manifest the instant the language switch lands —
-    // before any play click — and never re-fetch it. Rather than drop it, hold the
-    // latest one and flush it through the moment dub is confirmed.
+    // Manifest(s) the player fetched BEFORE dub was confirmed. These are the SUB
+    // stream (the label flips to "Dub" before the dub stream loads), so we never
+    // deliver them as dub — they're only a last-resort fallback if the fresh dub
+    // manifest never arrives. See openDubGateAndProceed / armDubFreshFallback.
     private var pendingDubUrl: String? = null
     private var pendingDubHeaders: Map<String, String>? = null
+    private var dubFallbackUrl: String? = null           // stale pre-confirm (sub) manifest, fallback only
+    private var dubFallbackHeaders: Map<String, String>? = null
+    private var dubFallbackRunnable: Runnable? = null     // fires DUB_FRESH_MAX_WAIT_MS after play if no fresh dub
     private var requestCount = 0
     private var startTimeMs = 0L
 
     @Volatile private var dub = false         // true → select the Dub track before playing
     @Volatile private var dubReady = false    // true once dub is selected; gates manifest capture
+    @Volatile private var playPressed = false // dub: only deliver a manifest fetched AFTER we press play
+    @Volatile private var serverSelected = false // true once a named server has been picked (post-switch)
     @Volatile private var serverReady = true  // false while a chosen server is pending; gates capture
     @Volatile private var episodeReady = true // false while a TV episode is pending; gates capture
 
@@ -341,6 +353,10 @@ class MiruroStreamExtractorWebView private constructor() {
         // first gets grabbed before the switch (the bug). No server requested →
         // gate starts open, so default / sub / dub behaviour is unchanged.
         this.serverReady = serverName.isNullOrBlank()
+        this.serverSelected = false
+        this.playPressed = false
+        this.dubFallbackUrl = null
+        this.dubFallbackHeaders = null
         // TV anime URLs carry ?ep=N — the AniList episode the backend already
         // remapped from the TMDB season/episode. Movie URLs have no ?ep, so this
         // is null and the episode gate stays open → movie behaviour is unchanged.
@@ -707,9 +723,10 @@ class MiruroStreamExtractorWebView private constructor() {
             when (result) {
                 "dub" -> {
                     Log.d(sCRAPE, "🎌 dub confirmed active — opening gate")
-                    // Dub is verified, so open the capture gate now and flush any
-                    // manifest the player grabbed during the switch.
-                    openDubGateAndProceed(view, deliverBuffered = true)
+                    // Dub label is verified. Open the gate and go to play — the fresh
+                    // dub manifest fetched on play is what we capture (the pre-confirm
+                    // buffer is sub and gets discarded inside openDubGateAndProceed).
+                    openDubGateAndProceed(view)
                 }
                 "sub" -> {
                     if (dubReclicks < MAX_DUB_RECLICKS) {
@@ -736,10 +753,10 @@ class MiruroStreamExtractorWebView private constructor() {
                         )
                     } else {
                         // Can't read the label — proceed best-effort. Open the gate so
-                        // a play-time manifest is still caught, but DON'T flush the
-                        // buffer: unconfirmed, it might be the sub stream.
+                        // a play-time manifest is still caught; the pre-confirm buffer
+                        // is kept only as a fallback, never delivered as dub outright.
                         Log.w(sCRAPE, "🎌 dub state inconclusive — proceeding anyway")
-                        openDubGateAndProceed(view, deliverBuffered = false)
+                        openDubGateAndProceed(view)
                     }
                 }
             }
@@ -747,33 +764,27 @@ class MiruroStreamExtractorWebView private constructor() {
     }
 
 
-    // ── Open the dub capture gate, then deliver the manifest the player already
-    //    fetched during the language switch, or proceed to play ───────────────
-    // deliverBuffered = true when dub is confirmed: if the source fetched its dub
-    // manifest during the switch (and won't again on the play click), that buffered
-    // manifest is what we want, so hand it over now. Only for the default server —
-    // with a named server still pending, the buffered one is the default-server
-    // stream and must be ignored in favour of the upcoming server switch.
-    private fun openDubGateAndProceed(view: WebView?, deliverBuffered: Boolean) {
+    // ── Open the dub capture gate, then proceed to play ─────────────────────
+    // Dub is confirmed at the UI-LABEL level here, but the dub STREAM hasn't loaded
+    // yet — the manifest buffered up to this point was fetched while still on Sub
+    // and is the WRONG track (this was the "dub plays sub" bug). So we DON'T deliver
+    // it: we stash it only as a fallback, clear the buffer, and proceed to play so
+    // the source fetches its real dub manifest, which the open gate then captures.
+    // armDubFreshFallback() (armed once we actually press play) delivers the stashed
+    // sub manifest only if no fresh one shows up in time.
+    private fun openDubGateAndProceed(view: WebView?) {
         if (view == null || !active || delivered.get()) return
         dubReady = true
 
-        val bufferedUrl = pendingDubUrl
-        if (deliverBuffered && bufferedUrl != null && serverName.isNullOrBlank()) {
-            Log.d(sCRAPE, "🎌 dub gate open — delivering manifest fetched during the switch")
-            deliver(
-                bufferedUrl,
-                pendingDubHeaders ?: mapOf(
-                    "Referer" to MIRURO_REFERER,
-                    "Origin" to MIRURO_ORIGIN,
-                    "User-Agent" to CHROME_USER_AGENT
-                ),
-                "buffered-dub"
-            )
-            return
+        if (pendingDubUrl != null) {
+            dubFallbackUrl = pendingDubUrl
+            dubFallbackHeaders = pendingDubHeaders
+            pendingDubUrl = null
+            pendingDubHeaders = null
+            Log.d(sCRAPE, "🎌 dub gate open — discarding pre-confirm (sub) buffer, capturing FRESH dub manifest")
+        } else {
+            Log.d(sCRAPE, "🎌 dub gate open — capturing fresh dub manifest")
         }
-
-        Log.d(sCRAPE, "🎌 dub gate open — proceeding to play")
         afterAudioReady(view)
     }
 
@@ -784,8 +795,10 @@ class MiruroStreamExtractorWebView private constructor() {
             Mode.ENUMERATE -> openProviderDropdown(view, 1)
             Mode.EXTRACT -> {
                 val sn = serverName
-                if (sn.isNullOrBlank()) {
-                    startPlaySequence(view)            // default server — unchanged path
+                if (sn.isNullOrBlank() || serverSelected) {
+                    // Default server, or the named server is already picked and we've
+                    // just re-confirmed dub survived the switch — go straight to play.
+                    startPlaySequence(view)
                 } else {
                     openProviderForSelect(view, sn, 1) // named server, then play
                 }
@@ -930,10 +943,20 @@ class MiruroStreamExtractorWebView private constructor() {
                     // it loads on the switch itself or when we press play — is the
                     // one we actually want.
                     serverReady = true
+                    serverSelected = true
                     listener?.onStatusUpdate("Server selected — starting player…")
                     handler.postDelayed({
                         if (!active || delivered.get()) return@postDelayed
-                        startPlaySequence(view)
+                        if (dub) {
+                            // A server switch reloads the player and can silently revert
+                            // the audio to Sub. Re-verify dub (re-selecting if it dropped)
+                            // BEFORE play — serverSelected is set, so on confirm the flow
+                            // routes straight to startPlaySequence, not back to server select.
+                            dubReclicks = 0
+                            confirmDubActive(view, 1)
+                        } else {
+                            startPlaySequence(view)
+                        }
                     }, SERVER_SWITCH_DELAY)
                 }
                 "not-found" -> {
@@ -1027,6 +1050,11 @@ class MiruroStreamExtractorWebView private constructor() {
 
     // ── Click the Vidstack play button, retrying until the m3u8 lands ───────
     private fun startPlaySequence(view: WebView?) {
+        // Dub: the gate is open and the pre-confirm (sub) buffer is stashed as a
+        // fallback. Pressing play makes the source fetch its real dub manifest, which
+        // the gate captures. Arm the fallback so we still deliver *something* if that
+        // fresh manifest never arrives.
+        if (dub && dubReady) armDubFreshFallback()
         clickRunnable = object : Runnable {
             override fun run() {
                 if (!active || delivered.get()) return
@@ -1034,11 +1062,8 @@ class MiruroStreamExtractorWebView private constructor() {
                     Log.w(sCRAPE, "⚠️ exhausted $MAX_CLICK_ATTEMPTS play-button attempts")
                     return
                 }
-                // The dub capture gate is opened in openDubGateAndProceed() the moment
-                // dub is confirmed — not here — so a manifest this source fetches during
-                // the switch (before the first play click) is buffered and flushed
-                // rather than dropped.
                 clickAttempts++
+                playPressed = true   // manifests fetched from here on are the real (dub) stream
                 clickPlayButton(view, clickAttempts)
                 handler.postDelayed(this, CLICK_INTERVAL)
             }
@@ -1046,6 +1071,35 @@ class MiruroStreamExtractorWebView private constructor() {
         Log.d(sCRAPE, "▶️ scheduling first play-button click in ${FIRST_CLICK_DELAY}ms")
         listener?.onStatusUpdate("Pressing play…")
         handler.postDelayed(clickRunnable!!, FIRST_CLICK_DELAY)
+    }
+
+    // ── Dub fallback: if the fresh dub manifest never arrives after play, deliver
+    //    the stashed pre-confirm manifest so playback isn't left hanging. It may be
+    //    sub, but that beats a spinner. A fresh manifest latches `delivered` first
+    //    and makes this a no-op. ────────────────────────────────────────────────
+    private fun armDubFreshFallback() {
+        dubFallbackRunnable?.let { handler.removeCallbacks(it) }
+        val r = Runnable {
+            if (!active || delivered.get()) return@Runnable
+            val fb = dubFallbackUrl
+            if (fb != null) {
+                Log.w(sCRAPE, "🎌 no fresh dub manifest in ${DUB_FRESH_MAX_WAIT_MS}ms — " +
+                        "falling back to buffered manifest (may be sub)")
+                deliver(
+                    fb,
+                    dubFallbackHeaders ?: mapOf(
+                        "Referer" to MIRURO_REFERER,
+                        "Origin" to MIRURO_ORIGIN,
+                        "User-Agent" to CHROME_USER_AGENT
+                    ),
+                    "buffered-dub-fallback"
+                )
+            } else {
+                Log.w(sCRAPE, "🎌 no fresh dub manifest and no fallback buffered — timeout will handle it")
+            }
+        }
+        dubFallbackRunnable = r
+        handler.postDelayed(r, DUB_FRESH_MAX_WAIT_MS)
     }
 
     private fun clickPlayButton(view: WebView?, attempt: Int) {
@@ -1154,15 +1208,14 @@ class MiruroStreamExtractorWebView private constructor() {
             Log.d(sCRAPE, "⏭️ ignoring pre-episode m3u8 ($via): $url")
             return
         }
-        // In dub mode, a manifest seen before the gate opens isn't necessarily
-        // junk: some sources fetch the dub manifest the instant you pick dub —
-        // during the switch, before any play click — and never re-fetch it. So
-        // hold the latest one instead of dropping it; openDubGateAndProceed()
-        // flushes it through the moment dub is confirmed.
+        // A manifest seen before dub is confirmed is the SUB stream (the Language
+        // label flips to "Dub" a beat before the dub stream actually loads). Keep the
+        // latest only as a fallback — openDubGateAndProceed() moves it to
+        // dubFallbackUrl and waits for the real dub manifest rather than delivering it.
         if (dub && !dubReady) {
             pendingDubUrl = url
             pendingDubHeaders = headers
-            Log.d(sCRAPE, "🕓 buffering pre-gate dub m3u8 ($via): $url")
+            Log.d(sCRAPE, "🕓 buffering pre-confirm (sub) m3u8 ($via): $url")
             return
         }
         // When a specific server was requested, drop everything the player loads
@@ -1172,8 +1225,19 @@ class MiruroStreamExtractorWebView private constructor() {
             Log.d(sCRAPE, "⏭️ ignoring pre-server (default) m3u8 ($via): $url")
             return
         }
+        // Dub, gate open, but play not pressed yet: a manifest here is either a stale
+        // sub fetch still in flight or an eager pre-play dub. Don't commit to it — hold
+        // the latest as the fallback and wait. The manifest fetched AFTER we press play
+        // is the real dub stream (armDubFreshFallback delivers this held one on timeout).
+        if (dub && !playPressed) {
+            dubFallbackUrl = url
+            dubFallbackHeaders = headers
+            Log.d(sCRAPE, "🕓 holding pre-play dub candidate ($via): $url")
+            return
+        }
         // Exactly-once, even though shouldInterceptRequest runs off the main thread.
         if (!delivered.compareAndSet(false, true)) return
+        dubFallbackRunnable?.let { handler.removeCallbacks(it) }  // fresh manifest won — cancel fallback
         val elapsed = System.currentTimeMillis() - startTimeMs
         Log.d(sCRAPE, "════════════ M3U8 CAPTURED ($via) ════════════")
         Log.d(sCRAPE, "  url     : $url")
@@ -1308,6 +1372,7 @@ class MiruroStreamExtractorWebView private constructor() {
         active = false
         timeoutRunnable?.let { handler.removeCallbacks(it) }
         clickRunnable?.let { handler.removeCallbacks(it) }
+        dubFallbackRunnable?.let { handler.removeCallbacks(it) }
 
         handler.post {
             try {

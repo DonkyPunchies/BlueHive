@@ -791,6 +791,10 @@ fun TVShowsDetailsScreenContent(
     var isCheckingServers by remember { mutableStateOf(false) }
     var showServerPicker  by remember { mutableStateOf(false) }
     var showServerError   by remember { mutableStateOf(false) }
+    // Shown when an anime's AniList mapping doesn't exist yet (resolveAnime 404 →
+    // miruroUrl null). Brand-new titles aren't in anime_id_map until AniBridge
+    // ingests them, so instead of leaving DuB/SuB inert we tell the user why.
+    var showNotYetAvailable by remember { mutableStateOf(false) }
     var pendingUrl         by remember { mutableStateOf<String?>(null) }
     var pendingDub         by remember { mutableStateOf(false) }
     var pendingSeason      by remember { mutableIntStateOf(1) }
@@ -1014,6 +1018,9 @@ fun TVShowsDetailsScreenContent(
     }
     LaunchedEffect(showServerError) {
         if (showServerError) { delay(2500); showServerError = false }
+    }
+    LaunchedEffect(showNotYetAvailable) {
+        if (showNotYetAvailable) { delay(4000); showNotYetAvailable = false }
     }
 
     // Check favorite status on load
@@ -2149,6 +2156,7 @@ fun TVShowsDetailsScreenContent(
                                 pendingEpisodeName = epName
                                 showDefaultPrompt  = true
                             },
+                            onUnavailable = { showNotYetAvailable = true },
                             onBack = {
                                 selectedEpisodeOverlayIndex = -1
                                 val targetIndex = lastFocusedEpisodeIndex
@@ -2324,6 +2332,22 @@ fun TVShowsDetailsScreenContent(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .padding(bottom = 70.dp)
+                    .background(Color(0xE6000000), RoundedCornerShape(10.dp))
+                    .padding(horizontal = 26.dp, vertical = 12.dp)
+            )
+        }
+
+        if (showNotYetAvailable) {
+            Text(
+                "This show isn't in our search engines yet — it's brand new, so check back in a week or so",
+                color = Color.White,
+                fontSize = 18.sp,
+                fontFamily = dongleRegular,
+                textAlign = TextAlign.Center,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 70.dp)
+                    .widthIn(max = 720.dp)
                     .background(Color(0xE6000000), RoundedCornerShape(10.dp))
                     .padding(horizontal = 26.dp, vertical = 12.dp)
             )
@@ -2999,10 +3023,11 @@ fun SeasonButton(
 @Composable
 private fun AnimeEpisodeProviderButtons(
     passionFont: FontFamily,
-    miruroUrl: String?,                                            // null if AniList resolve failed → DuB/SuB inert
+    miruroUrl: String?,                                            // null if AniList resolve failed
     focusRequesters: List<FocusRequester>,                         // [0]=DuB, [1]=SuB
     onDub: (String) -> Unit,
     onSub: (String) -> Unit,
+    onUnavailable: () -> Unit,                                     // fired when miruroUrl is null (no mapping yet)
     onBack: () -> Unit,
 ) {
     // Auto-focus DuB when the overlay opens (matches EpisodeProviderInlineButtons).
@@ -3040,7 +3065,7 @@ private fun AnimeEpisodeProviderButtons(
                         else               -> false
                     }
                 },
-                onClick = { miruroUrl?.let(onDub) }
+                onClick = { if (miruroUrl != null) onDub(miruroUrl) else onUnavailable() }
             )
             AnimeOverlayButton(
                 text = "Watch in SuB",
@@ -3059,7 +3084,7 @@ private fun AnimeEpisodeProviderButtons(
                         else               -> false
                     }
                 },
-                onClick = { miruroUrl?.let(onSub) }
+                onClick = { if (miruroUrl != null) onSub(miruroUrl) else onUnavailable() }
             )
         }
     }

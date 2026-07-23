@@ -192,7 +192,11 @@ private fun ContinueWatchingItem(
                             .allowHardware(true)
                             .memoryCachePolicy(CachePolicy.ENABLED)
                             .diskCachePolicy(CachePolicy.ENABLED)
-                            .memoryCacheKey("cw_thumb_${item.media_tmdb_id}_${item.media_type}")
+                            // Key per EPISODE, not per show — keying by
+                            // media_tmdb_id alone collided every episode of a
+                            // series onto one cache entry (all showed the first
+                            // still that loaded).
+                            .memoryCacheKey("cw_thumb_${item.media_tmdb_id}_${item.media_type}_${item.season_number}_${item.episode_number}")
                             .crossfade(150)
                             .build(),
                         contentDescription = item.media_title,
