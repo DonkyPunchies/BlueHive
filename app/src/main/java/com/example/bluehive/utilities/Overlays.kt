@@ -21,6 +21,10 @@ package com.example.bluehive.utilities
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -344,6 +348,115 @@ fun ConfirmationOverlay(
                     glowConfig      = overlayButtonGlowConfig(),
                     animationConfig = overlayButtonAnimationConfig(),
                 )
+            }
+        }
+    }
+}
+
+
+/**
+ * VideoQualityOverlay
+ *
+ * Centered video-quality picker over the standard dialog scrim + card, matching
+ * ConfirmationOverlay's look (same background, border, shape, padding, font).
+ * Each option is a focusable row with a radio marker; the currently-selected one
+ * auto-focuses. Selecting a row fires onSelect(index). Dismissal (BACK) is handled
+ * by the caller. Index 0 is "Auto".
+ */
+@Composable
+fun VideoQualityOverlay(
+    options:       List<String>,
+    selectedIndex: Int,
+    onSelect:      (Int) -> Unit,
+) {
+    // ── Scrim ───────────────────────────────────────────────────────────────────
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(overlayScrimColor())
+    )
+
+    // ── Centered dialog card ────────────────────────────────────────────────────
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier         = Modifier.fillMaxSize(),
+    ) {
+        Column(
+            modifier = Modifier
+                .width(OVERLAY_CARD_WIDTH)
+                .clip(overlayCardShape())
+                .background(overlayCardBackgroundColor(), overlayCardShape())
+                .border(1.dp, overlayCardBorderColor(), overlayCardShape())
+                .padding(
+                    horizontal = OVERLAY_CARD_PADDING_HORIZONTAL,
+                    vertical   = OVERLAY_CARD_PADDING_VERTICAL,
+                ),
+        ) {
+            Text(
+                text       = "Video Quality",
+                color      = Color.White,
+                fontFamily = AppTypography.interBold,
+                fontWeight = FontWeight.Bold,
+                fontSize   = 16.sp,
+                modifier   = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 14.dp),
+            )
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 230.dp)
+                    .verticalScroll(rememberScrollState()),
+            ) {
+                options.forEachIndexed { i, label ->
+                    var focused by remember { mutableStateOf(false) }
+                    val fr = remember { FocusRequester() }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 3.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(if (focused) Color(0xFF2644A6) else Color.Transparent)
+                            .onFocusChanged { focused = it.isFocused }
+                            .focusRequester(fr)
+                            .clickable { onSelect(i) }   // clickable is already focusable — a second .focusable() ate the first press
+                            .padding(horizontal = 14.dp, vertical = 11.dp),
+                    ) {
+                        Text(
+                            text       = label,
+                            color      = if (focused) Color.White else Color(0xFFB8B8B8),
+                            fontFamily = AppTypography.interBold,
+                            fontSize   = 14.sp,
+                            modifier   = Modifier.weight(1f),
+                        )
+                        // Radio marker — filled when this row is the active quality.
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .size(16.dp)
+                                .clip(CircleShape)
+                                .border(
+                                    width = 1.5.dp,
+                                    color = if (i == selectedIndex) Color(0xFF6AA0FF) else Color(0xFF777777),
+                                    shape = CircleShape,
+                                ),
+                        ) {
+                            if (i == selectedIndex) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(8.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xFF6AA0FF)),
+                                )
+                            }
+                        }
+                    }
+                    if (i == selectedIndex.coerceIn(0, (options.size - 1).coerceAtLeast(0))) {
+                        LaunchedEffect(Unit) { awaitFrame(); fr.requestFocus() }
+                    }
+                }
             }
         }
     }

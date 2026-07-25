@@ -177,6 +177,11 @@ class ProfileScreenActivity : ComponentActivity() {
         // start the personalized Netflix prefetch immediately — without waiting
         // on the profiles-list API to resolve — by reading this local value.
         SessionManager.get().setLastProfileId(profileId)
+        // Offload the Continue-Watching list + its episode thumbnails to NOW — they warm
+        // during the "Getting X ready" loading window (in an app-scoped job that outlives
+        // this finishing activity), so the home screen's CW section renders from cache
+        // instead of fetching + loading images on arrival.
+        (applicationContext as? BlueHiveApplication)?.prefetchContinueWatching(profileId)
         startActivity(
             Intent(this, HomeScreenCompose::class.java).apply {
                 putExtra("PROFILE_ID",        profileId)

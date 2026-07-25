@@ -17,9 +17,12 @@ import coil.ImageLoaderFactory
 import coil.decode.SvgDecoder
 import coil.disk.DiskCache
 import coil.memory.MemoryCache
+import coil.request.CachePolicy
+import coil.request.ImageRequest
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
+import com.example.bluehive.api.ApiClient
 import com.example.bluehive.api.LockoutBus
 import com.example.bluehive.api.SessionExpiredBus
 import com.example.bluehive.models.MediaItem
@@ -27,8 +30,11 @@ import com.example.bluehive.webview.BeeLogo
 import com.example.bluehive.webview.GeckoWebViewManager
 import com.example.bluehive.auth.DeviceEventStream
 import com.example.bluehive.auth.SessionManager
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 
 /**
@@ -221,6 +227,66 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
 
     private var homePrefetch: HomeScreenPrefetch? = null
 
+    // ── Continue-Watching prefetch (fired on profile-select) ────────────────────
+    // Dedicated, profile-accurate CW prefetch: the moment a profile is picked
+    // (ProfileScreenActivity.goHome), we fetch its Continue-Watching list AND warm
+    // every episode thumbnail into Coil — so the home screen's CW section renders
+    // from cache instead of fetching + loading images on arrival. Its own app-scoped
+    // job so it outlives the finishing ProfileScreenActivity.
+    private data class CwPrefetch(
+        val capturedAt: Long,
+        val profileId: Int,
+        var items: List<com.example.bluehive.api.WatchHistoryResponse>?,
+    )
+    private var cwPrefetch: CwPrefetch? = null
+    private val cwPrefetchScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    fun storeContinueWatchingPrefetch(profileId: Int, items: List<com.example.bluehive.api.WatchHistoryResponse>) {
+        cwPrefetch = CwPrefetch(System.currentTimeMillis(), profileId, items)
+    }
+
+    /**
+     * Fetch [profileId]'s Continue-Watching list and warm every episode thumbnail into
+     * Coil, up front — called from the profile picker on selection, so all of it runs
+     * during the "Getting X ready" loading window rather than on the home screen. The
+     * thumbnails are warmed with the EXACT request the CW rows use (same data, size and
+     * memoryCacheKey), so each row render is a cache hit. Best-effort: any failure just
+     * leaves the home screen to fetch/load as before.
+     */
+    fun prefetchContinueWatching(profileId: Int) {
+        if (profileId == -1) return
+        cwPrefetchScope.launch {
+            try {
+                val cw = runCatching {
+                    ApiClient.bluehiveApi.getWatchHistory(profileId = profileId, limit = 15, offset = 0)
+                }.getOrNull() ?: return@launch
+                // Store the list first so the CW section consumes it instead of fetching live.
+                storeContinueWatchingPrefetch(profileId, cw)
+                var warmed = 0
+                cw.forEach { item ->
+                    val url = item.image_url
+                    if (!url.isNullOrBlank()) {
+                        coilImageLoader.enqueue(
+                            ImageRequest.Builder(this@BlueHiveApplication)
+                                .data(url)
+                                .size(166, 94)
+                                .memoryCacheKey("cw_thumb_${item.media_tmdb_id}_${item.media_type}_${item.season_number}_${item.episode_number}")
+                                .memoryCachePolicy(CachePolicy.ENABLED)
+                                .diskCachePolicy(CachePolicy.ENABLED)
+                                .allowRgb565(true)
+                                .allowHardware(true)
+                                .build()
+                        )
+                        warmed++
+                    }
+                }
+                Log.d(TAG, "🍿 CW prefetch (profile=$profileId): ${cw.size} items, $warmed thumbs warming")
+            } catch (e: Exception) {
+                Log.w(TAG, "CW prefetch failed (profile=$profileId): ${e.message}")
+            }
+        }
+    }
+
     // Item 2 — 90-second freshness window. Past this, prefetched data is
     // considered stale and discarded.
     private val HOME_PREFETCH_TTL_MS = 90_000L
@@ -257,6 +323,18 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
 
     /** Continue watching is profile-specific — must match the active profile. One-shot. */
     fun consumeContinueWatchingPrefetch(profileId: Int): List<com.example.bluehive.api.WatchHistoryResponse>? {
+        // Profile-click prefetch wins — it's for the EXACT profile chosen (the splash
+        // prefetch only ever guessed the most-recently-used one).
+        cwPrefetch?.let { c ->
+            if (c.profileId == profileId &&
+                System.currentTimeMillis() - c.capturedAt <= HOME_PREFETCH_TTL_MS
+            ) {
+                val v = c.items
+                c.items = null
+                return v
+            }
+        }
+        // Fallback: the splash home prefetch.
         val p = freshHomePrefetchOrNull() ?: return null
         if (p.profileId != profileId) return null   // wrong profile → fall back to live fetch
         val v = p.continueWatching
@@ -612,7 +690,23 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
     // a cold start, and getNewSession() fails soft if it ever were.
     private val GECKO_INIT_DELAY_MS = 8_000L
 
+    // Only PRELOAD Gecko in the main process on devices with RAM headroom. Below this,
+    // a ~200 MB runtime resident in the backgrounded main process makes it a prime
+    // low-memory-killer target while the :extractor process (its own Gecko) runs — the
+    // OOM we hit on 2 GB TV boxes. Constrained devices init Gecko on demand instead
+    // (GeckoWebViewManager.getNewSession), which the anime path never triggers.
+    private val GECKO_PRELOAD_MIN_TOTAL_MEM = 2_500_000_000L   // ~2.3 GiB
+
     private fun initializeGeckoOnMainThread() {
+        // Skip the preload on RAM-constrained devices — Gecko then inits lazily on first
+        // MainWebViewer use, keeping the main process lean during anime playback.
+        val am = getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+        val memInfo = ActivityManager.MemoryInfo().also { am?.getMemoryInfo(it) }
+        if (am == null || am.isLowRamDevice || memInfo.totalMem < GECKO_PRELOAD_MIN_TOTAL_MEM) {
+            Log.d(TAG, "Skipping Gecko preload (totalMem=${memInfo.totalMem / (1024 * 1024)}MB, " +
+                    "lowRam=${am?.isLowRamDevice}) — runtime will init on demand")
+            return
+        }
         Handler(Looper.getMainLooper()).postDelayed({
             // GeckoView ships only armeabi-v7a native libs in this build. On a device
             // whose ABI can't load them (e.g. the x86_64 Baseline Profile generation

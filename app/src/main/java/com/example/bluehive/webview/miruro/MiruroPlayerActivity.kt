@@ -5,15 +5,44 @@ import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.KeyEvent
+import android.view.LayoutInflater
+import android.view.View
+import com.example.bluehive.R
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicText
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.common.Tracks
+import com.example.bluehive.utilities.VideoQualityOverlay
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.hls.HlsMediaSource
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.ui.PlayerView
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
@@ -39,6 +68,12 @@ class MiruroPlayerActivity : ComponentActivity() {
     // visibility change between the two (e.g. controls auto-showing on pause) can't
     // split a single press across both paths.
     private var centerWentToController = false
+
+    // ── Video-quality picker ────────────────────────────────────────────────────
+    private val showQualityOverlay = mutableStateOf(false)   // toggled by the control-bar button
+    private var selectedQualityIndex = 0                     // 0 = Auto
+    private var qualityVideoGroup: Tracks.Group? = null
+    private var qualityTrackIndices: List<Int> = emptyList() // parallel to labels[1..], sorted hi→lo
 
     // Fire TV remotes have a dedicated ▶❚❚ transport key; the onn box remote
     // does not. We only hijack the media play/pause keys on Fire TV so onn
@@ -90,7 +125,25 @@ class MiruroPlayerActivity : ComponentActivity() {
                 .createMediaSource(MediaItem.fromUri(playUrl))
         }
 
-        player = ExoPlayer.Builder(this).build().apply {
+        // Always grab the HIGHEST quality Miruro lists. HLS master playlists (e.g. the
+        // wixmp 1080p/720p/480p one) default to ADAPTIVE selection — ExoPlayer starts
+        // lower and ramps with bandwidth. Pin it to the top bitrate the device can
+        // decode instead. Single-quality media playlists have nothing to choose, so
+        // they're unaffected. This is playback-side only — zero impact on extraction.
+        val trackSelector = DefaultTrackSelector(this).apply {
+            setParameters(buildUponParameters().setForceHighestSupportedBitrate(true))
+        }
+        // Generous buffers so 1080p (~5.5 Mbps) relayed through the HLS proxy rides out
+        // proxy/CDN hiccups without stalling. Mirrors VidApiPlayerActivity:
+        // min 30s, max 120s, start after 2.5s, resume 10s after a rebuffer.
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(30_000, 120_000, 2_500, 10_000)
+            .setPrioritizeTimeOverSizeThresholds(true)
+            .build()
+        player = ExoPlayer.Builder(this)
+            .setTrackSelector(trackSelector)
+            .setLoadControl(loadControl)
+            .build().apply {
             addListener(object : Player.Listener {
                 override fun onPlayerError(error: PlaybackException) {
                     Log.e(sCRAPE, "❌ ExoPlayer failed for url=$url", error)
@@ -116,17 +169,88 @@ class MiruroPlayerActivity : ComponentActivity() {
 
 
         setContent {
-            AndroidView(
-                modifier = Modifier.fillMaxSize(),
-                factory = { ctx ->
-                    PlayerView(ctx).apply {
-                        playerView = this
-                        this.player = this@MiruroPlayerActivity.player
-                        useController = true
+            Box(modifier = Modifier.fillMaxSize()) {
+                AndroidView(
+                    modifier = Modifier.fillMaxSize(),
+                    factory = { ctx ->
+                        (LayoutInflater.from(ctx)
+                            .inflate(R.layout.miruro_player_view, null) as PlayerView).apply {
+                            playerView = this
+                            this.player = this@MiruroPlayerActivity.player
+                            // Quality button in the custom control bar opens the picker.
+                            findViewById<View?>(R.id.quality_button)?.setOnClickListener {
+                                showQualityOverlay.value = true
+                            }
+                        }
                     }
+                )
+                if (showQualityOverlay.value) {
+                    val labels = remember(showQualityOverlay.value) { buildQualityLabels() }
+                    VideoQualityOverlay(
+                        options       = labels,
+                        selectedIndex = selectedQualityIndex,
+                        onSelect      = { idx ->
+                            applyQuality(idx)
+                            showQualityOverlay.value = false
+                        },
+                    )
+                }
+            }
+        }
+    }
+
+    // Enumerate the stream's video qualities → ["Auto", "1080p", "720p", …], sorted
+    // high→low, caching the group + track indices so applyQuality() can map a pick
+    // back to a track. Called each time the picker opens (tracks can change).
+    private fun buildQualityLabels(): List<String> {
+        qualityVideoGroup = null
+        qualityTrackIndices = emptyList()
+        val p = player ?: return listOf("Auto")
+        val group = p.currentTracks.groups.firstOrNull {
+            it.type == C.TRACK_TYPE_VIDEO && it.length > 0
+        } ?: return listOf("Auto")
+        // (trackIndex, height, bitrate) sorted high→low, one row per resolution
+        // (duplicate heights collapse to the highest-bitrate variant).
+        val seenHeights = HashSet<Int>()
+        val tracks = (0 until group.length)
+            .map { idx ->
+                val f = group.getTrackFormat(idx)
+                Triple(idx, f.height, f.bitrate)
+            }
+            .sortedWith(compareByDescending<Triple<Int, Int, Int>> { it.second }.thenByDescending { it.third })
+            .filter { seenHeights.add(it.second) }
+        qualityVideoGroup = group
+        qualityTrackIndices = tracks.map { it.first }
+        val labels = mutableListOf("Auto")
+        tracks.forEach { t ->
+            labels.add(
+                when {
+                    t.second > 0 -> "${t.second}p"
+                    t.third > 0  -> "${t.third / 1000} kbps"
+                    else         -> "Track ${labels.size}"
                 }
             )
         }
+        return labels
+    }
+
+    // Apply the chosen quality. Index 0 (Auto) clears the override so the
+    // force-highest default resumes; otherwise pin the mapped track.
+    private fun applyQuality(index: Int) {
+        val p = player ?: return
+        selectedQualityIndex = index
+        val builder = p.trackSelectionParameters.buildUpon()
+        val group = qualityVideoGroup
+        if (index <= 0 || group == null) {
+            builder.clearOverridesOfType(C.TRACK_TYPE_VIDEO)
+        } else {
+            qualityTrackIndices.getOrNull(index - 1)?.let { trackIdx ->
+                builder.setOverrideForType(
+                    TrackSelectionOverride(group.mediaTrackGroup, listOf(trackIdx))
+                )
+            }
+        }
+        p.trackSelectionParameters = builder.build()
     }
 
     // Map the onn box CHANNEL UP / CHANNEL DOWN keys to skip forward / back.
@@ -145,6 +269,15 @@ class MiruroPlayerActivity : ComponentActivity() {
                 sCRAPE,
                 "🎛 key down: code=${event.keyCode} (${KeyEvent.keyCodeToString(event.keyCode)})"
             )
+        }
+        // Quality overlay open: BACK closes it; every other key goes to the Compose
+        // overlay so its focusable rows handle up / down / OK.
+        if (showQualityOverlay.value) {
+            if (event.keyCode == KeyEvent.KEYCODE_BACK) {
+                if (event.action == KeyEvent.ACTION_UP) showQualityOverlay.value = false
+                return true
+            }
+            return super.dispatchKeyEvent(event)
         }
         if (player != null && event.action == KeyEvent.ACTION_DOWN) {
             when (event.keyCode) {

@@ -28,6 +28,9 @@ import com.example.bluehive.BuildConfig
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -64,7 +67,15 @@ class MiruroStreamExtractorWebView private constructor() {
          * the read succeeded — null otherwise. Lets the caller cache the list so a
          * later "choose a server" needs no second webview pass.
          */
-        fun onM3u8Found(m3u8Url: String, headers: Map<String, String>, servers: List<ServerInfo>?)
+        // [dubFallback] true when DUB was requested but the real dub manifest never
+        // arrived, so this is the sub stream delivered as a last resort. Lets the
+        // caller fail over to another server before settling for the wrong track.
+        fun onM3u8Found(
+            m3u8Url: String,
+            headers: Map<String, String>,
+            servers: List<ServerInfo>?,
+            dubFallback: Boolean = false
+        )
 
         /** MAIN thread. Failure or timeout. */
         fun onExtractionFailed(reason: String)
@@ -104,13 +115,13 @@ class MiruroStreamExtractorWebView private constructor() {
 
         // ── Tunables ─────────────────────────────────────────────────────
         private const val TIMEOUT_MS = 60_000L
-        private const val FIRST_CLICK_DELAY = 2_500L   // let the player mount + sources resolve
+        private const val FIRST_CLICK_DELAY = 1_500L   // let the player mount + sources resolve
         private const val CLICK_INTERVAL = 1_500L      // re-click cadence
         private const val MAX_CLICK_ATTEMPTS = 12
 
         // ── Dub-selection choreography ───────────────────────────────────
-        private const val DROPDOWN_OPEN_DELAY     = 600L   // after opening the menu, before reading options
-        private const val DUB_SWITCH_DELAY        = 900L   // after picking dub, before pressing play
+        private const val DROPDOWN_OPEN_DELAY     = 350L   // after opening the menu, before reading options (read retries if empty)
+        private const val DUB_SWITCH_DELAY        = 500L   // after picking dub, before confirming (confirm re-reads if not ready)
         private const val DUB_RETRY_INTERVAL      = 800L   // retry cadence while the dropdown/menu renders
         private const val MAX_DUB_TRIGGER_ATTEMPTS = 8     // wait for the Language button to hydrate
         private const val MAX_DUB_OPTION_ATTEMPTS  = 4     // wait for the open menu to populate
@@ -125,18 +136,18 @@ class MiruroStreamExtractorWebView private constructor() {
         // we discard that buffer and wait for the FRESH dub manifest the source
         // fetches on play; if none arrives in this window we fall back to the
         // buffered one (better a sub stream than a hang).
-        private const val DUB_FRESH_MAX_WAIT_MS = 6_000L
+        private const val DUB_FRESH_MAX_WAIT_MS = 3_000L
 
         // ── Provider/server choreography (ENUMERATE + named-server EXTRACT) ─
         private const val PROVIDER_RETRY_INTERVAL       = 800L  // retry cadence while the Provider menu renders
         private const val MAX_PROVIDER_TRIGGER_ATTEMPTS = 8     // wait for the Provider button to hydrate
         private const val MAX_PROVIDER_OPTION_ATTEMPTS  = 4     // wait for the open menu to populate
-        private const val SERVER_SWITCH_DELAY           = 900L  // after picking a server, before pressing play
+        private const val SERVER_SWITCH_DELAY           = 500L  // after picking a server, before play/confirm (both retry if not ready)
 
         // ── Episode choreography (TV only — click the right EP before anything) ─
         private const val EPISODE_RETRY_INTERVAL = 800L   // retry cadence while the episode grid hydrates
         private const val MAX_EPISODE_ATTEMPTS   = 10     // episode grid can be slow to render
-        private const val EPISODE_SWITCH_DELAY   = 1_200L // after clicking the episode, let it load
+        private const val EPISODE_SWITCH_DELAY   = 600L   // after clicking the episode, let it load (dub/play polling absorbs residual)
 
         private const val MIRURO_ORIGIN = "https://www.miruro.tv"
         private const val MIRURO_REFERER = "https://www.miruro.tv/"
@@ -300,6 +311,11 @@ class MiruroStreamExtractorWebView private constructor() {
     private var dubFallbackUrl: String? = null           // stale pre-confirm (sub) manifest, fallback only
     private var dubFallbackHeaders: Map<String, String>? = null
     private var dubFallbackRunnable: Runnable? = null     // fires DUB_FRESH_MAX_WAIT_MS after play if no fresh dub
+    @Volatile private var deliveredAsDubFallback = false  // true → the delivered stream is the sub fallback, not real dub
+    // A post-confirm manifest (fetched AFTER dub was selected) is the real dub stream
+    // — a different URL than the pre-confirm sub. When one is held, the fallback is
+    // delivering DUB, not a sub last-resort, so we must NOT tell the app to fail over.
+    @Volatile private var dubFallbackIsPostConfirm = false
     private var requestCount = 0
     private var startTimeMs = 0L
 
@@ -322,6 +338,13 @@ class MiruroStreamExtractorWebView private constructor() {
     private var serversCaptured: List<ServerInfo>? = null
     private var pendingM3u8Url: String? = null
     private var pendingM3u8Headers: Map<String, String>? = null
+
+    // Every .m3u8 URL seen this pass (master + per-quality variants). Thread-safe
+    // because shouldInterceptRequest runs off the main thread. Used at delivery to
+    // upgrade a single-quality variant back to the master that owns it — Miruro
+    // serves each rung as its own …/pl.m3u8 and the real master (which lists every
+    // rung) is frequently fetched, and discarded, before dub confirms.
+    private val seenManifests = ConcurrentHashMap.newKeySet<String>()
 
     @Volatile
     private var active = false
@@ -357,6 +380,8 @@ class MiruroStreamExtractorWebView private constructor() {
         this.playPressed = false
         this.dubFallbackUrl = null
         this.dubFallbackHeaders = null
+        this.dubFallbackIsPostConfirm = false
+        this.deliveredAsDubFallback = false
         // TV anime URLs carry ?ep=N — the AniList episode the backend already
         // remapped from the TMDB season/episode. Movie URLs have no ?ep, so this
         // is null and the episode gate stays open → movie behaviour is unchanged.
@@ -687,9 +712,20 @@ class MiruroStreamExtractorWebView private constructor() {
                         handler.postDelayed({ clickDubOption(view, attempt + 1) }, DUB_RETRY_INTERVAL)
                     }
                 }
-                else -> {   // "no-dub": options present, none is Dub → genuinely sub-only
-                    Log.w(sCRAPE, "🎌 no Dub entry in menu — no dub available")
-                    failAndCleanup(REASON_NO_DUB)
+                else -> {   // "no-dub": menu is open with options, but no Dub entry YET.
+                    // Miruro can render Sub first and populate the Dub <option> a beat
+                    // later, so a half-rendered menu must be retried — NOT treated as
+                    // sub-only — exactly like "no-options". Only after the full retry
+                    // budget has elapsed do we conclude the title is genuinely sub-only.
+                    // Fixes the dub-detection race where a single early read on a slow-
+                    // rendering page mislabels a dubbed title as NO_DUB (e.g. the
+                    // Chainsaw Man: Reze Arc movie).
+                    if (attempt >= MAX_DUB_OPTION_ATTEMPTS) {
+                        Log.w(sCRAPE, "🎌 no Dub entry after $attempt reads — no dub available")
+                        failAndCleanup(REASON_NO_DUB)
+                    } else {
+                        handler.postDelayed({ clickDubOption(view, attempt + 1) }, DUB_RETRY_INTERVAL)
+                    }
                 }
             }
         }
@@ -779,6 +815,7 @@ class MiruroStreamExtractorWebView private constructor() {
         if (pendingDubUrl != null) {
             dubFallbackUrl = pendingDubUrl
             dubFallbackHeaders = pendingDubHeaders
+            dubFallbackIsPostConfirm = false   // this is the pre-confirm SUB — only a last resort
             pendingDubUrl = null
             pendingDubHeaders = null
             Log.d(sCRAPE, "🎌 dub gate open — discarding pre-confirm (sub) buffer, capturing FRESH dub manifest")
@@ -1202,6 +1239,9 @@ class MiruroStreamExtractorWebView private constructor() {
     private fun deliver(url: String, headers: Map<String, String>, via: String) {
         // ENUMERATE never presses play, so it must never deliver a manifest.
         if (mode != Mode.EXTRACT) return
+        // Record every manifest (even ones the gates below drop) so delivery can
+        // later resolve a variant back to its master.
+        seenManifests.add(url)
         // TV: drop anything captured before the correct episode is selected —
         // the show page can auto-preview episode 1.
         if (!episodeReady) {
@@ -1232,12 +1272,17 @@ class MiruroStreamExtractorWebView private constructor() {
         if (dub && !playPressed) {
             dubFallbackUrl = url
             dubFallbackHeaders = headers
+            dubFallbackIsPostConfirm = true   // fetched after dub was selected → the real dub stream
             Log.d(sCRAPE, "🕓 holding pre-play dub candidate ($via): $url")
             return
         }
         // Exactly-once, even though shouldInterceptRequest runs off the main thread.
         if (!delivered.compareAndSet(false, true)) return
         dubFallbackRunnable?.let { handler.removeCallbacks(it) }  // fresh manifest won — cancel fallback
+        // Requested dub but this is the sub last-resort (only the pre-confirm sub was
+        // ever seen — no real dub manifest arrived)? Flag it so the caller fails over.
+        // A held POST-confirm manifest IS the dub, so that's NOT a fallback.
+        deliveredAsDubFallback = dub && via == "buffered-dub-fallback" && !dubFallbackIsPostConfirm
         val elapsed = System.currentTimeMillis() - startTimeMs
         Log.d(sCRAPE, "════════════ M3U8 CAPTURED ($via) ════════════")
         Log.d(sCRAPE, "  url     : $url")
@@ -1270,15 +1315,77 @@ class MiruroStreamExtractorWebView private constructor() {
     }
 
     private fun finalizeM3u8(url: String, headers: Map<String, String>) {
-        try {
-            listener?.onStatusUpdate("Stream found — starting player…")
-            listener?.onM3u8Found(url, headers, serversCaptured)
-        } catch (e: Exception) {
-            // A throw here (e.g. startActivity failing) must NOT skip cleanup,
-            // or busy stays true and every future extraction is blocked.
-            Log.e(sCRAPE, "❌ onM3u8Found threw — cleaning up anyway", e)
+        // A media (single-quality) playlist locks ExoPlayer to that one rung. Miruro
+        // serves each quality as its own …/pl.m3u8, and the true MASTER (which lists
+        // every rung) is often fetched — and discarded by the dub gate — before we
+        // deliver. So before handing off, upgrade a variant back to the master that
+        // owns it: ExoPlayer then sees 360/720/1080 and force-highest lands on 1080p
+        // every time instead of whichever variant happened to arrive last. Network
+        // I/O → run off-main, then post the result back.
+        Thread {
+            val best = try { resolveMasterUrl(url, headers) } catch (_: Exception) { url }
+            handler.post {
+                if (best != url) Log.d(sCRAPE, "⬆️ upgraded variant → master playlist: $best")
+                try {
+                    listener?.onStatusUpdate("Stream found — starting player…")
+                    listener?.onM3u8Found(best, headers, serversCaptured, deliveredAsDubFallback)
+                } catch (e: Exception) {
+                    // A throw here (e.g. startActivity failing) must NOT skip cleanup,
+                    // or busy stays true and every future extraction is blocked.
+                    Log.e(sCRAPE, "❌ onM3u8Found threw — cleaning up anyway", e)
+                } finally {
+                    cleanup()
+                }
+            }
+        }.start()
+    }
+
+    // Return the MASTER playlist for `url`. If `url` is already a master
+    // (#EXT-X-STREAM-INF) it's returned as-is. If it's a media playlist (a single
+    // quality), hunt through everything we saw this pass for a master that lists
+    // this exact variant and return that — track-safe, since the master owns this
+    // rung. Any failure falls back to the original url (no regression).
+    private fun resolveMasterUrl(url: String, headers: Map<String, String>): String {
+        val body = httpGet(url, headers) ?: return url
+        if (body.contains("#EXT-X-STREAM-INF")) return url   // already a master
+        if (!body.contains("#EXTINF")) return url            // not a media playlist we recognise
+        // Distinctive path token (…/<TOKEN>/pl.m3u8) so we match even if a master
+        // lists the variant relatively rather than absolutely.
+        val token = url.substringBeforeLast("/pl.m3u8", "").substringAfterLast("/")
+        var checked = 0
+        for (cand in seenManifests) {
+            if (cand == url || checked++ > 8) continue
+            val cbody = httpGet(cand, headers) ?: continue
+            if (!cbody.contains("#EXT-X-STREAM-INF")) continue
+            if (cbody.contains(url) || (token.isNotEmpty() && cbody.contains(token))) {
+                return cand
+            }
+        }
+        return url
+    }
+
+    // Minimal blocking GET for a small playlist. Sends the Referer/UA/Origin the
+    // player would, short timeouts so a dead CDN can't stall delivery for long.
+    private fun httpGet(url: String, headers: Map<String, String>): String? {
+        var conn: HttpURLConnection? = null
+        return try {
+            conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 3000
+                readTimeout = 3000
+                instanceFollowRedirects = true
+                requestMethod = "GET"
+                headers["Referer"]?.let { setRequestProperty("Referer", it) }
+                headers["User-Agent"]?.let { setRequestProperty("User-Agent", it) }
+                headers["Origin"]?.let { setRequestProperty("Origin", it) }
+                setRequestProperty("Accept", "*/*")
+            }
+            if (conn.responseCode in 200..399)
+                conn.inputStream.bufferedReader().use { it.readText() }
+            else null
+        } catch (_: Exception) {
+            null
         } finally {
-            cleanup()
+            try { conn?.disconnect() } catch (_: Exception) {}
         }
     }
 

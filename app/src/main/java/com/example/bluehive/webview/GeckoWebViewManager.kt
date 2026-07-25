@@ -100,8 +100,16 @@ object GeckoWebViewManager {
      * This ensures no stale child processes
      */
     fun getNewSession(ownerId: String, context: Context): GeckoSession? {
+        // Lazy init: on RAM-constrained devices the startup preload is skipped, so the
+        // runtime is created here on first actual use (opening a MainWebViewer source).
+        // No-op if already initialized. Keeps the main process ~200 MB leaner during the
+        // common anime path, which never touches Gecko.
         if (!isInitialized) {
-            Log.e(TAG, "❌ Not initialized!")
+            Log.d(TAG, "⏳ runtime not preloaded — initializing on demand")
+            initialize(context)
+        }
+        if (!isInitialized || geckoRuntime == null) {
+            Log.e(TAG, "❌ Not initialized (on-demand init failed)!")
             return null
         }
 

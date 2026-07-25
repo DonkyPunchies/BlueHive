@@ -30,6 +30,7 @@ class MiruroExtractorActivity : ComponentActivity() {
         const val RESULT_M3U8    = "RESULT_M3U8"
         const val RESULT_REFERER = "RESULT_REFERER"
         const val RESULT_UA      = "RESULT_UA"
+        const val RESULT_DUB_FALLBACK = "RESULT_DUB_FALLBACK"  // true → sub delivered because real dub wasn't found
 
         // ENUMERATE result (RESULT_OK) — parallel arrays + default index
         const val RESULT_SERVER_NAMES         = "RESULT_SERVER_NAMES"
@@ -107,12 +108,14 @@ class MiruroExtractorActivity : ComponentActivity() {
                 override fun onM3u8Found(
                     m3u8Url: String,
                     headers: Map<String, String>,
-                    servers: List<MiruroStreamExtractorWebView.ServerInfo>?
+                    servers: List<MiruroStreamExtractorWebView.ServerInfo>?,
+                    dubFallback: Boolean
                 ) {
                     val data = Intent()
                         .putExtra(RESULT_M3U8,    m3u8Url)
                         .putExtra(RESULT_REFERER, headers["Referer"])
                         .putExtra(RESULT_UA,      headers["User-Agent"])
+                        .putExtra(RESULT_DUB_FALLBACK, dubFallback)
                     // If the server list was captured in this same pass, pass it
                     // back on the SAME result extras ENUMERATE uses so the caller
                     // can cache it (parallel arrays + default index).

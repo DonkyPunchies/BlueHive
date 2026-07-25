@@ -134,7 +134,9 @@ class MainWebViewer : AppCompatActivity() {
                     geckoViewRef = geckoView
                     webViewController = controller
                     mainHandler.postDelayed({
-                        if (!isFinishing && !shutdownInitiated && GeckoWebViewManager.isReady()) {
+                        // getNewSession() now inits the runtime on demand, so don't gate
+                        // on isReady() — on constrained devices the runtime is created here.
+                        if (!isFinishing && !shutdownInitiated) {
                             setupNewSession(geckoView)
                         }
                     }, 350)

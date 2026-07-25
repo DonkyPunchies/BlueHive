@@ -6,6 +6,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
@@ -34,8 +35,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
@@ -94,11 +97,12 @@ private val CW_THUMB_WIDTH      = 58.dp
 private val CW_ROW_SHAPE        = RoundedCornerShape(0.dp)
 private val CW_THUMB_SHAPE      = RoundedCornerShape(topStart = 0.dp, bottomStart = 0.dp)
 private val CW_BG_COLOR         = Color(0xFF131313) // 0xFF121314
+private val CW_BG_FOCUSED       = Color(0xFF2D58AA) // focused row fill — light blue (tune to taste)
 private val CW_BORDER_UNFOCUSED = Color(0xFF262525)
 private val CW_BORDER_FOCUSED   = Color.White
 private val CW_TITLE_FOCUSED    = Color.White
-private val CW_TITLE_DEFAULT    = Color(0xFFBBBBBB)
-private val CW_SUBTITLE_COLOR   = Color(0xFF777777)
+private val CW_TITLE_DEFAULT    = Color.White          // media title — bright white (both states)
+private val CW_SUBTITLE_COLOR   = Color(0xFFDFDFDF)    // subtitle — off-white (the title's former tone)
 private const val CW_MAX_ITEMS  = 15
 
 // ── Single item row ───────────────────────────────────────────────────────────
@@ -127,7 +131,7 @@ private fun ContinueWatchingItem(
             .fillMaxWidth()
             .height(CW_ITEM_HEIGHT)
             .clip(CW_ROW_SHAPE)
-            .background(CW_BG_COLOR)
+            .background(if (isFocused) CW_BG_FOCUSED else CW_BG_COLOR)
             .border(
                 width = if (isFocused) 0.8.dp else 1.dp,
                 color = if (isFocused) CW_BORDER_FOCUSED else CW_BORDER_UNFOCUSED,
@@ -245,6 +249,7 @@ private fun ContinueWatchingItem(
 }
 
 // ── Main composable ───────────────────────────────────────────────────────────
+@OptIn(ExperimentalComposeUiApi::class)   // FocusProperties.exit (the UP focus trap)
 @Composable
 fun HomeScreenContinueWatchingCompose(
     profileId: Int,
@@ -568,7 +573,16 @@ fun HomeScreenContinueWatchingCompose(
                     .width(listWidth)
                     .height(listHeight)
                     .clip(RoundedCornerShape(0.dp))
-                    .zIndex(3f),
+                    .zIndex(3f)
+                    // Focus trap: cancel any UP that would leave the list, at the GROUP
+                    // boundary. This holds even under rapid up/down — unlike the per-row
+                    // up=Cancel / focusedItemId guards, which lag while LazyColumn recycles
+                    // the boundary row and let focus slip up into the Trending section.
+                    // DOWN keeps its normal behavior (last row → downNeighbor).
+                    .focusProperties {
+                        exit = { dir -> if (dir == FocusDirection.Up) FocusRequester.Cancel else FocusRequester.Default }
+                    }
+                    .focusGroup(),
                 verticalArrangement = Arrangement.spacedBy(CW_ITEM_SPACING),
                 contentPadding = PaddingValues(start = 0.dp, top = 0.dp, end = 0.dp, bottom = 3.dp),
             ) {

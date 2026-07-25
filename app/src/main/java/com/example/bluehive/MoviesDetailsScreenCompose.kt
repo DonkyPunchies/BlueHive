@@ -533,7 +533,28 @@ fun MoviesDetailsScreenContent(
     val activity = LocalActivity.current as? MoviesDetailsScreenCompose
     val favoriteProfileId = activity?.profileId ?: -1
 
-
+    // ── Automatic server failover ────────────────────────────────────────────
+    // When the default (or chosen) server is down — a hard extract failure, or a
+    // dub request that fell back to sub — walk the rest of the provider list until
+    // one yields a real stream. Works for any anime movie, dub or sub. triedServers
+    // is reset at the start of each play (default attempt); lastExtractServer is the
+    // provider of the in-flight extract (null = Miruro's default).
+    val triedServers = remember { mutableSetOf<String>() }
+    var lastExtractServer by remember { mutableStateOf<String?>(null) }
+    // Set by the result handler to re-extract with the next server; a LaunchedEffect
+    // (declared after launchExtract) performs the actual re-launch. This state hop
+    // breaks the launchExtract ⇄ extractorLauncher reference cycle. (url, dub, server)
+    var failoverRequest by remember { mutableStateOf<Triple<String, Boolean, String?>?>(null) }
+    fun pickNextServer(url: String, dub: Boolean): String? {
+        val list = serverListCache[serverCacheKey(url, dub)]?.first
+            ?: serverOptions.takeIf { it.isNotEmpty() }
+            ?: return null
+        val untried = list.filter { it.name !in triedServers }
+        if (untried.isEmpty()) return null
+        val want = if (dub) "dub" else "sub"
+        // Prefer a provider whose tags advertise the requested track; else any untried.
+        return (untried.firstOrNull { o -> o.tags.any { it.equals(want, true) } } ?: untried.first()).name
+    }
 
     // Receives the m3u8 back from the isolated :extractor process, then launches
     // the player here in the main process — keeps back-navigation identical.
@@ -548,70 +569,95 @@ fun MoviesDetailsScreenContent(
             val m3u8    = data?.getStringExtra(MiruroExtractorActivity.RESULT_M3U8)
             val referer = data?.getStringExtra(MiruroExtractorActivity.RESULT_REFERER)
             val ua      = data?.getStringExtra(MiruroExtractorActivity.RESULT_UA)
-            if (!m3u8.isNullOrBlank()) {
-                val proxied = BuildConfig.API_BASE_URL.trimEnd('/') +
-                        "/api/hls/proxy?url=" + URLEncoder.encode(m3u8, "UTF-8")
-                Log.d("scraper", "M Extract → relaying via $proxied")
-                context.startActivity(
-                    Intent(context, MiruroPlayerActivity::class.java)
-                        .putExtra("M3U8_URL", proxied)
-                        .putExtra("REFERER", referer)
-                        .putExtra("UA", ua)
-                )
+            val dubFallback = data?.getBooleanExtra(MiruroExtractorActivity.RESULT_DUB_FALLBACK, false) == true
+            val capUrl  = pendingUrl
 
-                // ── Record the watch ────────────────────────────────────────
-                // The DuB/SuB path goes straight to MiruroPlayerActivity and never
-                // touches MainWebViewer, which is the only place watch history was
-                // ever logged — so anime watched this way was invisible to the
-                // backend. Log it here with the SAME endpoint the normal player
-                // path uses. This populates BOTH the Watch History screen and the
-                // Continue Watching row (both read this one endpoint).
-                if (favoriteProfileId != -1 && tmdbId != 0) {
-                    val sourceLabel = if (pendingDub) "Miruro (Dub)" else "Miruro (Sub)"
-                    kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
-                        try {
-                            ApiClient.bluehiveApi.logWatchHistory(
-                                WatchHistoryRequest(
-                                    profile_id     = favoriteProfileId,
-                                    media_tmdb_id  = tmdbId,
-                                    media_type     = mediaType,
-                                    source_name    = sourceLabel,
-                                    media_title    = mediaTitle,
-                                    season_number  = null,   // anime movies on this screen
-                                    episode_number = null,
-                                    episode_name   = null,
-                                )
+            // ── Cache any server list captured in this same pass FIRST, so failover
+            //    below can consult it (a default extract carries the provider list). ─
+            val capNames = data?.getStringArrayListExtra(MiruroExtractorActivity.RESULT_SERVER_NAMES)
+            val capTags  = data?.getStringArrayListExtra(MiruroExtractorActivity.RESULT_SERVER_TAGS)
+            val capDef   = data?.getIntExtra(MiruroExtractorActivity.RESULT_SERVER_DEFAULT_INDEX, 0) ?: 0
+            if (!capNames.isNullOrEmpty() && capUrl != null) {
+                val opts = capNames.mapIndexed { i, name ->
+                    val tagStr = capTags?.getOrNull(i) ?: ""
+                    val tagList = if (tagStr.isBlank()) emptyList()
+                        else tagStr.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+                    ServerOption(name = name, tags = tagList)
+                }
+                serverListCache[serverCacheKey(capUrl, pendingDub)] =
+                    opts to capDef.coerceIn(0, opts.size - 1)
+                Log.d("scraper", "🗂 cached ${opts.size} servers from default extract")
+            }
+            // Mark the provider we just tried (named failover server, else Miruro's default).
+            val triedName = lastExtractServer
+                ?: capNames?.let { it.getOrNull(capDef.coerceIn(0, it.size - 1)) }
+            triedName?.let { triedServers.add(it) }
+
+            if (m3u8.isNullOrBlank()) {
+                // Nothing captured — server likely down. Fail over before erroring.
+                val next = if (capUrl != null) pickNextServer(capUrl, pendingDub) else null
+                if (next != null && capUrl != null) {
+                    Log.d("scraper", "🔁 no stream — auto-failover to server '$next'")
+                    triedServers.add(next)
+                    failoverRequest = Triple(capUrl, pendingDub, next)
+                } else {
+                    Log.e("scraper", "M Extract: OK result but no m3u8")
+                    showServerError = true
+                }
+                return@rememberLauncherForActivityResult
+            }
+
+            // Dub requested but we got the sub last-resort → try the next server.
+            if (pendingDub && dubFallback) {
+                val next = if (capUrl != null) pickNextServer(capUrl, true) else null
+                if (next != null && capUrl != null) {
+                    Log.d("scraper", "🔁 dub server down — auto-failover to server '$next'")
+                    triedServers.add(next)
+                    failoverRequest = Triple(capUrl, true, next)
+                    return@rememberLauncherForActivityResult
+                }
+                Log.w("scraper", "🔁 dub unavailable on every server — playing sub as last resort")
+            }
+
+            // ── Play the captured stream ─────────────────────────────────────
+            val proxied = BuildConfig.API_BASE_URL.trimEnd('/') +
+                    "/api/hls/proxy?url=" + URLEncoder.encode(m3u8, "UTF-8")
+            Log.d("scraper", "M Extract → relaying via $proxied")
+            context.startActivity(
+                Intent(context, MiruroPlayerActivity::class.java)
+                    .putExtra("M3U8_URL", proxied)
+                    .putExtra("REFERER", referer)
+                    .putExtra("UA", ua)
+            )
+
+            // ── Record the watch ────────────────────────────────────────
+            // The DuB/SuB path goes straight to MiruroPlayerActivity and never
+            // touches MainWebViewer, which is the only place watch history was
+            // ever logged — so anime watched this way was invisible to the
+            // backend. Log it here with the SAME endpoint the normal player
+            // path uses. This populates BOTH the Watch History screen and the
+            // Continue Watching row (both read this one endpoint).
+            if (favoriteProfileId != -1 && tmdbId != 0) {
+                val sourceLabel = if (pendingDub) "Miruro (Dub)" else "Miruro (Sub)"
+                kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
+                    try {
+                        ApiClient.bluehiveApi.logWatchHistory(
+                            WatchHistoryRequest(
+                                profile_id     = favoriteProfileId,
+                                media_tmdb_id  = tmdbId,
+                                media_type     = mediaType,
+                                source_name    = sourceLabel,
+                                media_title    = mediaTitle,
+                                season_number  = null,   // anime movies on this screen
+                                episode_number = null,
+                                episode_name   = null,
                             )
-                            Log.d("scraper", "✅ Watch history logged: anime tmdbId=$tmdbId ($sourceLabel)")
-                        } catch (e: Exception) {
-                            Log.w("scraper", "⚠️ Anime watch-history log failed (non-fatal): ${e.message}")
-                        }
+                        )
+                        Log.d("scraper", "✅ Watch history logged: anime tmdbId=$tmdbId ($sourceLabel)")
+                    } catch (e: Exception) {
+                        Log.w("scraper", "⚠️ Anime watch-history log failed (non-fatal): ${e.message}")
                     }
                 }
-
-                // ── Cache any server list captured in this same pass ─────────
-                // A default extraction (captureServers=true) also carries the
-                // provider list on the RESULT_SERVER_* extras. Save it so a later
-                // "Choose a server" skips its own enumerate webview pass while we
-                // stay on this page.
-                val capNames = data?.getStringArrayListExtra(MiruroExtractorActivity.RESULT_SERVER_NAMES)
-                val capTags  = data?.getStringArrayListExtra(MiruroExtractorActivity.RESULT_SERVER_TAGS)
-                val capDef   = data?.getIntExtra(MiruroExtractorActivity.RESULT_SERVER_DEFAULT_INDEX, 0) ?: 0
-                val capUrl   = pendingUrl
-                if (!capNames.isNullOrEmpty() && capUrl != null) {
-                    val opts = capNames.mapIndexed { i, name ->
-                        val tagStr = capTags?.getOrNull(i) ?: ""
-                        val tagList = if (tagStr.isBlank()) emptyList()
-                            else tagStr.split(",").map { it.trim() }.filter { it.isNotEmpty() }
-                        ServerOption(name = name, tags = tagList)
-                    }
-                    serverListCache[serverCacheKey(capUrl, pendingDub)] =
-                        opts to capDef.coerceIn(0, opts.size - 1)
-                    Log.d("scraper", "🗂 cached ${opts.size} servers from default extract")
-                }
-            } else {
-                Log.e("scraper", "M Extract: OK result but no m3u8")
-                showServerError = true
             }
         } else {
             val data   = result.data
@@ -619,7 +665,18 @@ fun MoviesDetailsScreenContent(
             val failed = data?.getBooleanExtra(MiruroExtractorActivity.RESULT_FAILED, false) == true
             when {
                 noDub  -> { Log.w("scraper", "M Extract: no dub available"); showNoDub = true }
-                failed -> { Log.w("scraper", "M Extract: failed");            showServerError = true }
+                failed -> {
+                    // Extraction error — server likely down. Fail over to the next one.
+                    val u = pendingUrl
+                    val next = if (u != null) pickNextServer(u, pendingDub) else null
+                    if (next != null && u != null) {
+                        Log.d("scraper", "🔁 extract failed — auto-failover to server '$next'")
+                        triedServers.add(next)
+                        failoverRequest = Triple(u, pendingDub, next)
+                    } else {
+                        Log.w("scraper", "M Extract: failed"); showServerError = true
+                    }
+                }
                 else   -> { Log.w("scraper", "M Extract: user cancelled") /* stay silent */ }
             }
         }
@@ -767,6 +824,10 @@ fun MoviesDetailsScreenContent(
     // animation fully completes before the scrim appears.
     val launchExtract: (String, Boolean, String?) -> Unit = { url, dub, server ->
         Log.d("scraper", "M Extract (dub=$dub, server=${server ?: "default"}) → $url")
+        // Fresh play (default attempt) → reset the failover trail. Track the in-flight
+        // provider so its result can mark it tried.
+        if (server == null) triedServers.clear()
+        lastExtractServer = server
         if (!isExtracting && !extractPending && !isCheckingServers) {
             extractPending = true
             coroutineScope.launch {
@@ -808,6 +869,13 @@ fun MoviesDetailsScreenContent(
                 )
             }
         }
+    }
+
+    // Auto server-failover: the result handler stashes the next attempt here; run it.
+    LaunchedEffect(failoverRequest) {
+        val req = failoverRequest ?: return@LaunchedEffect
+        failoverRequest = null
+        launchExtract(req.first, req.second, req.third)
     }
 
 
