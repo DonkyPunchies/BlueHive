@@ -931,8 +931,12 @@ fun FavoritesScreen(profileId: Int = -1, refreshTrigger: Int = 0) {
                         ) { index, entry ->
 
                             // ── Single source of truth for focus ──────────────────
-                            // Mirrors TvWideLazyRow: val isItemFocused = hasRowFocus && (focusedIndex == index)
-                            val isItemFocused = hasGridFocus && focusedGridIndex == index
+                            // Mirrors TvWideLazyRow (267-268): derivedStateOf gates invalidation on
+                            // the Boolean RESULT, so only the two tiles whose focus flips recompose
+                            // per D-pad move — not every visible tile (the raw read was the grid lag).
+                            val isItemFocused by remember(index) {
+                                derivedStateOf { hasGridFocus && focusedGridIndex == index }
+                            }
 
                             // Each card gets its own VanishController so only the tapped
                             // card plays the disintegration effect, not the whole grid.

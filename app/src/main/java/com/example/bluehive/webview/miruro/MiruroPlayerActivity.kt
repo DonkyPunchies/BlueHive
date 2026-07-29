@@ -41,6 +41,12 @@ import com.example.bluehive.utilities.VideoQualityOverlay
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
+import com.example.bluehive.api.AnimeFallbackRequest
+import com.example.bluehive.api.ApiClient
+import com.example.bluehive.api.WatchHistoryRequest
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.ui.PlayerView
@@ -61,6 +67,99 @@ class MiruroPlayerActivity : ComponentActivity() {
 
     private var player: ExoPlayer? = null
     private var playerView: PlayerView? = null
+
+    // Watch history is written from HERE, on confirmed playback, rather than by the
+    // details screen when it launched us — see onIsPlayingChanged below. One row per
+    // launch; the flag stops pause/resume re-logging.
+    private var watchLogged = false
+
+    // ── Direct-first playback, HLS relay as fallback ────────────────────────────
+    // We play the CDN URL directly and only route through /api/hls/proxy if that
+    // fails. The relay exists because some consumer ISPs (Spectrum Security Shield
+    // and friends) DNS-hijack the CDN host — but that only affects SOME networks,
+    // and relaying pushes every video byte through the backend (~1 GB per episode,
+    // in AND out). Trying direct first means unfiltered networks cost the server
+    // nothing, while filtered ones still work via the fallback.
+    private var fallbackUrl: String? = null
+    private var usingFallback = false
+
+    /**
+     * Media3 groups IO/network failures in the 2000-2999 error range
+     * (ERROR_CODE_IO_*). We fall back ONLY for those — a decoder or renderer
+     * failure (4000s) would fail identically through the relay, so retrying it
+     * would just waste bandwidth and delay the error the user needs to see.
+     */
+    private fun isNetworkFailure(error: PlaybackException): Boolean =
+        error.errorCode in 2000..2999
+
+    /**
+     * Tell the backend this device had to use the relay, so it lands in
+     * logs/Anime_Fallback_Record.log. Fire-and-forget — a reporting failure must
+     * never disturb the playback that is already recovering.
+     */
+    private fun reportFallback(error: PlaybackException, directUrl: String?) {
+        val mediaId = intent.getStringExtra("MEDIA_ID")?.toIntOrNull() ?: return
+        val cdnHost = directUrl?.let {
+            runCatching { java.net.URI(it).host }.getOrNull()
+        }
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                ApiClient.bluehiveApi.reportAnimeFallback(
+                    AnimeFallbackRequest(
+                        profile_id     = intent.getIntExtra("PROFILE_ID", -1).takeIf { it != -1 },
+                        media_tmdb_id  = mediaId,
+                        media_type     = intent.getStringExtra("MEDIA_TYPE") ?: "tv",
+                        media_title    = intent.getStringExtra("MEDIA_TITLE"),
+                        season_number  = intent.getIntExtra("SEASON_NUMBER", 0).takeIf { it > 0 },
+                        episode_number = intent.getIntExtra("EPISODE_NUMBER", 0).takeIf { it > 0 },
+                        episode_name   = intent.getStringExtra("EPISODE_NAME"),
+                        source_name    = intent.getStringExtra("SOURCE_NAME"),
+                        error_code     = error.errorCodeName,
+                        cdn_host       = cdnHost,
+                    )
+                )
+                Log.d(sCRAPE, "📝 fallback recorded (tmdb=$mediaId cdn=$cdnHost)")
+            } catch (e: Exception) {
+                Log.w(sCRAPE, "fallback report failed (non-fatal): ${e.message}")
+            }
+        }
+    }
+
+    /** POST the watch-history row. Fire-and-forget: never block or fail playback. */
+    private fun logWatchOnPlaybackConfirmed() {
+        val profileId = intent.getIntExtra("PROFILE_ID", -1)
+        val mediaId   = intent.getStringExtra("MEDIA_ID")?.toIntOrNull() ?: 0
+        if (profileId == -1 || mediaId == 0) {
+            Log.w(sCRAPE, "▶️ playback confirmed but PROFILE_ID/MEDIA_ID missing — not logging")
+            return
+        }
+        val mediaType = intent.getStringExtra("MEDIA_TYPE") ?: "tv"
+        val season    = intent.getIntExtra("SEASON_NUMBER", 0).takeIf { it > 0 }
+        val episode   = intent.getIntExtra("EPISODE_NUMBER", 0).takeIf { it > 0 }
+        val title     = intent.getStringExtra("MEDIA_TITLE")
+        val epName    = intent.getStringExtra("EPISODE_NAME")
+        val source    = intent.getStringExtra("SOURCE_NAME") ?: "Miruro"
+
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                ApiClient.bluehiveApi.logWatchHistory(
+                    WatchHistoryRequest(
+                        profile_id     = profileId,
+                        media_tmdb_id  = mediaId,
+                        media_type     = mediaType,
+                        source_name    = source,
+                        media_title    = title,
+                        season_number  = season,
+                        episode_number = episode,
+                        episode_name   = epName,
+                    )
+                )
+                Log.d(sCRAPE, "✅ Watch history logged on PLAYBACK: tmdb=$mediaId S$season E$episode ($source)")
+            } catch (e: Exception) {
+                Log.w(sCRAPE, "⚠️ Watch-history log failed (non-fatal): ${e.message}")
+            }
+        }
+    }
 
     // Per center-dial press: did we route the DOWN to the PlayerView controller
     // (so we let the UP through too) or handle it ourselves as a play/pause toggle
@@ -98,7 +197,12 @@ class MiruroPlayerActivity : ComponentActivity() {
             ?: ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
                     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-        Log.d(sCRAPE, "▶️ playing extracted m3u8: $url (referer=$referer)")
+        // Relay URL to switch to if the direct CDN attempt fails. Absent = the
+        // caller wants the given URL played as-is with no fallback.
+        fallbackUrl = intent.getStringExtra("M3U8_FALLBACK_URL")?.takeIf { it.isNotBlank() }
+
+        Log.d(sCRAPE, "▶️ playing extracted m3u8: $url (referer=$referer) " +
+                "fallback=${if (fallbackUrl != null) "available" else "none"}")
 
         val okHttpClient = OkHttpClient.Builder()
             .followRedirects(true)
@@ -148,6 +252,27 @@ class MiruroPlayerActivity : ComponentActivity() {
                 override fun onPlayerError(error: PlaybackException) {
                     Log.e(sCRAPE, "❌ ExoPlayer failed for url=$url", error)
                     Log.e(sCRAPE, "❌ Cause: ${error.cause}")
+
+                    // ── Network blockage → switch to the HLS relay, once ────────
+                    // The direct CDN is unreachable on this network (ISP DNS
+                    // hijack, blocked IP, dead host). Re-prepare against the relay
+                    // and resume where we were, so a mid-play CDN failure doesn't
+                    // restart the episode.
+                    val fb = fallbackUrl
+                    if (!usingFallback && fb != null && isNetworkFailure(error)) {
+                        usingFallback = true
+                        val resumeAt = currentPosition.coerceAtLeast(0L)
+                        Log.w(sCRAPE,
+                            "🔀 direct CDN unreachable (${error.errorCodeName}) — " +
+                            "falling back to HLS relay, resuming at ${resumeAt}ms")
+                        reportFallback(error, url)
+                        setMediaSource(buildMediaSource(fb))
+                        prepare()
+                        if (resumeAt > 0) seekTo(resumeAt)
+                        playWhenReady = true
+                    } else if (usingFallback) {
+                        Log.e(sCRAPE, "❌ relay failed too — nothing left to try")
+                    }
                 }
             })
             setMediaSource(buildMediaSource(url))
@@ -162,6 +287,20 @@ class MiruroPlayerActivity : ComponentActivity() {
                     Log.d(sCRAPE, "⏱ duration=${player?.duration}ms | isLive=${player?.isCurrentMediaItemLive}")
                 }
             }
+
+            // ✅ THE watched signal for anime. Fires only once video is genuinely
+            // rolling — not when the user picked DuB/SuB, not when a server was
+            // chosen, not merely when this activity launched. A failed extract, a
+            // dead server, or a stream that never starts therefore never marks the
+            // episode watched. Guarded by `watchLogged` so a pause/resume can't
+            // log the same episode twice.
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                if (isPlaying && !watchLogged) {
+                    watchLogged = true
+                    logWatchOnPlaybackConfirmed()
+                }
+            }
+
             override fun onPlayerError(error: PlaybackException) {
                 Log.e(sCRAPE, "❌ ExoPlayer error: ${error.message} | cause: ${error.cause?.message}")
             }

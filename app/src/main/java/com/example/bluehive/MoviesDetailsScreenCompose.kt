@@ -397,7 +397,15 @@ private fun getStreamingSources(mediaType: String, mediaId: Int): List<MoviesDet
             MoviesDetailsScreenCompose.StreamingSource(
                 "Queen Stream",
                 "VidFast",
-                "https://vidfast.pro/movie/$mediaId?autoPlay=true"
+                "https://vidfast.pro/movie/$mediaId?autoPlay=true",
+                // hls.js embed → headless m3u8 extraction + ExoPlayer, with the
+                // GeckoView embed kept as the fallback (see the extractor result
+                // handler). Verified on-device: the manifest is captured in ~35s
+                // via both the JS hook and the network intercept, with no DRM or
+                // license traffic. Playing it in ExoPlayer instead of keeping a
+                // full browser engine resident for the whole film is the point —
+                // GeckoView is what OOM-killed the 2 GB box.
+                useExtractor = true
             ),
             MoviesDetailsScreenCompose.StreamingSource(
                 "Royal Jelly",
@@ -409,11 +417,11 @@ private fun getStreamingSources(mediaType: String, mediaId: Int): List<MoviesDet
                 "VidLink",
                 "https://vidlink.pro/movie/$mediaId"
             ),
-            MoviesDetailsScreenCompose.StreamingSource(
-                "Colony Stream",
-                "VidSuper",
-                "https://vidsuper.net/movie/$mediaId"
-            ),
+//            MoviesDetailsScreenCompose.StreamingSource(
+//                "Colony Stream",
+//                "VidSuper",
+//                "https://vidsuper.net/movie/$mediaId"
+//            ),
             MoviesDetailsScreenCompose.StreamingSource(
                 "Honeycomb",
                 "VidApi",
@@ -486,6 +494,10 @@ fun MoviesDetailsScreenContent(
     var extractStage   by remember { mutableIntStateOf(0) }
     var extractPending by remember { mutableStateOf(false) }   // guards the 1.5s pre-launch window
     var showNoDub      by remember { mutableStateOf(false) }   // transient "No dub available" toast
+    // Shown when this anime movie has no AniList mapping yet, so there is no Miruro
+    // URL to extract from. Without this, DuB/SuB were a SILENT no-op — the guard
+    // below just found sources.size <= 2 and did nothing at all.
+    var showNotYetAvailable by remember { mutableStateOf(false) }
 
     // ── Anime server-selection flow ─────────────────────────────────────────
     var showDefaultPrompt by remember { mutableStateOf(false) } // instant "default server?" Yes/No
@@ -620,45 +632,33 @@ fun MoviesDetailsScreenContent(
             }
 
             // ── Play the captured stream ─────────────────────────────────────
+            // DIRECT FIRST, relay only on failure — see MiruroPlayerActivity. The
+            // relay works around ISPs that DNS-hijack the CDN, but costs ~1 GB of
+            // backend transfer each way per episode, so it is now the fallback
+            // rather than the default path.
             val proxied = BuildConfig.API_BASE_URL.trimEnd('/') +
                     "/api/hls/proxy?url=" + URLEncoder.encode(m3u8, "UTF-8")
-            Log.d("scraper", "M Extract → relaying via $proxied")
-            context.startActivity(
-                Intent(context, MiruroPlayerActivity::class.java)
-                    .putExtra("M3U8_URL", proxied)
-                    .putExtra("REFERER", referer)
-                    .putExtra("UA", ua)
-            )
-
+            Log.d("scraper", "M Extract → direct=$m3u8  (relay fallback ready)")
             // ── Record the watch ────────────────────────────────────────
             // The DuB/SuB path goes straight to MiruroPlayerActivity and never
             // touches MainWebViewer, which is the only place watch history was
-            // ever logged — so anime watched this way was invisible to the
-            // backend. Log it here with the SAME endpoint the normal player
-            // path uses. This populates BOTH the Watch History screen and the
-            // Continue Watching row (both read this one endpoint).
-            if (favoriteProfileId != -1 && tmdbId != 0) {
-                val sourceLabel = if (pendingDub) "Miruro (Dub)" else "Miruro (Sub)"
-                kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
-                    try {
-                        ApiClient.bluehiveApi.logWatchHistory(
-                            WatchHistoryRequest(
-                                profile_id     = favoriteProfileId,
-                                media_tmdb_id  = tmdbId,
-                                media_type     = mediaType,
-                                source_name    = sourceLabel,
-                                media_title    = mediaTitle,
-                                season_number  = null,   // anime movies on this screen
-                                episode_number = null,
-                                episode_name   = null,
-                            )
-                        )
-                        Log.d("scraper", "✅ Watch history logged: anime tmdbId=$tmdbId ($sourceLabel)")
-                    } catch (e: Exception) {
-                        Log.w("scraper", "⚠️ Anime watch-history log failed (non-fatal): ${e.message}")
-                    }
-                }
-            }
+            // otherwise logged — so anime watched this way was invisible to the
+            // backend. It IS logged, but by the player itself once video is
+            // actually rolling (onIsPlayingChanged), NOT here: firing on a
+            // successful extract counted a watch even when the stream never
+            // played. Season/episode are omitted — these are movies.
+            context.startActivity(
+                Intent(context, MiruroPlayerActivity::class.java)
+                    .putExtra("M3U8_URL", m3u8)                  // try the CDN directly
+                    .putExtra("M3U8_FALLBACK_URL", proxied)      // relay if that's blocked
+                    .putExtra("REFERER", referer)
+                    .putExtra("UA", ua)
+                    .putExtra("PROFILE_ID",  favoriteProfileId)
+                    .putExtra("MEDIA_ID",    tmdbId.toString())
+                    .putExtra("MEDIA_TYPE",  mediaType)
+                    .putExtra("MEDIA_TITLE", mediaTitle)
+                    .putExtra("SOURCE_NAME", if (pendingDub) "Miruro (Dub)" else "Miruro (Sub)")
+            )
         } else {
             val data   = result.data
             val noDub  = data?.getBooleanExtra(MiruroExtractorActivity.RESULT_NO_DUB, false) == true
@@ -733,6 +733,32 @@ fun MoviesDetailsScreenContent(
     // and pass EMBED_URL for CDN failover (token refresh on a mid-play error).
     var vidApiSourceName by remember { mutableStateOf("VidApi") }
     var vidApiEmbedUrl   by remember { mutableStateOf<String?>(null) }
+
+    // The source we were extracting, kept so a FAILED extraction can fall back to
+    // the GeckoView embed instead of dead-ending on an error. Extraction is the
+    // fast/light path; the embed is the one that always works. A user CANCEL does
+    // NOT fall back — backing out is a deliberate "no".
+    var extractFallbackSource by remember {
+        mutableStateOf<MoviesDetailsScreenCompose.StreamingSource?>(null)
+    }
+
+    /**
+     * Extraction didn't produce a playable stream — hand the user off to the
+     * GeckoView embed rather than an error screen. The embed is heavier (a full
+     * browser engine for the whole film) but it is the path that always works, so
+     * a site change or a slow probe degrades playback instead of breaking it.
+     */
+    val fallbackToEmbed: (String) -> Unit = { why ->
+        val src = extractFallbackSource
+        if (src != null) {
+            Log.w("scraper-vidapi", "↩️ extraction unusable ($why) — falling back to ${src.name} embed")
+            extractFallbackSource = null
+            onStreamingSourceSelected(src)
+        } else {
+            Log.w("scraper-vidapi", "extraction unusable ($why) and no fallback source recorded")
+            vidApiError = "Couldn't find a playable stream — try another source."
+        }
+    }
     // English subtitle fetch, kicked off in parallel with extraction when a VidApi
     // source is played.
     val vidApiExtractorLauncher = rememberLauncherForActivityResult(
@@ -751,6 +777,10 @@ fun MoviesDetailsScreenContent(
                 // extractor's own RESULT_SUBTITLE — vaplayer's thumbnail track — is
                 // intentionally unused).
                 Log.d("scraper-vidapi", "▶️ direct CDN play: $m3u8")
+                // Watch history is logged by the PLAYER on confirmed playback (see
+                // VidApiPlayerActivity.onIsPlayingChanged), not here. Logging on a
+                // successful extract counted a watch even when the stream never
+                // played — a dead CDN, a failed re-extract, or the user backing out.
                 context.startActivity(
                     Intent(context, VidApiPlayerActivity::class.java)
                         .putExtra("M3U8_URL", m3u8)
@@ -760,40 +790,22 @@ fun MoviesDetailsScreenContent(
                         // EMBED_URL lets the player re-extract a fresh token on a
                         // mid-play CDN error (important for token'd embeds).
                         .putExtra("EMBED_URL", vidApiEmbedUrl)
+                        .putExtra("PROFILE_ID",  favoriteProfileId)
+                        .putExtra("MEDIA_TYPE",  mediaType)
+                        .putExtra("MEDIA_TITLE", mediaTitle)
+                        .putExtra("SOURCE_NAME", vidApiSourceName)
                 )
-                if (favoriteProfileId != -1 && tmdbId != 0) {
-                    val histSource = vidApiSourceName
-                    kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
-                        try {
-                            ApiClient.bluehiveApi.logWatchHistory(
-                                WatchHistoryRequest(
-                                    profile_id     = favoriteProfileId,
-                                    media_tmdb_id  = tmdbId,
-                                    media_type     = mediaType,
-                                    source_name    = histSource,
-                                    media_title    = mediaTitle,
-                                    season_number  = null,
-                                    episode_number = null,
-                                    episode_name   = null,
-                                )
-                            )
-                            Log.d("scraper-vidapi", "✅ watch history logged tmdbId=$tmdbId ($histSource)")
-                        } catch (e: Exception) {
-                            Log.w("scraper-vidapi", "⚠️ history log failed (non-fatal): ${e.message}")
-                        }
-                    }
-                }
             } else {
                 Log.e("scraper-vidapi", "OK result but no m3u8")
-                vidApiError = "Couldn't find a playable stream — try another source."
+                fallbackToEmbed("no m3u8 captured")
             }
         } else {
             val data   = result.data
             val failed = data?.getBooleanExtra(VidApiExtractorActivity.RESULT_FAILED, false) == true
             val reason = data?.getStringExtra(VidApiExtractorActivity.RESULT_REASON)
             when {
-                failed -> { Log.w("scraper-vidapi", "failed: $reason"); vidApiError = reason ?: "Extraction failed — try another source." }
-                else   -> { Log.w("scraper-vidapi", "user cancelled") /* silent */ }
+                failed -> { Log.w("scraper-vidapi", "failed: $reason"); fallbackToEmbed(reason ?: "extraction failed") }
+                else   -> { Log.w("scraper-vidapi", "user cancelled") /* silent — no fallback */ }
             }
         }
     }
@@ -934,6 +946,13 @@ fun MoviesDetailsScreenContent(
         }
     }
 
+
+    LaunchedEffect(showNotYetAvailable) {
+        if (showNotYetAvailable) {
+            delay(4000)
+            showNotYetAvailable = false
+        }
+    }
 
     LaunchedEffect(showNoDub) {
         if (showNoDub) {
@@ -1516,6 +1535,12 @@ fun MoviesDetailsScreenContent(
                             pendingUrl = sources[2].url
                             pendingDub = true
                             showDefaultPrompt = true
+                        } else {
+                            // No AniList mapping yet → no Miruro/M Extract source was
+                            // built, so there is nothing to scrape. Say so instead of
+                            // silently doing nothing.
+                            Log.w("scraper", "DuB pressed but no Miruro source (tmdb=$mediaId) — unmapped")
+                            showNotYetAvailable = true
                         }
                     }
                 )
@@ -1532,6 +1557,9 @@ fun MoviesDetailsScreenContent(
                             pendingUrl = sources[2].url
                             pendingDub = false
                             showDefaultPrompt = true
+                        } else {
+                            Log.w("scraper", "SuB pressed but no Miruro source (tmdb=$mediaId) — unmapped")
+                            showNotYetAvailable = true
                         }
                     }
                 )
@@ -1550,23 +1578,30 @@ fun MoviesDetailsScreenContent(
                 sources.forEachIndexed { i, source ->
                     val col = i % 2
                     val row = i / 2
+                    // A trailing odd button (alone on its row) is centered between the two
+                    // columns instead of hugging the left column.
+                    val aloneInRow = i % 2 == 0 && i == sources.lastIndex
                     MoviesStreamerButton(
                         source = source,
                         fontFamily = passionFont,
                         focusRequester = streamerFocus[i],
-                        offsetX = colX[col],
+                        offsetX = if (aloneInRow) (colX[0] + colX[1]) / 2f else colX[col],
                         offsetY = if (row < rowY.size) rowY[row]
                                   else rowY.last() + 55.dp * (row - rowY.lastIndex),
-                        disableLeftSound  = col == 0,               // left column → mute left edge
-                        disableRightSound = col == 1,               // right column → mute right edge
+                        disableLeftSound  = aloneInRow || col == 0, // left column / lone centered → mute left edge
+                        disableRightSound = aloneInRow || col == 1, // right column / lone centered → mute right edge
                         disableDownSound  = i + 2 >= sources.size,  // no button directly below → mute down
                         onClick = {
                             isTrailerPlaying = false; hasTrailerBeenPlayed = false
                             // Extractor sources → headless m3u8 extraction + ExoPlayer
                             // (overlay shows progress); everything else keeps the WebView
                             // path. Keyed off the source flag, not its name/slot.
-                            if (source.useExtractor) launchVidApiExtract(source.name, source.url)
-                            else onStreamingSourceSelected(source)
+                            if (source.useExtractor) {
+                                // Remember it so a failed extraction can fall back
+                                // to this same source's embed.
+                                extractFallbackSource = source
+                                launchVidApiExtract(source.name, source.url)
+                            } else onStreamingSourceSelected(source)
                         }
                     )
                 }
@@ -1613,6 +1648,22 @@ fun MoviesDetailsScreenContent(
                 color = Color.White,
                 fontSize = 18.sp,
                 fontFamily = dongleRegular,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 70.dp)
+                    .background(Color(0xE6000000), RoundedCornerShape(10.dp))
+                    .padding(horizontal = 26.dp, vertical = 12.dp)
+            )
+        }
+
+        // ── "Not in our search engine yet" — no AniList mapping for this movie ──
+        if (showNotYetAvailable) {
+            Text(
+                "This title isn't in our anime search engine yet — try VidFast below",
+                color = Color.White,
+                fontSize = 18.sp,
+                fontFamily = dongleRegular,
+                textAlign = TextAlign.Center,
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .padding(bottom = 70.dp)

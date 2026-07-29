@@ -1,5 +1,6 @@
 package com.example.bluehive.continueWatchingComponents
 
+import android.os.SystemClock
 import android.util.Log
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
@@ -105,6 +106,11 @@ private val CW_TITLE_DEFAULT    = Color.White          // media title — bright
 private val CW_SUBTITLE_COLOR   = Color(0xFFDFDFDF)    // subtitle — off-white (the title's former tone)
 private const val CW_MAX_ITEMS  = 15
 
+// ⬆️⬇️ Hold-to-repeat navigation speed for the Continue Watching list: the minimum
+// time (ms) between focus moves while UP/DOWN is HELD DOWN. HIGHER = SLOWER. The
+// system's raw key-repeat (~50ms) is what made it feel too fast; bump this to taste.
+private const val CW_NAV_REPEAT_MS = 70L
+
 // ── Single item row ───────────────────────────────────────────────────────────
 @Composable
 private fun ContinueWatchingItem(
@@ -114,6 +120,7 @@ private fun ContinueWatchingItem(
     isLast: Boolean,
     frameFocusRequester: FocusRequester,
     downNeighbor: FocusRequester?,
+    navGate: LongArray,                 // shared [0]=last-move time; gates hold-to-repeat speed
     onItemClick: () -> Unit,
     onFocused: () -> Unit,
 ) {
@@ -160,12 +167,27 @@ private fun ContinueWatchingItem(
                             true
                         }
                         Key.DirectionUp -> {
-                            if (!isFirst) BlueHiveApplication.playHoverSound()
-                            false
+                            // Hold-to-repeat throttle (see CW_NAV_REPEAT_MS): swallow repeats
+                            // that land sooner than the interval so holding scrolls at a
+                            // comfortable pace instead of the system's fast key-repeat.
+                            val now = SystemClock.uptimeMillis()
+                            if (now - navGate[0] < CW_NAV_REPEAT_MS) {
+                                true  // too soon — consume, no move (and no sound)
+                            } else {
+                                navGate[0] = now
+                                if (!isFirst) BlueHiveApplication.playHoverSound()
+                                false  // allow the move
+                            }
                         }
                         Key.DirectionDown -> {
-                            if (!isLast) BlueHiveApplication.playHoverSound()
-                            false
+                            val now = SystemClock.uptimeMillis()
+                            if (now - navGate[0] < CW_NAV_REPEAT_MS) {
+                                true
+                            } else {
+                                navGate[0] = now
+                                if (!isLast) BlueHiveApplication.playHoverSound()
+                                false
+                            }
                         }
                         Key.DirectionLeft, Key.DirectionRight -> {
                             true // consume — no sideways escape from inside the list
@@ -316,6 +338,12 @@ fun HomeScreenContinueWatchingCompose(
     // ✅ Single source of truth state
     var frameState by remember { mutableStateOf<ContinueWatchingFrameState>(ContinueWatchingFrameState.UnFocused) }
 
+    // Focus anywhere in the WHOLE component (base frame OR any row). This is the signal
+    // the state machine was missing: isFrameFocused only sees the base frame, so the
+    // instant a row took focus it read false and collapsed Selected → UnFocused. The
+    // outer Box's onFocusChanged (below) keeps this true for the frame AND every row.
+    var componentHasFocus by remember { mutableStateOf(false) }
+
     val itemFocusRequesters = remember { mutableMapOf<Int, FocusRequester>() }
     fun requesterFor(id: Int): FocusRequester =
         itemFocusRequesters.getOrPut(id) { FocusRequester() }
@@ -330,26 +358,51 @@ fun HomeScreenContinueWatchingCompose(
     var focusedItemId by remember { mutableStateOf<Int?>(null) }
     val listState = rememberLazyListState()
 
-    // Sync state with actual focus (but don't auto-exit Selected unless focus truly leaves)
-    LaunchedEffect(isFrameFocused) {
-        frameState = if (!isFrameFocused) {
-            ContinueWatchingFrameState.UnFocused
-        } else {
-            ContinueWatchingFrameState.Focused  // always Focused when frame regains focus
+    // Hold-to-repeat throttle timestamp for up/down (see CW_NAV_REPEAT_MS). A plain
+    // 1-slot array, NOT observable state, so ticking it never triggers recomposition.
+    val cwNavGate = remember { longArrayOf(0L) }
+
+    // Derive the three-state from ACTUAL focus:
+    //   • nothing in the component focused                       → UnFocused
+    //   • the base frame itself is focused (arrived, not in list)→ Focused
+    //   • focus is in the component but NOT the base frame
+    //     (a row has it)                                         → Selected (in the list)
+    // Entering still sets Selected explicitly on CENTER/click (to kick off the row focus);
+    // this derivation then HOLDS Selected while any row is focused — the old effect
+    // demoted to UnFocused the moment the base frame lost focus, which is the whole bug.
+    // Only fires on real focus changes, so the explicit CENTER→Selected isn't clobbered.
+    LaunchedEffect(componentHasFocus, isFrameFocused) {
+        frameState = when {
+            !componentHasFocus -> ContinueWatchingFrameState.UnFocused
+            isFrameFocused     -> ContinueWatchingFrameState.Focused
+            else               -> ContinueWatchingFrameState.Selected
         }
     }
 
-    // When the activity pauses (user opens details / web viewer), demote
-    // Selected → UnFocused. Otherwise frameState desyncs from Android focus
-    // on return: state says we're inside the list, but no list item has focus,
-    // so the navigation guards block re-entry.
+    // Pause/resume focus handoff. On pause (user opened a show) we demote Selected →
+    // UnFocused so the state doesn't desync while backgrounded — but we REMEMBER we were
+    // in the list, and on resume we re-enter Selected so focus is handed back to the same
+    // row (via the retry LaunchedEffect below). Without this, returning left the list
+    // looking focused (stale highlight) while no row actually held focus.
+    var restoreSelectionOnResume by remember { mutableStateOf(false) }
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_PAUSE &&
-                frameState is ContinueWatchingFrameState.Selected
-            ) {
-                Log.d("CONTINUE_WATCHING", "⏸️ ON_PAUSE while Selected → demoting to UnFocused")
-                frameState = ContinueWatchingFrameState.UnFocused
+            when (event) {
+                Lifecycle.Event.ON_PAUSE -> {
+                    if (frameState is ContinueWatchingFrameState.Selected) {
+                        Log.d("CONTINUE_WATCHING", "⏸️ ON_PAUSE while Selected → demote + mark for restore")
+                        restoreSelectionOnResume = true
+                        frameState = ContinueWatchingFrameState.UnFocused
+                    }
+                }
+                Lifecycle.Event.ON_RESUME -> {
+                    if (restoreSelectionOnResume) {
+                        restoreSelectionOnResume = false
+                        Log.d("CONTINUE_WATCHING", "▶️ ON_RESUME → restoring Selected (re-focus last row)")
+                        frameState = ContinueWatchingFrameState.Selected
+                    }
+                }
+                else -> {}
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -387,7 +440,11 @@ fun HomeScreenContinueWatchingCompose(
                 kotlinx.coroutines.android.awaitFrame()
                 requesterFor(targetId).requestFocus()
                 kotlinx.coroutines.android.awaitFrame()
-                if (!isFrameFocused) break  // a row took focus — done
+                // Success = a ROW actually holds focus (component focused, but not the
+                // base frame). The old check `!isFrameFocused` is already true on resume
+                // (the base frame was never focused there), so it broke immediately even
+                // when no row had taken focus — leaving the list looking focused but dead.
+                if (componentHasFocus && !isFrameFocused) break
                 attempts++
             }
 
@@ -434,7 +491,10 @@ fun HomeScreenContinueWatchingCompose(
     val listHeight  = 169.dp
 
     Box(
-        modifier = Modifier.onPreviewKeyEvent { event ->
+        modifier = Modifier
+            // Focus-within the whole component (frame + rows) → drives the state machine.
+            .onFocusChanged { componentHasFocus = it.hasFocus }
+            .onPreviewKeyEvent { event ->
             if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
             if (frameState !is ContinueWatchingFrameState.Selected) return@onPreviewKeyEvent false
             when (event.key) {
@@ -455,7 +515,9 @@ fun HomeScreenContinueWatchingCompose(
                 .width(focusedW)
                 .height(focusedH)
                 .zIndex(focusedZ)
-                .graphicsLayer(alpha = if (frameState is ContinueWatchingFrameState.Focused) 1f else 0f),
+                // Visible when Focused OR Selected (per this block's intent) — so the frame
+                // stays highlighted while you're navigating rows inside the list.
+                .graphicsLayer(alpha = if (frameState is ContinueWatchingFrameState.Focused || frameState is ContinueWatchingFrameState.Selected) 1f else 0f),
             contentScale = ContentScale.FillBounds
         )
 
@@ -594,6 +656,7 @@ fun HomeScreenContinueWatchingCompose(
                         isLast              = index == historyItems.lastIndex,
                         frameFocusRequester = focusRequester,
                         downNeighbor        = downNeighbor,
+                        navGate             = cwNavGate,
                         onItemClick = {
                             if (!isNavigating) {
                                 isNavigating = true

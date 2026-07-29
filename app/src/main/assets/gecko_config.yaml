@@ -1,16 +1,25 @@
-# Reduce memory usage for low-RAM devices
+# Reduce memory usage for low-RAM devices (e.g. 2 GB TV boxes).
+#
+# IMPORTANT: every pref MUST be indented under `prefs:`. GeckoView's DebugConfig maps the
+# `prefs:` block into a name->value map; a key left at column 0 is parsed as a (nonexistent)
+# top-level DebugConfig property, which THROWS and makes Gecko discard this ENTIRE file — so
+# none of the tuning below applies. Keep the two-space indentation.
 prefs:
-# Reduce JS memory pressure
-javascript.options.mem.gc_min_slice_budget_ms: 5
-javascript.options.mem.gc_max_empty_chunk_count: 2
-javascript.options.mem.gc_allocation_threshold_mb: 10
+  # Fewer content processes — one is plenty for the single-page webviewer, and each extra
+  # Gecko process is its own heap (the OOM that killed playback spawned :tab/:gpu/:media).
+  dom.ipc.processCount: 1
 
-# Reduce image decode cache
-image.cache.size: 1048576
-image.mem.surfacecache.max_size_kb: 2048
+  # Trim JS GC memory pressure.
+  javascript.options.mem.gc_min_slice_budget_ms: 5
+  javascript.options.mem.gc_max_empty_chunk_count: 2
+  javascript.options.mem.gc_allocation_threshold_mb: 10
 
-# Single page — no history needed
-browser.sessionhistory.max_entries: 1
+  # Reduce image decode / surface caches.
+  image.cache.size: 1048576
+  image.mem.surfacecache.max_size_kb: 2048
 
-# Reduce network cache
-browser.cache.memory.capacity: 2048
+  # Single page — no back/forward history to retain.
+  browser.sessionhistory.max_entries: 1
+
+  # Reduce in-memory network cache.
+  browser.cache.memory.capacity: 2048

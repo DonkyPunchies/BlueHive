@@ -223,6 +223,28 @@ data class WatchHistoryResponse(
 )
 
 
+/** Sent when anime playback had to fall back from the direct CDN to the HLS relay. */
+data class AnimeFallbackRequest(
+    val profile_id:     Int?,
+    val media_tmdb_id:  Int,
+    val media_type:     String,
+    val media_title:    String?,
+    val season_number:  Int?,
+    val episode_number: Int?,
+    val episode_name:   String?,
+    val source_name:    String?,
+    val error_code:     String?,
+    val cdn_host:       String?,
+)
+
+
+/** One (season, episode) the profile has started — drives the watched marker. */
+data class WatchedEpisodeResponse(
+    val season_number:  Int,
+    val episode_number: Int,
+)
+
+
 data class MediaDetailResponse(
     val tmdb_id:            Int,
     val media_type:         String,
@@ -361,6 +383,14 @@ interface BluehiveApiService {
     @POST("/api/android/end-session")
     suspend fun endSession(): Response<SimpleOkResponse>
 
+    // Reported when the player could NOT reach the CDN directly and had to fall
+    // back to the HLS relay. Written to logs/Anime_Fallback_Record.log server-side.
+    // user_id / device_id come from the token, not this body.
+    @POST("/api/android/anime-fallback")
+    suspend fun reportAnimeFallback(
+        @Body body: AnimeFallbackRequest,
+    ): Response<Unit>
+
     @POST("/api/android/background")
     suspend fun background(): Response<SimpleOkResponse>
 
@@ -383,6 +413,15 @@ interface BluehiveApiService {
         @Query("limit")  limit:  Int = 50,
         @Query("offset") offset: Int = 0,
     ): List<WatchHistoryResponse>
+
+    // Watched-episode markers for ONE show. Scoped by tmdb_id so the episode
+    // grid gets the COMPLETE set — getWatchHistory above is paged over the whole
+    // profile, so filtering it client-side drops episodes past the page size.
+    @GET("/api/bluehive/profiles/{profileId}/watched-episodes")
+    suspend fun getWatchedEpisodes(
+        @Path("profileId") profileId: Int,
+        @Query("tmdb_id")  tmdbId:    Int,
+    ): List<WatchedEpisodeResponse>
 
     @POST("/api/bluehive/watch-history")
     suspend fun logWatchHistory(

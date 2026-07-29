@@ -241,6 +241,7 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
     private var cwPrefetch: CwPrefetch? = null
     private val cwPrefetchScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+
     fun storeContinueWatchingPrefetch(profileId: Int, items: List<com.example.bluehive.api.WatchHistoryResponse>) {
         cwPrefetch = CwPrefetch(System.currentTimeMillis(), profileId, items)
     }

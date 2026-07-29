@@ -9,12 +9,21 @@ import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.annotation.OptIn
+import androidx.compose.foundation.Canvas
+import androidx.compose.ui.draw.scale
+import com.example.bluehive.utilities.WatchedCornerFold
+import androidx.compose.ui.tooling.preview.Preview
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -41,6 +50,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
+import android.os.SystemClock
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.text.font.FontFamily
@@ -103,6 +113,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.android.awaitFrame
 import kotlinx.coroutines.withContext
 
+
+// ⬅️➡️ Hold-to-repeat navigation speed for the episode LazyRow: the minimum time (ms)
+// between focus moves while LEFT/RIGHT is HELD DOWN. HIGHER = SLOWER. (Continue Watching
+// uses CW_NAV_REPEAT_MS = 70L; episode tiles are chunkier, so this starts a touch slower.)
+private const val EPISODE_NAV_REPEAT_MS = 140L
 
 class TVShowsDetailsScreenCompose: ComponentActivity() {
 
@@ -450,15 +465,15 @@ private fun getStreamingSources(
                 "VidLink",
                 "https://vidlink.pro/tv/$mediaId/$seasonNumber/$episodeNumber"
             ),
-            TVShowsDetailsScreenCompose.StreamingSource(
-                "Colony Stream",
-                "VidSuper",
-                "https://vidsuper.net/tv/$mediaId/$seasonNumber/$episodeNumber"
-            ),
+//            TVShowsDetailsScreenCompose.StreamingSource(
+//                "Colony Stream",
+//                "VidSuper",
+//                "https://vidsuper.net/tv/$mediaId/$seasonNumber/$episodeNumber"
+//            ),
             TVShowsDetailsScreenCompose.StreamingSource(
                 "Honeycomb",
                 "VidApi",
-                "https://vaplayer.ru/embed/tv/$mediaId?s=$seasonNumber&e=$episodeNumber"
+                "https://vaplayer.ru/embed/tv/$mediaId/$seasonNumber/$episodeNumber"
             )
         )
         else -> emptyList()
@@ -654,6 +669,9 @@ fun TVShowsDetailsScreenContent(
 
     var lastFocusedEpisodeIndex by remember { mutableIntStateOf(0) }  // ✅ Remember the last focused episode so RIGHT from seasons always restores correctly
     val episodesRowState = rememberLazyListState() // ✅ Give LazyRow a state so we can scroll before restoring focus
+    // Hold-to-repeat throttle timestamp for the episode row (see EPISODE_NAV_REPEAT_MS).
+    // Plain 1-slot array (NOT observable state) so ticking it never triggers recomposition.
+    val episodeNavGate = remember { longArrayOf(0L) }
 
     // Hoisted season-column scroll state (the LazyColumn below now uses this
     // instead of its own local rememberLazyListState) so the episode row's Back
@@ -776,6 +794,41 @@ fun TVShowsDetailsScreenContent(
     var isFavorited by remember { mutableStateOf(false) }
     val activity = LocalActivity.current as? TVShowsDetailsScreenCompose
     val favoriteProfileId = activity?.profileId ?: -1
+
+    // ── Watched-episode markers ──────────────────────────────────────────────
+    // (season, episode) pairs this profile has started, for THIS show. Drives the
+    // corner fold on each episode card. Fetched once per show; failures leave the
+    // set empty so the grid simply shows no markers (never blocks the screen).
+    var watchedEpisodes by remember(tmdbId) { mutableStateOf<Set<Pair<Int, Int>>>(emptySet()) }
+
+    suspend fun refreshWatchedEpisodes() {
+        if (favoriteProfileId == -1) return
+        try {
+            val marks = withContext(Dispatchers.IO) {
+                ApiClient.bluehiveApi.getWatchedEpisodes(favoriteProfileId, tmdbId)
+            }
+            watchedEpisodes = marks.map { it.season_number to it.episode_number }.toSet()
+        } catch (e: Exception) {
+            Log.w("TVShowsDetails", "watched-episodes fetch failed (non-fatal): ${e.message}")
+        }
+    }
+
+    LaunchedEffect(tmdbId, favoriteProfileId) { refreshWatchedEpisodes() }
+
+    // Re-read on every resume. Nothing is marked optimistically any more — the
+    // marker follows the backend row, and that row is only written once the player
+    // confirms video is actually playing. Coming back from the player is therefore
+    // the moment a genuinely-watched episode should light up.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, tmdbId, favoriteProfileId) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                coroutineScope.launch { refreshWatchedEpisodes() }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     // ════════════════════════════════════════════════════════════════════════
     //  Anime DuB / SuB extraction flow (ported from MoviesDetailsScreenCompose).
@@ -911,42 +964,36 @@ fun TVShowsDetailsScreenContent(
             }
 
             // ── Play the captured stream ─────────────────────────────────────
+            // DIRECT FIRST, relay only on failure. The relay works around ISPs that
+            // DNS-hijack the CDN host, but it pushes every video byte through the
+            // backend (~1 GB per episode each way). Most networks reach the CDN
+            // fine, so we hand the player both URLs and let it fall back only if
+            // the direct attempt actually fails — see MiruroPlayerActivity.
             val proxied = BuildConfig.API_BASE_URL.trimEnd('/') +
                     "/api/hls/proxy?url=" + URLEncoder.encode(m3u8, "UTF-8")
-            Log.d("scraper", "M Extract → relaying via $proxied")
+            Log.d("scraper", "M Extract → direct=$m3u8  (relay fallback ready)")
+            // Everything the player needs to log the watch itself. It writes the
+            // row only once video is actually rolling (onIsPlayingChanged), so a
+            // stream that never starts leaves no history and no watched marker.
             context.startActivity(
                 Intent(context, MiruroPlayerActivity::class.java)
-                    .putExtra("M3U8_URL", proxied)
+                    .putExtra("M3U8_URL", m3u8)                  // try the CDN directly
+                    .putExtra("M3U8_FALLBACK_URL", proxied)      // relay if that's blocked
                     .putExtra("REFERER", referer)
                     .putExtra("UA", ua)
+                    .putExtra("PROFILE_ID",     favoriteProfileId)
+                    .putExtra("MEDIA_ID",       tmdbId.toString())
+                    .putExtra("MEDIA_TYPE",     mediaType)
+                    .putExtra("MEDIA_TITLE",    mediaTitle)
+                    .putExtra("SEASON_NUMBER",  pendingSeason)
+                    .putExtra("EPISODE_NUMBER", pendingEpisode)
+                    .putExtra("EPISODE_NAME",   pendingEpisodeName)
+                    .putExtra("SOURCE_NAME",    if (pendingDub) "Miruro (Dub)" else "Miruro (Sub)")
             )
-            // Same endpoint MainWebViewer uses — lands in BOTH Watch History
-            // and Continue Watching, this time with season + episode.
-            if (favoriteProfileId != -1 && tmdbId != 0) {
-                val sourceLabel = if (pendingDub) "Miruro (Dub)" else "Miruro (Sub)"
-                val logSeason  = pendingSeason
-                val logEpisode = pendingEpisode
-                val logEpName  = pendingEpisodeName
-                kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
-                    try {
-                        ApiClient.bluehiveApi.logWatchHistory(
-                            WatchHistoryRequest(
-                                profile_id     = favoriteProfileId,
-                                media_tmdb_id  = tmdbId,
-                                media_type     = mediaType,
-                                source_name    = sourceLabel,
-                                media_title    = mediaTitle,
-                                season_number  = logSeason,
-                                episode_number = logEpisode,
-                                episode_name   = logEpName,
-                            )
-                        )
-                        Log.d("scraper", "✅ Watch history logged: anime tv tmdbId=$tmdbId S$logSeason E$logEpisode ($sourceLabel)")
-                    } catch (e: Exception) {
-                        Log.w("scraper", "⚠️ Anime watch-history log failed (non-fatal): ${e.message}")
-                    }
-                }
-            }
+            // NOTE: watch history is deliberately NOT logged here any more. It used
+            // to fire the moment extraction succeeded, which marked an episode
+            // watched even if the stream never actually played. MiruroPlayerActivity
+            // now logs it on confirmed playback instead (see the extras above).
         } else {
             val data   = result.data
             val noDub  = data?.getBooleanExtra(MiruroExtractorActivity.RESULT_NO_DUB, false) == true
@@ -1667,7 +1714,18 @@ fun TVShowsDetailsScreenContent(
                                                 modifier = Modifier.onKeyEvent { event ->
                                             if (event.type == KeyEventType.KeyDown) {
                                                 when (event.key) {
-                                                    Key.DirectionDown, Key.DirectionUp -> {
+                                                    Key.DirectionDown -> {
+                                                        if (seasonIndex == seasons.lastIndex) {
+                                                            // Last season — nothing below it. Swallow the
+                                                            // key so holding DOWN at the bottom stops
+                                                            // repeating the nav sound (and doesn't move).
+                                                            true
+                                                        } else {
+                                                            BlueHiveApplication.playTitleCardNavigation()
+                                                            false
+                                                        }
+                                                    }
+                                                    Key.DirectionUp -> {
                                                         BlueHiveApplication.playTitleCardNavigation()
                                                         false
                                                     }
@@ -1836,6 +1894,11 @@ fun TVShowsDetailsScreenContent(
 
                                 val isEpisodeSelectOverlay = selectedEpisodeOverlayIndex == index
 
+                                // Watched marker for THIS episode. watchedEpisodes changes only on
+                                // load and when the user starts a stream, so reading it per item
+                                // costs nothing during D-pad navigation.
+                                val isWatched = (selectedSeason to episode.episodeNumber) in watchedEpisodes
+
                                 // Try the episode still first, fallback to show's backdropUrl
                                 val stillUrl = episode.stillImageUrl ?: backdropUrl
 
@@ -1927,9 +1990,22 @@ fun TVShowsDetailsScreenContent(
                                                     Key.DirectionLeft, Key.DirectionRight -> {
                                                         if (selectedEpisodeOverlayIndex == index) {
                                                             true
+                                                        } else if (event.key == Key.DirectionRight && index == episodes.lastIndex) {
+                                                            // Dead-end: RIGHT on the last episode has nowhere to go —
+                                                            // consume it silently (no scroll sound, no no-op traversal).
+                                                            true
                                                         } else {
-                                                            BlueHiveApplication.playTitleCardNavigation()
-                                                            false
+                                                            // Hold-to-repeat throttle (see EPISODE_NAV_REPEAT_MS): swallow
+                                                            // repeats that land sooner than the interval so holding L/R
+                                                            // scrolls at a controlled pace, like the Continue Watching list.
+                                                            val now = SystemClock.uptimeMillis()
+                                                            if (now - episodeNavGate[0] < EPISODE_NAV_REPEAT_MS) {
+                                                                true   // too soon — consume, no move (and no sound)
+                                                            } else {
+                                                                episodeNavGate[0] = now
+                                                                BlueHiveApplication.playTitleCardNavigation()
+                                                                false  // allow the move
+                                                            }
                                                         }
                                                     }
                                                     else -> false
@@ -2001,6 +2077,22 @@ fun TVShowsDetailsScreenContent(
                                                     .align(Alignment.BottomStart)
                                                     .padding(start = 4.dp, bottom = 76.5.dp)
                                             )
+
+                                            // ✅ Watched marker — corner fold + tick, TOP-RIGHT so it
+                                            // never collides with the episode-number badge. Drawn in a
+                                            // single Canvas (no Material-Icons dependency) and clipped
+                                            // to the card shape so it follows the rounded corner.
+                                            if (isWatched) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .matchParentSize()
+                                                        .clip(episodeShape)
+                                                ) {
+                                                    WatchedCornerFold(
+                                                        modifier = Modifier.align(Alignment.TopEnd)
+                                                    )
+                                                }
+                                            }
                                         }
 
 
@@ -2208,6 +2300,11 @@ fun TVShowsDetailsScreenContent(
                             onDub = { url ->
                                 val epName = selectedEpisode.title
                                 onEpisodeSelected(selectedSeason, episodeNumber, epName)
+                                // NOT marked watched here. Picking DuB only opens the
+                                // server prompt — extraction can still fail, find no
+                                // servers, or be cancelled. The mark happens where the
+                                // stream actually plays (see the extractor result
+                                // handler, alongside logWatchHistory).
                                 lastStreamFocusRequester = providerFocusRequesters.getOrNull(0)
                                 pendingUrl         = url
                                 pendingDub         = true
@@ -2219,6 +2316,7 @@ fun TVShowsDetailsScreenContent(
                             onSub = { url ->
                                 val epName = selectedEpisode.title
                                 onEpisodeSelected(selectedSeason, episodeNumber, epName)
+                                // NOT marked watched here — same reason as onDub above.
                                 lastStreamFocusRequester = providerFocusRequesters.getOrNull(1)
                                 pendingUrl         = url
                                 pendingDub         = false
@@ -2243,6 +2341,10 @@ fun TVShowsDetailsScreenContent(
                             onSourceSelected = { source ->
                                 val epName = selectedEpisode.title
                                 onEpisodeSelected(selectedSeason, episodeNumber, epName)
+                                // Mark watched immediately — the backend row is written when the
+                                // stream launches, so waiting for a refetch would leave the card
+                                // unmarked until the user re-opens the show.
+                                watchedEpisodes = watchedEpisodes + (selectedSeason to episodeNumber)
                                 onStreamingSourceSelected(source)
                             },
                             onBack = {
@@ -2862,7 +2964,11 @@ private fun EpisodeProviderInlineButtons(
         safeSources.chunked(2).forEachIndexed { rowIndex, rowSources ->
             Row(
                 horizontalArrangement = Arrangement.spacedBy((-2).dp),
-                modifier = Modifier.fillMaxWidth()
+                // Wrap to content (NOT fillMaxWidth): the Column's CenterHorizontally then
+                // centers a lone trailing button UNDER the 2-wide grid. With fillMaxWidth
+                // the row spanned the whole overlay, so centering threw it far right; the
+                // full 2-button rows are the widest, so they stay anchored at the left.
+                modifier = Modifier.wrapContentWidth()
             ) {
                 rowSources.forEachIndexed { colIndex, source ->
                     val i = rowIndex * 2 + colIndex
@@ -2958,7 +3064,14 @@ private fun EpisodeOverlayStreamerButton(
                     }
 
                     Key.DirectionDown -> {
-                        val target = index + 2                               // one row down, same column
+                        var target = index + 2                               // one row down, same column
+                        // Lone trailing button (odd source count — e.g. VidApi centered under
+                        // the 2x2 grid): the right-column button directly above it (index
+                        // total-2, e.g. VidLink) has no same-column neighbour below, so route
+                        // DOWN to the lone button instead of dead-ending with no move.
+                        if (total % 2 == 1 && index == total - 2) {
+                            target = total - 1
+                        }
                         if (target < total) {
                             focusRequesters.getOrNull(target)?.requestFocus()
                             BlueHiveApplication.playHoverSound()
@@ -3234,3 +3347,81 @@ private fun AnimeOverlayButton(
 
 
 
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  @Preview — watched corner fold
+//
+//  Renders the REAL WatchedCornerFold composable (not a copy) on a mock episode
+//  still, so tweaking WATCHED_FOLD_* above updates this preview immediately.
+//  Open this file in Android Studio and hit "Split" / "Design" to see it.
+// ════════════════════════════════════════════════════════════════════════════
+@Preview(name = "Watched fold — on card", widthDp = 420, heightDp = 190, showBackground = true, backgroundColor = 0xFF0A0A12)
+@Composable
+private fun WatchedCornerFoldPreview() {
+    val episodeShape = RoundedCornerShape(7.5.dp)
+
+    Row(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF0A0A12))
+            .padding(16.dp),
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        // Watched — unfocused card (the hard case: marker must read on a dim still)
+        Box(
+            modifier = Modifier
+                .width(174.27.dp)
+                .height(97.5.dp)
+                .clip(episodeShape)
+                .background(Color(0xFF16161E))
+                .border(1.1.dp, Color(0xFF505050), episodeShape)
+        ) {
+            WatchedCornerFold(modifier = Modifier.align(Alignment.TopEnd))
+            Text(
+                text = "6/10",
+                color = Color(0xFFD6D6D6),
+                fontSize = 10.sp,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(start = 5.dp, top = 5.dp)
+            )
+        }
+
+        // Watched — focused card (white border + lighter surface)
+        Box(
+            modifier = Modifier
+                .width(174.27.dp)
+                .height(97.5.dp)
+                .clip(episodeShape)
+                .background(Color(0xFF2B2B36))
+                .border(1.4.dp, Color.White, episodeShape)
+        ) {
+            WatchedCornerFold(modifier = Modifier.align(Alignment.TopEnd))
+            Text(
+                text = "7/10",
+                color = Color.White,
+                fontSize = 10.sp,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(start = 5.dp, top = 5.dp)
+            )
+        }
+    }
+}
+
+@Preview(name = "Watched fold — zoomed", widthDp = 150, heightDp = 150, showBackground = true, backgroundColor = 0xFF16161E)
+@Composable
+private fun WatchedCornerFoldZoomPreview() {
+    // Isolated + enlarged so tick geometry is easy to judge while tuning
+    // WATCHED_FOLD_TICK_SIZE / WATCHED_FOLD_TICK_STROKE.
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF16161E)),
+        contentAlignment = Alignment.Center
+    ) {
+        WatchedCornerFold(modifier = Modifier.scale(3f))
+    }
+}

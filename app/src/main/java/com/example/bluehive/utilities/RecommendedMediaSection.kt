@@ -1,8 +1,11 @@
 // utilities/RecommendedMediaSection.kt
 package com.example.bluehive.utilities
 
+import android.os.SystemClock
 import android.util.Log
 import androidx.activity.ComponentActivity
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
@@ -17,6 +20,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.key.*
 import androidx.compose.ui.layout.ContentScale
 import androidx.activity.compose.LocalActivity
@@ -27,7 +31,18 @@ import androidx.compose.ui.unit.sp
 import com.example.bluehive.BlueHiveApplication
 import com.example.bluehive.R
 import com.example.bluehive.models.MediaItem
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+
+// ⬅️➡️ Hold-to-repeat navigation speed for the Recommended Media row: the minimum time
+// (ms) between focus moves while LEFT/RIGHT is HELD DOWN. HIGHER = SLOWER.
+private const val RECOMMENDED_NAV_REPEAT_MS = 105L
+
+// ⏱️ Title reveal timing — matched to the front-page TvWideLazyRow shelves. A card must hold
+// focus for TITLE_REVEAL_DELAY_MS, then its title fades in over TITLE_FADE_MS. Fast swiping
+// keeps the title at alpha 0 (no flicker); settling triggers the same relaxed fade as home.
+private const val TITLE_REVEAL_DELAY_MS = 800L
+private const val TITLE_FADE_MS = 700
 
 @Composable
 fun RecommendedMediaSection(
@@ -47,6 +62,9 @@ fun RecommendedMediaSection(
     }
 
     val listState = rememberLazyListState()
+    // Hold-to-repeat throttle timestamp for the row (see RECOMMENDED_NAV_REPEAT_MS).
+    // Plain 1-slot array (NOT observable state) so ticking it never triggers recomposition.
+    val recNavGate = remember { longArrayOf(0L) }
     val coroutineScope = rememberCoroutineScope()
     var focusedIndex by remember { mutableIntStateOf(-1) }
     var hasRowFocus by remember { mutableStateOf(false) }
@@ -138,7 +156,32 @@ fun RecommendedMediaSection(
                         items = recommendations,
                         key = { _, item -> item.tmdbId }
                     ) { index, mediaItem ->
-                        val isItemFocused = hasRowFocus && (focusedIndex == index)
+                        // Per-item focus state (LOCAL) so a nav step recomposes only the two
+                        // cards whose focus actually changed — not every visible card. Reading
+                        // the shared focusedIndex here made ALL cards (each an AsyncImage)
+                        // recompose on every keypress, which is the navigation lag.
+                        var isItemFocused by remember { mutableStateOf(false) }
+
+                        // Title reveal debounce + fade, matched to the front-page TvWideLazyRow
+                        // shelves: the title Box is always composed while focused but sits at
+                        // alpha 0 until the card has HELD focus for TITLE_REVEAL_DELAY_MS, then
+                        // fades in over TITLE_FADE_MS. Fast swiping never lets titleVisible reach
+                        // true, so alpha stays 0 — no flicker; settling triggers the relaxed fade.
+                        var titleVisible by remember { mutableStateOf(false) }
+                        val titleAlpha by animateFloatAsState(
+                            targetValue = if (titleVisible) 1f else 0f,
+                            animationSpec = tween(durationMillis = TITLE_FADE_MS),
+                            label = "recTitleAlpha"
+                        )
+                        LaunchedEffect(isItemFocused) {
+                            if (isItemFocused) {
+                                titleVisible = false
+                                delay(TITLE_REVEAL_DELAY_MS)
+                                titleVisible = true
+                            } else {
+                                titleVisible = false
+                            }
+                        }
 
                         val releaseDateText = remember(mediaItem.releaseDate) {
                             mediaItem.releaseDate
@@ -184,6 +227,10 @@ fun RecommendedMediaSection(
                                 modifier = baseCardModifier
                                     .focusRequester(focusRequesters[index])
                                     .onFocusChanged { focusState ->
+                                        // Drive the LOCAL focus flag (glow/size/title) from this
+                                        // card's own focus — this is what was missing and made the
+                                        // glow layer disappear (isItemFocused never went true).
+                                        isItemFocused = focusState.isFocused
                                         if (focusState.isFocused) {
                                             // 🔹 Only update state, no scroll here
                                             focusedIndex = index
@@ -193,18 +240,22 @@ fun RecommendedMediaSection(
                                         if (event.type == KeyEventType.KeyDown) {
                                             when (event.key) {
                                                 Key.DirectionLeft -> {
-                                                    if (focusedIndex > 0) {
-                                                        val targetIndex = focusedIndex - 1
-                                                        focusRequesters[targetIndex].requestFocus()
+                                                    // Throttle hold-to-repeat (see RECOMMENDED_NAV_REPEAT_MS); the
+                                                    // boundary guard keeps the sound off at the first card.
+                                                    val now = SystemClock.uptimeMillis()
+                                                    if (focusedIndex > 0 && now - recNavGate[0] >= RECOMMENDED_NAV_REPEAT_MS) {
+                                                        recNavGate[0] = now
+                                                        focusRequesters[focusedIndex - 1].requestFocus()
                                                         BlueHiveApplication.playTitleCardNavigation()
                                                     }
                                                     true
                                                 }
 
                                                 Key.DirectionRight -> {
-                                                    if (focusedIndex < recommendations.size - 1) {
-                                                        val targetIndex = focusedIndex + 1
-                                                        focusRequesters[targetIndex].requestFocus()
+                                                    val now = SystemClock.uptimeMillis()
+                                                    if (focusedIndex < recommendations.size - 1 && now - recNavGate[0] >= RECOMMENDED_NAV_REPEAT_MS) {
+                                                        recNavGate[0] = now
+                                                        focusRequesters[focusedIndex + 1].requestFocus()
                                                         BlueHiveApplication.playTitleCardNavigation()
                                                     }
                                                     true
@@ -245,7 +296,8 @@ fun RecommendedMediaSection(
                                     modifier = Modifier
                                         .width(145.dp)
                                         .height(50.dp)
-                                        .offset(y = (-2).dp),
+                                        .offset(y = (-2).dp)
+                                        .graphicsLayer { alpha = titleAlpha },
                                     contentAlignment = Alignment.TopCenter
                                 ) {
                                     Text(
