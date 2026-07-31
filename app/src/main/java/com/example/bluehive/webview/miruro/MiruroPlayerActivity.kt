@@ -33,6 +33,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.TrackSelectionOverride
@@ -43,6 +44,7 @@ import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import com.example.bluehive.api.AnimeFallbackRequest
 import com.example.bluehive.api.ApiClient
+import com.example.bluehive.webview.exoplayer_resources.ExoPlayerConfig
 import com.example.bluehive.api.WatchHistoryRequest
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -62,8 +64,9 @@ class MiruroPlayerActivity : ComponentActivity() {
 
     private val sCRAPE = "scraper"
 
-    // Channel up/down jump size for ExoPlayer seek (in ms).
-    private val SEEK_INCREMENT_MS = 10_000L
+    // Channel up/down jump size for ExoPlayer seek (in ms). Shared with every
+    // other site's player via ExoPlayerConfig so a skip feels identical.
+    private val SEEK_INCREMENT_MS = ExoPlayerConfig.SEEK_INCREMENT_MS
 
     private var player: ExoPlayer? = null
     private var playerView: PlayerView? = null
@@ -204,13 +207,6 @@ class MiruroPlayerActivity : ComponentActivity() {
         Log.d(sCRAPE, "▶️ playing extracted m3u8: $url (referer=$referer) " +
                 "fallback=${if (fallbackUrl != null) "available" else "none"}")
 
-        val okHttpClient = OkHttpClient.Builder()
-            .followRedirects(true)
-            .followSslRedirects(true)
-            .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
-            .build()
-
         val requestHeaders = mapOf(
             "User-Agent" to ua,
             "Referer" to referer,
@@ -220,34 +216,33 @@ class MiruroPlayerActivity : ComponentActivity() {
             "X-API-Key" to BuildConfig.API_KEY
         )
 
-        val httpFactory = OkHttpDataSource.Factory(okHttpClient)
-            .setUserAgent(ua)
-            .setDefaultRequestProperties(requestHeaders)
+        // Buffering / bitrate / networking come from the shared ExoPlayerConfig so
+        // every site's player behaves identically. Only requestHeaders above are
+        // Miruro-specific (its CDN pins Origin to miruro.tv).
+        val httpFactory = ExoPlayerConfig.dataSourceFactory(ua, requestHeaders)
 
-        fun buildMediaSource(playUrl: String): HlsMediaSource {
-            return HlsMediaSource.Factory(httpFactory)
-                .createMediaSource(MediaItem.fromUri(playUrl))
-        }
+        fun buildMediaSource(playUrl: String): HlsMediaSource =
+            ExoPlayerConfig.hlsMediaSource(playUrl, httpFactory)
 
         // Always grab the HIGHEST quality Miruro lists. HLS master playlists (e.g. the
         // wixmp 1080p/720p/480p one) default to ADAPTIVE selection — ExoPlayer starts
         // lower and ramps with bandwidth. Pin it to the top bitrate the device can
         // decode instead. Single-quality media playlists have nothing to choose, so
         // they're unaffected. This is playback-side only — zero impact on extraction.
-        val trackSelector = DefaultTrackSelector(this).apply {
-            setParameters(buildUponParameters().setForceHighestSupportedBitrate(true))
-        }
+        val trackSelector = ExoPlayerConfig.trackSelector(this)
         // Generous buffers so 1080p (~5.5 Mbps) relayed through the HLS proxy rides out
         // proxy/CDN hiccups without stalling. Mirrors VidApiPlayerActivity:
         // min 30s, max 120s, start after 2.5s, resume 10s after a rebuffer.
-        val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(30_000, 120_000, 2_500, 10_000)
-            .setPrioritizeTimeOverSizeThresholds(true)
-            .build()
-        player = ExoPlayer.Builder(this)
-            .setTrackSelector(trackSelector)
-            .setLoadControl(loadControl)
-            .build().apply {
+        player = ExoPlayerConfig.buildPlayer(this, trackSelector)
+            .apply {
+            // Diagnostic only: logs the rung actually selected + all rungs offered.
+            ExoPlayerConfig.attachVideoTrackLog(this, sCRAPE)
+            // Hold the display awake while playback is intended (incl. stalls).
+            ExoPlayerConfig.keepScreenOnWhilePlaying(this@MiruroPlayerActivity, this)
+            // Same diagnostics + deadlock recovery as HlsPlayerActivity: the
+            // wedge is in the box's display stack, so it is not site-specific.
+            ExoPlayerConfig.attachPlaybackLog(this, sCRAPE)
+            ExoPlayerConfig.attachStallWatchdog(this, lifecycleScope, sCRAPE)
             addListener(object : Player.Listener {
                 override fun onPlayerError(error: PlaybackException) {
                     Log.e(sCRAPE, "❌ ExoPlayer failed for url=$url", error)
@@ -316,6 +311,8 @@ class MiruroPlayerActivity : ComponentActivity() {
                             .inflate(R.layout.miruro_player_view, null) as PlayerView).apply {
                             playerView = this
                             this.player = this@MiruroPlayerActivity.player
+                            // 3s fade-out + blue focused scrubber (shared).
+                            ExoPlayerConfig.applyControllerPolicy(this)
                             // Quality button in the custom control bar opens the picker.
                             findViewById<View?>(R.id.quality_button)?.setOnClickListener {
                                 showQualityOverlay.value = true
@@ -441,13 +438,19 @@ class MiruroPlayerActivity : ComponentActivity() {
                 KeyEvent.KEYCODE_MEDIA_PAUSE -> if (isFireTv) {
                     player?.pause(); return true
                 }
-                // Fire TV only: the dedicated ⏪ / ⏩ transport keys do the same
-                // ±10s jump as the onn box's channel keys, straight on ExoPlayer
-                // with no on-screen scrubber. seekBy already clamps to [0, dur].
-                KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> if (isFireTv) {
+                // The dedicated ⏪ / ⏩ transport keys (Fire TV remote, and any other
+                // remote that sends them) do the same ±10s jump as the onn box's
+                // channel keys, straight on ExoPlayer with no on-screen scrubber.
+                // seekBy already clamps to [0, dur].
+                //
+                // NOT gated on isFireTv, unlike play/pause below: seeking is the
+                // only sane meaning for these keys on ANY remote, and gating it
+                // meant a Firestick whose feature-flag/manufacturer check missed
+                // would silently do nothing. Matches HlsPlayerActivity.
+                KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> {
                     seekBy(SEEK_INCREMENT_MS); return true
                 }
-                KeyEvent.KEYCODE_MEDIA_REWIND -> if (isFireTv) {
+                KeyEvent.KEYCODE_MEDIA_REWIND -> {
                     seekBy(-SEEK_INCREMENT_MS); return true
                 }
                 // Both remotes: the center dial is context-sensitive.
@@ -482,18 +485,26 @@ class MiruroPlayerActivity : ComponentActivity() {
             return if (centerWentToController) super.dispatchKeyEvent(event) else true
         }
 
+        // Swallow the matching ACTION_UP so PlayerView never sees these keys and
+        // the scrubber can't flash. Seek keys are ungated (see the DOWN handler);
+        // play/pause stays behind isFireTv to keep onn behaviour untouched.
         if (event.action == KeyEvent.ACTION_UP &&
             (event.keyCode == KeyEvent.KEYCODE_CHANNEL_UP ||
                     event.keyCode == KeyEvent.KEYCODE_CHANNEL_DOWN ||
+                    event.keyCode == KeyEvent.KEYCODE_MEDIA_FAST_FORWARD ||
+                    event.keyCode == KeyEvent.KEYCODE_MEDIA_REWIND ||
                     (isFireTv && (
                             event.keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE ||
                                     event.keyCode == KeyEvent.KEYCODE_MEDIA_PLAY ||
-                                    event.keyCode == KeyEvent.KEYCODE_MEDIA_PAUSE ||
-                                    event.keyCode == KeyEvent.KEYCODE_MEDIA_FAST_FORWARD ||
-                                    event.keyCode == KeyEvent.KEYCODE_MEDIA_REWIND)))
+                                    event.keyCode == KeyEvent.KEYCODE_MEDIA_PAUSE)))
         ) {
             return true
         }
+
+        // One direction press is enough to raise the controls (see the helper —
+        // the first press was being spent on Compose focus interop).
+        if (ExoPlayerConfig.raiseControllerOnDirectionKey(playerView, event)) return true
+
         return super.dispatchKeyEvent(event)
     }
 
@@ -503,11 +514,7 @@ class MiruroPlayerActivity : ComponentActivity() {
     // of doing nothing.
     private fun togglePlayPause() {
         val p = player ?: return
-        when {
-            p.playbackState == Player.STATE_ENDED -> { p.seekTo(0); p.play() }
-            p.playWhenReady -> p.pause()
-            else -> p.play()
-        }
+        ExoPlayerConfig.togglePlayPause(p)
         Log.d(sCRAPE, "⏯ transport key → playWhenReady=${player?.playWhenReady}")
     }
 

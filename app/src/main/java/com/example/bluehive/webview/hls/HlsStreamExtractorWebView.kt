@@ -1,6 +1,9 @@
-package com.example.bluehive.webview.vidapi
+package com.example.bluehive.webview.hls
 
 import android.annotation.SuppressLint
+import android.app.Activity
+import android.view.ViewGroup
+import android.widget.FrameLayout
 import android.content.Context
 import android.graphics.Bitmap
 import android.net.http.SslError
@@ -29,7 +32,7 @@ import java.io.ByteArrayInputStream
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * VidApiStreamExtractorWebView — headless m3u8 extractor for HLS embed pages.
+ * HlsStreamExtractorWebView — headless m3u8 extractor for HLS embed pages.
  *
  * Host-agnostic (currently drives the VidApi / vaplayer.ru embed; originally
  * written for cinesrc.st). Referer/Origin are derived from the captured m3u8's
@@ -48,13 +51,20 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * Every log uses tag "scraper-vidapi" — filter Logcat by `scraper-vidapi`.
  */
-class VidApiStreamExtractorWebView private constructor() {
+class HlsStreamExtractorWebView private constructor() {
 
     interface ExtractionListener {
         /** MAIN thread. master m3u8 + optional subtitle + headers ExoPlayer should send. */
         fun onM3u8Found(m3u8Url: String, subtitleUrl: String?, headers: Map<String, String>)
         /** MAIN thread. Failure or timeout, with a human-readable reason. */
         fun onExtractionFailed(reason: String)
+
+        /**
+         * The NETWORK refused the request — an ISP/router content filter, not a
+         * dead source. Defaults to [onExtractionFailed] so existing callers keep
+         * working; override to skip the retry, which cannot help here.
+         */
+        fun onExtractionBlocked(reason: String) = onExtractionFailed(reason)
         /** MAIN thread. Optional progress text. */
         fun onStatusUpdate(status: String) {}
     }
@@ -73,6 +83,62 @@ class VidApiStreamExtractorWebView private constructor() {
         private const val CLICK_INTERVAL     = 1_500L
         private const val MAX_CLICK_ATTEMPTS = 20         // more than Miruro — probing takes time
 
+        // ── Subtitle hunt (opt-in per call) ──────────────────────────────────
+        // VidFast attaches ~180 EMPTY TextTracks to the <video> up front (english,
+        // english 2, english 3, bengali, …) with cues=null, and there are no
+        // <track> elements at all. Nothing is fetched until a language is
+        // SELECTED — selecting is what makes the site GET its .vtt. Verified live
+        // in a browser console: the .vtt appears in the network log only after the
+        // click. So the only way to obtain it is to drive their menu.
+        //
+        // The CC button is found by its SVG icon geometry, NOT by class: the MUI
+        // class names are build hashes (three different buttons shared mui-79elbk,
+        // and the same button reported different classes in two page states),
+        // whereas the icon path only changes if they redraw the icon.
+        private const val CC_ICON_PATH_PREFIX = "M2 12C2 8.22876"
+        /**
+         * How long to wait for the .vtt before giving up and playing without it.
+         *
+         * Has to cover the injected script's own polling: the language list is NOT
+         * present 900ms after the CC click (measured on the box — 'no-english-entry'),
+         * so the script polls for ~7s with one menu-reopen halfway, and this budget
+         * has to outlast that plus the fetch. It is a worst case, not a typical
+         * cost — a successful hunt exits as soon as the .vtt is seen.
+         */
+        // ── Network-filter detection ─────────────────────────────────────────
+        //
+        // MEASURED 2026-07-31: VidFast stopped extracting entirely — the page
+        // reported "100% loaded" in 1.3s, made ONE request, and never produced a
+        // <video>, so every run burned the full 60s timeout twice and reported a
+        // generic "source failed". It wasn't the source. Spectrum's CUJO filter
+        // had started blocking the domain:
+        //
+        //   $ curl -I http://vidfast.vc/tv/60625/5/2
+        //   HTTP/1.1 302 Found
+        //   Location: https://block.charter-prod.hosted.cujo.io/warn.html?url=...
+        //
+        // Over HTTPS the filter can't redirect, so it kills the TLS handshake
+        // instead — which is why the WebView just got nothing. Detecting this
+        // turns two minutes of silence into an instant, accurate message.
+        /** Hosts an ISP/router filter redirects to when it blocks a domain. */
+        private val BLOCK_PAGE_HOSTS = listOf(
+            "cujo.io",             // Charter / Spectrum "Security Shield" (confirmed)
+            "blockpage",
+            "blocked.",
+            "block.",
+            "warn.html",
+        )
+        /** Main-frame failures that mean "the connection was refused/severed". */
+        private val NETWORK_BLOCK_ERROR_CODES = setOf(
+            WebViewClient.ERROR_FAILED_SSL_HANDSHAKE,
+            WebViewClient.ERROR_CONNECT,
+            WebViewClient.ERROR_HOST_LOOKUP,
+            WebViewClient.ERROR_PROXY_AUTHENTICATION,
+        )
+
+        private const val SUBTITLE_HUNT_MS = 9_000L
+        private const val SUBTITLE_POLL_MS = 400L
+
         private const val FALLBACK_ORIGIN  = "https://cinesrc.st"  // ultimate fallback origin only
         private const val CHROME_USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -81,7 +147,18 @@ class VidApiStreamExtractorWebView private constructor() {
         /** Process-wide single-flight guard. Plain boolean — holds no Context. */
         @Volatile private var busy = false
 
-        fun extract(context: Context, url: String, listener: ExtractionListener) {
+        /**
+         * @param huntSubtitles after the m3u8 is captured, drive the site's CC menu
+         *   so it fetches its English .vtt, and return that too. Costs up to
+         *   SUBTITLE_HUNT_MS extra before the player opens, so it's opt-in — only
+         *   callers whose site actually works this way (VidFast) pass true.
+         */
+        fun extract(
+            context: Context,
+            url: String,
+            listener: ExtractionListener,
+            huntSubtitles: Boolean = false,
+        ) {
             if (busy) {
                 Log.w(TAG, "⚠️ extraction already running — ignoring duplicate call")
                 listener.onExtractionFailed("Extraction already in progress")
@@ -89,7 +166,7 @@ class VidApiStreamExtractorWebView private constructor() {
             }
             busy = true
             try {
-                VidApiStreamExtractorWebView().start(context.applicationContext, url, listener)
+                HlsStreamExtractorWebView().start(context, url, listener, huntSubtitles)
             } catch (e: Exception) {
                 Log.e(TAG, "❌ start() threw before extraction began", e)
                 busy = false
@@ -112,8 +189,29 @@ class VidApiStreamExtractorWebView private constructor() {
     private var startTimeMs = 0L
     @Volatile private var active = false
     @Volatile private var subtitleUrl: String? = null   // best-effort, captured if seen pre-delivery
+    // Final document URL when the m3u8 was captured - the real Referer the page used.
+    @Volatile private var lastPageUrl: String? = null
+    /** Set once a network filter is identified — see [reportNetworkBlock]. */
+    @Volatile private var networkBlocked = false
+    /** Set by the caller; see extract(huntSubtitles). */
+    private var huntSubtitles = false
+    /** Non-null only while the WebView is attached to a real window (hunt mode). */
+    private var hostActivity: Activity? = null
 
-    private fun start(appContext: Context, url: String, listener: ExtractionListener) {
+    /**
+     * @param context the CALLER's context. When [huntSubtitles] is on and this is an
+     *   Activity, the WebView is attached to its window (invisibly) - see
+     *   createWebView for why that is required.
+     */
+    private fun start(
+        context: Context,
+        url: String,
+        listener: ExtractionListener,
+        huntSubtitles: Boolean = false,
+    ) {
+        this.huntSubtitles = huntSubtitles
+        this.hostActivity = context as? Activity
+        val appContext = context.applicationContext
         this.listener = listener
         active = true
         startTimeMs = System.currentTimeMillis()
@@ -132,8 +230,37 @@ class VidApiStreamExtractorWebView private constructor() {
 
     @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
     private fun createWebView(appContext: Context, url: String) {
-        val wv = WebView(appContext)
+        // Attach to a real window when hunting subtitles.
+        //
+        // Normally this WebView is never added to any view hierarchy - it is driven
+        // purely through loadUrl + JS. hls.js, fetch/XHR and video decoding don't
+        // care, which is why plain extraction works detached. But a detached WebView
+        // has a 0x0 layout viewport and gets no animation frames, and MUI opens its
+        // Subtitles dialog through a transition that positions against the anchor's
+        // bounding rect and completes on rAF. With zero-size rects and no frames the
+        // dialog never mounts - which is exactly the '0 menu items' we measured.
+        //
+        // So in hunt mode we host it in the caller Activity's window at full size but
+        // fully transparent: real layout, real frames, nothing visible. Removed again
+        // in cleanup(). The normal (non-hunt) path is untouched and stays detached.
+        val host = hostActivity.takeIf { huntSubtitles }
+        val wv = WebView(host ?: appContext)
         webView = wv
+        if (host != null) {
+            try {
+                wv.alpha = 0f
+                host.addContentView(
+                    wv,
+                    FrameLayout.LayoutParams(
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+                    ),
+                )
+                Log.d(TAG, "🧷 WebView attached to host window (invisible) for subtitle hunt")
+            } catch (e: Exception) {
+                Log.w(TAG, "⚠️ could not attach WebView (${e.message}) - hunt will likely fail")
+            }
+        }
 
         if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true)
 
@@ -193,11 +320,26 @@ class VidApiStreamExtractorWebView private constructor() {
 
         override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
             Log.d(TAG, "▶️ page STARTED: ${truncate(url)} [${elapsed()}ms]")
+            if (url != null && isBlockPageUrl(url)) {
+                reportNetworkBlock(hostOf(lastPageUrl) ?: "the source", "redirected to $url")
+                return
+            }
+            // Remember where we ended up (the embed redirects); its ORIGIN is the
+            // Referer the extracted CDN validates against - see deliver().
+            if (url != null) lastPageUrl = url
         }
 
         override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
-            if (request?.isForMainFrame == true)
-                Log.e(TAG, "❌ MAIN-FRAME error ${error?.errorCode} ${error?.description} @ ${request.url}")
+            if (request?.isForMainFrame != true) return
+            Log.e(TAG, "❌ MAIN-FRAME error ${error?.errorCode} ${error?.description} @ ${request.url}")
+            // The page itself couldn't be reached at all. On this box that has
+            // meant a filter sitting in front of the connection, not a dead site.
+            if (error?.errorCode in NETWORK_BLOCK_ERROR_CODES) {
+                reportNetworkBlock(
+                    request.url?.host ?: "the source",
+                    "main-frame ${error?.errorCode} ${error?.description}"
+                )
+            }
         }
 
         override fun onReceivedHttpError(view: WebView?, request: WebResourceRequest?, errorResponse: WebResourceResponse?) {
@@ -242,6 +384,13 @@ class VidApiStreamExtractorWebView private constructor() {
         override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
             Log.w(TAG, "⚠️ SSL error on ${error?.url} — cancelling")
             handler?.cancel()
+            // Only the PAGE's own host counts. Ad and beacon domains throw SSL
+            // errors constantly during runs that go on to succeed, so treating
+            // any of them as a block would abort perfectly good extractions.
+            val badHost = hostOf(error?.url)
+            if (badHost != null && badHost == hostOf(lastPageUrl)) {
+                reportNetworkBlock(badHost, "TLS handshake refused for the page itself")
+            }
         }
     }
 
@@ -356,6 +505,10 @@ class VidApiStreamExtractorWebView private constructor() {
             Log.d(TAG, "🎯 m3u8 seen via JS hook: $url")
             handler.post { deliver(url, originHeaders(url), "js-hook") }
         }
+        /** Progress/diagnostics from the subtitle hunt's injected script. */
+        @Keep @JavascriptInterface
+        fun onHunt(msg: String) { Log.d(TAG, "💬 hunt: $msg") }
+
         @Keep @JavascriptInterface
         fun onSubtitle(url: String) {
             if (subtitleUrl == null) {
@@ -368,22 +521,182 @@ class VidApiStreamExtractorWebView private constructor() {
     private fun deliver(url: String, headers: Map<String, String>, via: String) {
         if (!isM3u8Url(url)) return
         if (!delivered.compareAndSet(false, true)) return
+        // Attach the document URL under a private pseudo-header. Additive: callers
+        // that don't look for it (VidApi) are unaffected; VidFast reads it to use
+        // the page-origin referer its CDN actually validates against.
+        val outHeaders = headers.toMutableMap()
+        lastPageUrl?.let { outHeaders["X-Page-Url"] = it }
         Log.d(TAG, "════════════ M3U8 CAPTURED ($via) ════════════")
         Log.d(TAG, "  url      : $url")
-        Log.d(TAG, "  referer  : ${headers["Referer"]}")
+        Log.d(TAG, "  referer  : ${outHeaders["Referer"]}")
+        Log.d(TAG, "  pageUrl  : ${lastPageUrl ?: "unknown"}")
         Log.d(TAG, "  subtitle : ${subtitleUrl ?: "none"}")
         Log.d(TAG, "  elapsed  : ${elapsed()}ms after $clickAttempts play attempts")
+        // Hold the WebView open just long enough to make the site fetch its
+        // subtitles, then finish. Skipped entirely when not requested, or when a
+        // .vtt already flew past on its own.
+        if (huntSubtitles && subtitleUrl == null) {
+            handler.post { runSubtitleHunt { finishDelivery(url, outHeaders) } }
+        } else {
+            handler.post { finishDelivery(url, outHeaders) }
+        }
+    }
+
+    /** Hand the stream (and subtitle, if we got one) to the caller and tear down. */
+    private fun finishDelivery(url: String, outHeaders: Map<String, String>) {
         val sub = subtitleUrl
-        handler.post {
+        try {
+            listener?.onStatusUpdate("Stream found — starting player…")
+            listener?.onM3u8Found(url, sub, outHeaders)
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ onM3u8Found threw — cleaning up anyway", e)
+        } finally {
+            cleanup()
+        }
+    }
+
+    /**
+     * Click the site's CC button, then its first "english" entry, and wait for the
+     * resulting .vtt request to be seen by the interceptor / JS hook.
+     *
+     * Bounded by SUBTITLE_HUNT_MS and ALWAYS calls [onDone] — a missing subtitle
+     * must never cost the user their episode, so every failure path here just
+     * shrugs and plays the stream.
+     */
+    private fun runSubtitleHunt(onDone: () -> Unit) {
+        val view = webView
+        if (view == null) { onDone(); return }
+        Log.d(TAG, "💬 subtitle hunt: opening CC menu…")
+        listener?.onStatusUpdate("Fetching subtitles…")
+
+        val js = """
+        (function(){
+          try {
+            // SILENCE THE PAGE FIRST. The extractor nudges the site's <video> into
+            // playing to force the stream out, and that audio goes to the speakers.
+            // It used to be inaudible because the WebView was destroyed the instant
+            // the m3u8 was captured; holding it open for the hunt made the show
+            // start playing "in the background" before the real player opened.
+            Array.prototype.slice.call(document.querySelectorAll('video,audio'))
+              .forEach(function(m){ try { m.muted = true; m.volume = 0; } catch(e){} });
+
+            // FORCE A DESKTOP-WIDTH VIEWPORT.
+            //
+            // Measured: the attached WebView lays out at 960 CSS px and showed 14
+            // control buttons, where the same page on a laptop shows 16 and puts CC
+            // at a different index. VidFast is responsive, so at 960 we are getting a
+            // NARROWER layout than the one whose subtitle dialog we know exists.
+            // useWideViewPort is already on, but the page ships
+            // <meta name="viewport" content="width=device-width">, which wins — so
+            // rewrite that meta and let Blink re-lay-out. MUI reads breakpoints via
+            // matchMedia, so the resize is what makes it re-render at the wide layout.
+            var oldW = window.innerWidth;
             try {
-                listener?.onStatusUpdate("Stream found — starting player…")
-                listener?.onM3u8Found(url, sub, headers)
-            } catch (e: Exception) {
-                Log.e(TAG, "❌ onM3u8Found threw — cleaning up anyway", e)
-            } finally {
-                cleanup()
+              var mv = document.querySelector('meta[name=viewport]');
+              if (!mv) {
+                mv = document.createElement('meta');
+                mv.setAttribute('name', 'viewport');
+                document.head.appendChild(mv);
+              }
+              mv.setAttribute('content', 'width=1920, initial-scale=1');
+              window.dispatchEvent(new Event('resize'));
+            } catch (e) {
+              VidApiBridge.onHunt('viewport override failed: ' + e.message);
+            }
+
+            var rafFired = false;
+            requestAnimationFrame(function(){ rafFired = true; });
+            setTimeout(function(){
+              try {
+                VidApiBridge.onHunt('env: ' + oldW + ' -> ' + window.innerWidth + 'x' + window.innerHeight +
+                  ' raf=' + rafFired +
+                  ' modals=' + document.querySelectorAll('[class*="MuiModal-root"],[role="dialog"],[role="menu"]').length +
+                  ' bodyLen=' + document.body.innerHTML.length);
+              } catch(e) {}
+            }, 1200);
+
+            // Give React a beat to re-render at the new breakpoint before we go
+            // looking for controls — the button set itself changes with the layout.
+            setTimeout(function(){ go(); }, 1000);
+            function go(){
+            var btns = Array.prototype.slice.call(document.querySelectorAll('button'));
+            var cc = null;
+            for (var i = 0; i < btns.length; i++) {
+              var p = btns[i].querySelector('svg path');
+              var d = p ? (p.getAttribute('d') || '') : '';
+              if (d.indexOf('$CC_ICON_PATH_PREFIX') === 0) { cc = btns[i]; break; }
+            }
+            if (!cc) { VidApiBridge.onHunt('no-cc-button (' + btns.length + ' buttons)'); return; }
+            var beforeLen = document.body.innerHTML.length;
+            VidApiBridge.onHunt('cc found at index ' + btns.indexOf(cc) + ' of ' + btns.length);
+            cc.click();
+            setTimeout(function(){
+              try {
+                VidApiBridge.onHunt('after-click: bodyLen ' + beforeLen + ' -> ' +
+                  document.body.innerHTML.length + ', dialogs=' +
+                  document.querySelectorAll('[class*="MuiDialog-root"],[class*="MuiModal-root"]').length);
+              } catch(e) {}
+            }, 1200);
+
+            // The language list is populated asynchronously — on a slow box it is
+            // NOT there 900ms after the click (measured: 'no-english-entry'). Poll
+            // instead of guessing, and if it never shows, report what the menu DID
+            // contain so the failure is diagnosable from logcat alone.
+            var items = function(){
+              return Array.prototype.slice
+                .call(document.querySelectorAll('[class*="MuiMenuItem-root"]'))
+                .filter(function(e){ return /^english$/i.test((e.textContent || '').trim()); });
+            };
+            var snapshot = function(){
+              var all = Array.prototype.slice
+                .call(document.querySelectorAll('[class*="MuiMenuItem-root"]'));
+              if (!all.length) return '0 menu items';
+              return all.length + ' items: ' + all.slice(0, 12).map(function(e){
+                return (e.textContent || '').trim().slice(0, 14);
+              }).join(',');
+            };
+            var tries = 0;
+            var iv = null;
+            function tick(){
+              tries++;
+              var found = items();
+              if (found.length) {
+                clearInterval(iv);
+                found[0].click();
+                VidApiBridge.onHunt('clicked english (1 of ' + found.length + ') after ' + (tries * 400) + 'ms');
+                return;
+              }
+              if (tries === 2)  VidApiBridge.onHunt('waiting… ' + snapshot());
+              // Halfway: the menu may have closed itself — reopen once.
+              if (tries === 9 && !window.__ccReopened) { window.__ccReopened = true; cc.click(); }
+              if (tries >= 18) { clearInterval(iv); VidApiBridge.onHunt('gave up — ' + snapshot()); }
+            }
+            iv = setInterval(tick, 400);
+            }
+          } catch (e) {
+            try { VidApiBridge.onHunt('err: ' + e.message); } catch (_) {}
+          }
+        })();
+        """.trimIndent()
+        view.evaluateJavascript(js, null)
+
+        // Poll until the interceptor / JS hook records the .vtt, or we run out of
+        // patience. subtitleUrl is written from both paths and is @Volatile.
+        val deadline = System.currentTimeMillis() + SUBTITLE_HUNT_MS
+        val poll = object : Runnable {
+            override fun run() {
+                if (subtitleUrl != null) {
+                    Log.d(TAG, "💬 subtitle hunt: got it — ${truncate(subtitleUrl)}")
+                    onDone(); return
+                }
+                if (System.currentTimeMillis() >= deadline) {
+                    Log.w(TAG, "💬 subtitle hunt: nothing after ${SUBTITLE_HUNT_MS}ms — playing without")
+                    onDone(); return
+                }
+                handler.postDelayed(this, SUBTITLE_POLL_MS)
             }
         }
+        handler.postDelayed(poll, SUBTITLE_POLL_MS)
     }
 
     private fun buildHeaders(request: WebResourceRequest): Map<String, String> {
@@ -460,6 +773,34 @@ class VidApiStreamExtractorWebView private constructor() {
     private fun truncate(url: String?, max: Int = 200): String =
         if (url == null) "null" else if (url.length > max) url.take(max) + "…" else url
 
+    // ── Network-filter detection (see BLOCK_PAGE_HOSTS) ──────────────────────
+
+    private fun hostOf(url: String?): String? =
+        url?.let { runCatching { android.net.Uri.parse(it).host }.getOrNull() }
+
+    private fun isBlockPageUrl(url: String): Boolean =
+        BLOCK_PAGE_HOSTS.any { url.contains(it, ignoreCase = true) }
+
+    /**
+     * Give up NOW and say why. Retrying is pointless — a filter blocks every
+     * attempt identically, so the old behaviour was two full 60s timeouts and a
+     * message that blamed the source.
+     */
+    private fun reportNetworkBlock(host: String, how: String) {
+        if (!active || delivered.get() || networkBlocked) return
+        networkBlocked = true
+        Log.e(TAG, "🚧 BLOCKED BY NETWORK: $host ($how)")
+        handler.post {
+            listener?.onStatusUpdate("Blocked by your network")
+            listener?.onExtractionBlocked(
+                "Your network is blocking $host.\n" +
+                    "This is a filter on your internet connection (router or ISP), " +
+                    "not a problem with BlueHive or the source."
+            )
+            cleanup()
+        }
+    }
+
     private fun failAndCleanup(reason: String) {
         handler.post {
             listener?.onStatusUpdate("Extraction failed")
@@ -483,12 +824,17 @@ class VidApiStreamExtractorWebView private constructor() {
                 webView?.apply {
                     stopLoading(); loadUrl("about:blank"); clearHistory(); clearCache(true)
                     removeJavascriptInterface("VidApiBridge"); webChromeClient = null
+                    // Detach before destroy() when hunt mode parented us to the host
+                    // Activity — destroying a still-attached WebView leaves a dead
+                    // view in that window's hierarchy.
+                    (parent as? ViewGroup)?.removeView(this)
                     removeAllViews(); destroy()
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "⚠️ cleanup error: ${e.message}")
             } finally {
                 webView = null; listener = null; timeoutRunnable = null; clickRunnable = null
+                hostActivity = null
                 busy = false
                 Log.d(TAG, "✅ extractor cleaned up")
             }

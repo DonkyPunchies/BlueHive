@@ -8,6 +8,7 @@ import android.os.Process
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
+import com.example.bluehive.webview.hls.HlsStreamExtractorWebView
 
 /**
  * Transparent, content-less host for the VidApi (embed) extraction. Runs in its
@@ -55,10 +56,10 @@ class VidApiExtractorActivity : ComponentActivity() {
             }
         })
 
-        VidApiStreamExtractorWebView.extract(
+        HlsStreamExtractorWebView.extract(
             context = this,
             url = url,
-            listener = object : VidApiStreamExtractorWebView.ExtractionListener {
+            listener = object : HlsStreamExtractorWebView.ExtractionListener {
                 override fun onStatusUpdate(status: String) { Log.d(TAG, "status: $status") }
 
                 override fun onM3u8Found(m3u8Url: String, subtitleUrl: String?, headers: Map<String, String>) {

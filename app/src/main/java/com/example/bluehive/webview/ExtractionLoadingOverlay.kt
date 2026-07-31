@@ -62,8 +62,18 @@ object BeeLogo {
     }
 }
 
+/**
+ * @param status the live, per-milestone line ("Finding the best server…").
+ * @param note   a persistent second line for something the user should know that
+ *               ISN'T a milestone — currently the retry banner. It has to be its
+ *               own parameter rather than part of [status]: the extractor
+ *               broadcasts a new status every few seconds, so a retry message
+ *               folded into that string would be overwritten and vanish a moment
+ *               after appearing. Rendered in amber so it reads as a warning
+ *               rather than progress.
+ */
 @Composable
-fun ExtractionLoadingOverlay(status: String, stage: Int) {
+fun ExtractionLoadingOverlay(status: String, stage: Int, note: String? = null) {
     val inf = rememberInfiniteTransition(label = "loader")
 
     // These are read ONLY inside graphicsLayer{}/draw lambdas below — i.e. in the
@@ -288,6 +298,27 @@ fun ExtractionLoadingOverlay(status: String, stage: Int) {
                     letterSpacing = 0.3.sp,
                     modifier      = Modifier.widthIn(max = 300.dp)
                 )
+            }
+
+            // Persistent warning line (retry banner). Fades in and then STAYS,
+            // independent of the status line churning above it.
+            if (note != null) {
+                Spacer(Modifier.height(10.dp))
+                AnimatedContent(
+                    targetState = note,
+                    transitionSpec = { fadeIn(tween(300)) togetherWith fadeOut(tween(200)) },
+                    label = "note"
+                ) { n ->
+                    Text(
+                        n,
+                        color         = Color(0xFFFFB74D).copy(0.95f),
+                        fontSize      = 13.sp,
+                        fontWeight    = FontWeight.Normal,
+                        textAlign     = TextAlign.Center,
+                        letterSpacing = 0.3.sp,
+                        modifier      = Modifier.widthIn(max = 300.dp)
+                    )
+                }
             }
 
             Spacer(Modifier.height(26.dp))

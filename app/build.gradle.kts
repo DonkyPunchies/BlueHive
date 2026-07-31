@@ -347,6 +347,8 @@ dependencies {
     // ═══════════════════════════════════════════════════════════
     implementation(libs.okhttp)
     implementation(libs.okhttp.logging.interceptor)
+    // DNS-over-HTTPS for stream fetches — see ExoPlayerConfig.okHttpClient().
+    implementation(libs.okhttp.dnsoverhttps)
     implementation(libs.retrofit)
     implementation(libs.converter.gson)
 

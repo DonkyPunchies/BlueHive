@@ -103,6 +103,9 @@ import com.example.bluehive.api.WatchHistoryRequest
 import com.example.bluehive.webview.BeeLogo
 import com.example.bluehive.webview.ExtractionLoadingOverlay
 import com.example.bluehive.webview.miruro.MiruroPlayerActivity
+import com.example.bluehive.webview.hls.HlsExtract
+import com.example.bluehive.webview.hls.HlsPlayerActivity
+import com.example.bluehive.webview.vidfast.VidFastExtractorActivity
 import com.example.bluehive.webview.miruro.MiruroExtractorActivity
 import android.app.Activity
 import androidx.activity.compose.BackHandler
@@ -118,6 +121,23 @@ import kotlinx.coroutines.withContext
 // between focus moves while LEFT/RIGHT is HELD DOWN. HIGHER = SLOWER. (Continue Watching
 // uses CW_NAV_REPEAT_MS = 70L; episode tiles are chunkier, so this starts a touch slower.)
 private const val EPISODE_NAV_REPEAT_MS = 140L
+
+/**
+ * How many times to attempt VidFast m3u8 extraction before giving up and handing
+ * off to the GeckoView embed.
+ *
+ * WHY A RETRY EXISTS: VidFast is genuinely flaky, not reliably broken. A measured
+ * case — extraction hit the 60s timeout with no master.m3u8, and the SAME episode
+ * extracted fine 40s later in 39s. Without a retry that user paid a full minute of
+ * loading and then got dropped into GeckoView: a whole browser engine resident for
+ * the entire episode, which is the thing this extractor exists to avoid (it's what
+ * OOM-killed the 2 GB box). One free retry converts most of those into a play.
+ *
+ * Cost of the bad case is one more extraction window (~60s worst case), which is
+ * why this is 2 and not 3. Raising it also changes the retry banner's wording —
+ * see where vidFastNote is built.
+ */
+private const val VIDFAST_MAX_ATTEMPTS = 2
 
 class TVShowsDetailsScreenCompose: ComponentActivity() {
 
@@ -840,6 +860,57 @@ fun TVShowsDetailsScreenContent(
     var extractPending by remember { mutableStateOf(false) }
     var showNoDub      by remember { mutableStateOf(false) }
 
+    // ── VidFast: ExoPlayer-vs-Gecko choice + extraction ─────────────────────────
+    // Picking VidFast opens a two-button choice instead of playing immediately:
+    //   • ExoPlayer → headless m3u8 extraction, then our own player. Light: the
+    //     WebView lives ~35s in a killable process instead of GeckoView staying
+    //     resident for the whole episode.
+    //   • Gecko     → the embed, exactly as before. Always works.
+    // A failed extraction silently falls back to Gecko, so a site change degrades
+    // playback rather than breaking it.
+    var vidFastChoiceFor by remember { mutableStateOf<TVShowsDetailsScreenCompose.StreamingSource?>(null) }
+    var isVidFastExtract by remember { mutableStateOf(false) }
+    // REAL status text from the extractor process (empty = use the anime flow's
+    // stage labels). This is what makes the overlay honest — see the receiver below.
+    var vidFastStatus    by remember { mutableStateOf("") }
+    var vidFastFallback  by remember { mutableStateOf<TVShowsDetailsScreenCompose.StreamingSource?>(null) }
+
+    // ── Extraction retry (see VIDFAST_MAX_ATTEMPTS) ──────────────────────────
+    // Which attempt is in flight (1 = first, 2 = retry).
+    var vidFastAttempt by remember { mutableIntStateOf(0) }
+    // Persistent amber line on the loading overlay. Separate from vidFastStatus
+    // because that gets overwritten by the extractor's next milestone broadcast.
+    var vidFastNote    by remember { mutableStateOf<String?>(null) }
+    /** Non-null shows ExtractionErrorOverlay — a failure the user can act on. */
+    var extractionError by remember { mutableStateOf<String?>(null) }
+    // State hop for the relaunch. The result handler CAN'T relaunch its own
+    // launcher — inside its own lambda the val isn't initialised yet — so it posts
+    // the URL here and a LaunchedEffect declared after the launcher does the
+    // launch. Same trick as failoverRequest below.
+    var vidFastRetryUrl by remember { mutableStateOf<String?>(null) }
+
+    // The extractor runs in :vidfastextractor, so its progress can't be observed
+    // directly — it broadcasts each real milestone and we mirror it onto the
+    // overlay. No timers: a dot only advances when the extractor actually moved on.
+    val extractCtx = LocalContext.current
+    DisposableEffect(Unit) {
+        val receiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(c: android.content.Context?, i: Intent?) {
+                val s = i?.getStringExtra(VidFastExtractorActivity.EXTRA_STATUS) ?: return
+                vidFastStatus = s
+                extractStage  = i.getIntExtra(VidFastExtractorActivity.EXTRA_STAGE, extractStage)
+                Log.d("scraper-vidfast", "progress → $s (stage $extractStage)")
+            }
+        }
+        androidx.core.content.ContextCompat.registerReceiver(
+            extractCtx, receiver,
+            android.content.IntentFilter(VidFastExtractorActivity.ACTION_PROGRESS),
+            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        onDispose { runCatching { extractCtx.unregisterReceiver(receiver) } }
+    }
+
+
     var showDefaultPrompt by remember { mutableStateOf(false) }
     var isCheckingServers by remember { mutableStateOf(false) }
     var showServerPicker  by remember { mutableStateOf(false) }
@@ -856,6 +927,176 @@ fun TVShowsDetailsScreenContent(
     var serverOptions      by remember { mutableStateOf<List<ServerOption>>(emptyList()) }
     var serverDefaultIdx   by remember { mutableIntStateOf(0) }
     var lastStreamFocusRequester by remember { mutableStateOf<FocusRequester?>(null) }
+
+    // THE RULE: back out of a player and focus returns to the streaming button that
+    // launched it, never the Favorites button at the top. Every streaming button's
+    // onClick sets lastStreamFocusRequester; this restores it on resume.
+    //
+    // Second anchor: the VidFast flow closes the episode overlay before launching,
+    // so that button is gone on return — fall back to its episode tile, which is
+    // one OK press from the same buttons (and nowhere near the header).
+    //
+    // Yields entirely while the error overlay is up. That overlay appears on the
+    // SAME resume this restoration fires on — the extractor activity closing is
+    // what triggers both — so the two raced and this one won, dragging focus out
+    // of the modal and back onto the details screen behind it.
+    RestoreFocusOnPlayerReturn("TVDetailsFocus") {
+        if (extractionError != null) return@RestoreFocusOnPlayerReturn emptyList()
+        lastStreamFocusRequester?.let { streamButton ->
+            listOfNotNull(
+                streamButton,
+                episodeFocusRequesters.getOrNull(lastFocusedEpisodeIndex),
+            )
+        } ?: emptyList()
+    }
+
+    val vidFastExtractorLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        isExtracting     = false
+        isVidFastExtract = false
+        extractPending   = false
+        vidFastStatus    = ""
+
+        val fallbackSrc = vidFastFallback
+        val data = result.data
+        val m3u8 = data?.getStringExtra(VidFastExtractorActivity.RESULT_M3U8)
+
+        if (result.resultCode == Activity.RESULT_OK && !m3u8.isNullOrBlank()) {
+            val ua = data.getStringExtra(VidFastExtractorActivity.RESULT_UA)
+            // VidFast's CDN validates the Referer against the EMBED PAGE origin
+            // (https://vidfast.vc/), not the m3u8's own host. The extractor's
+            // default self-referer (the CDN host) gets a 403 — the exact failure
+            // seen on first test: extraction succeeded, playback CDN-errored, and
+            // re-extraction with fresh tokens failed identically (headers, not
+            // tokens). Prefer the captured page origin; fall back to the self-
+            // referer only if the page URL is somehow missing.
+            val pageUrl = data.getStringExtra(VidFastExtractorActivity.RESULT_PAGE_URL)
+            val referer = pageUrl?.let {
+                runCatching {
+                    val u = android.net.Uri.parse(it)
+                    if (u.scheme != null && u.host != null) "${u.scheme}://${u.host}/" else null
+                }.getOrNull()
+            } ?: data.getStringExtra(VidFastExtractorActivity.RESULT_REFERER)
+            Log.d("scraper-vidfast", "▶️ playing extracted stream in ExoPlayer (referer=$referer, page=$pageUrl)")
+            // HlsPlayerActivity is the generic HLS player (headers, quality
+            // picker, on-demand captions). It logs watch history itself on
+            // confirmed playback — see its onIsPlayingChanged.
+            context.startActivity(
+                Intent(context, HlsPlayerActivity::class.java)
+                    .putExtra("M3U8_URL", m3u8)
+                    .putExtra("REFERER", referer)
+                    .putExtra("UA", ua)
+                    .putExtra("TMDB_ID", tmdbId)
+                    // Lets the player re-extract a fresh stream if the CDN token
+                    // dies mid-episode. Without it the player logs "cannot
+                    // re-extract" and just stops. Safe to point at the VidFast
+                    // embed — the probe confirmed this extractor handles it.
+                    .putExtra("EMBED_URL", fallbackSrc?.url)
+                    // Which extractor to re-run on a mid-play CDN failure. The
+                    // player is source-agnostic, so the caller names it.
+                    .putExtra(HlsExtract.EXTRA_EXTRACTOR_CLASS,
+                              VidFastExtractorActivity::class.java.name)
+                    .putExtra("PROFILE_ID",     favoriteProfileId)
+                    .putExtra("MEDIA_TYPE",     mediaType)
+                    .putExtra("MEDIA_TITLE",    mediaTitle)
+                    .putExtra("SEASON_NUMBER",  pendingSeason)
+                    .putExtra("EPISODE_NUMBER", pendingEpisode)
+                    .putExtra("EPISODE_NAME",   pendingEpisodeName)
+                    .putExtra("SOURCE_NAME",    "VidFast")
+                    // The site's own English caption, captured by the extractor's
+                    // subtitle hunt. Null when the hunt found nothing — the player
+                    // then falls back to OpenSubtitles as before.
+                    .putExtra("SUBTITLE_URL",
+                              data.getStringExtra(VidFastExtractorActivity.RESULT_SUBTITLE))
+            )
+        } else {
+            val failed = data?.getBooleanExtra(VidFastExtractorActivity.RESULT_FAILED, false) == true
+            val reason = data?.getStringExtra(VidFastExtractorActivity.RESULT_REASON)
+            // A network filter blocks every attempt identically, so retrying just
+            // costs another 60s timeout and ends with the same generic message.
+            // Say what actually happened instead.
+            val blocked = data?.getBooleanExtra(VidFastExtractorActivity.RESULT_BLOCKED, false) == true
+            val genuineFailure =
+                failed || (result.resultCode == Activity.RESULT_OK && m3u8.isNullOrBlank())
+            val retryUrl = fallbackSrc?.url
+
+            if (blocked) {
+                Log.e("scraper-vidfast", "🚧 blocked by network — not retrying: $reason")
+                extractionError = reason
+                    ?: "Your network is blocking this source."
+                vidFastFallback = null
+                vidFastAttempt  = 0
+                vidFastNote     = null
+                return@rememberLauncherForActivityResult
+            }
+
+            if (genuineFailure && vidFastAttempt < VIDFAST_MAX_ATTEMPTS && retryUrl != null) {
+                // ── Retry, don't fall back yet ───────────────────────────────
+                vidFastAttempt += 1
+                Log.w("scraper-vidfast",
+                      "⚠️ extraction failed (${reason ?: "no m3u8"}) — " +
+                          "retry $vidFastAttempt/$VIDFAST_MAX_ATTEMPTS")
+                vidFastNote = if (vidFastAttempt == 2) {
+                    "Failure on first extraction — attempting retry 2/$VIDFAST_MAX_ATTEMPTS"
+                } else {
+                    "Failure on attempt ${vidFastAttempt - 1} — " +
+                        "attempting retry $vidFastAttempt/$VIDFAST_MAX_ATTEMPTS"
+                }
+                // Keep the overlay up and rewind it to stage 1 — the attempt above
+                // cleared these, and the user should see one continuous load, not a
+                // flash back to the details screen and a second overlay.
+                isExtracting     = true
+                isVidFastExtract = true
+                extractPending   = true
+                extractStage     = 1
+                vidFastStatus    = "Retrying extraction…"
+                vidFastRetryUrl  = retryUrl
+                // Return early so vidFastFallback SURVIVES — the retry needs it for
+                // its own URL, and the Gecko hand-off needs it if the retry fails too.
+                return@rememberLauncherForActivityResult
+            }
+
+            if (genuineFailure) {
+                // Out of attempts → STOP. No GeckoView hand-off: the embed is a whole
+                // browser engine resident for the episode, which is what this
+                // extractor exists to avoid. The overlay is already gone
+                // (isExtracting was cleared at the top) so the user simply lands back
+                // on the details screen with the source buttons still focused, free
+                // to pick another one. Chaining to other sites is the planned
+                // replacement for the embed hand-off.
+                Log.w("scraper-vidfast",
+                      "🛑 extraction failed after $vidFastAttempt attempt(s) " +
+                          "(${reason ?: "no m3u8"}) — stopping, staying on details")
+            } else {
+                // Back button — a deliberate "no". Don't launch anything, and don't
+                // burn a retry on it either.
+                Log.d("scraper-vidfast", "user cancelled — no fallback")
+            }
+        }
+        vidFastFallback = null
+        vidFastAttempt  = 0
+        vidFastNote     = null
+    }
+
+    // Performs the relaunch posted by the result handler above. The small delay
+    // lets the failed :vidfastextractor process actually die before the next one
+    // spawns — two WebView processes at once is the memory spike we can't afford.
+    LaunchedEffect(vidFastRetryUrl) {
+        val url = vidFastRetryUrl ?: return@LaunchedEffect
+        // Do NOT clear vidFastRetryUrl here. It is this effect's KEY, so writing it
+        // makes Compose cancel this very coroutine mid-delay and the retry never
+        // launches at all - the overlay then hangs forever with no extractor in
+        // front. Cleared after the launch instead (which just restarts the effect
+        // once, harmlessly, on a null key).
+        delay(500)
+        Log.d("scraper-vidfast", "🔁 relaunching extractor (attempt $vidFastAttempt) → $url")
+        vidFastExtractorLauncher.launch(
+            Intent(context, VidFastExtractorActivity::class.java)
+                .putExtra(VidFastExtractorActivity.EXTRA_URL, url)
+        )
+        vidFastRetryUrl = null
+    }
 
     // Server lists captured during a DEFAULT extraction, cached for the lifetime
     // of this detail screen. Keyed by url + audio (url carries ?ep=, so each
@@ -888,7 +1129,7 @@ fun TVShowsDetailsScreenContent(
     }
 
     // Back closes whichever prompt/picker is open instead of leaving the screen.
-    BackHandler(enabled = showDefaultPrompt || showServerPicker) {
+    BackHandler(enabled = showDefaultPrompt || showServerPicker || vidFastChoiceFor != null) {
         when {
             showServerPicker -> { showServerPicker = false; showDefaultPrompt = true }
             showDefaultPrompt -> {
@@ -898,6 +1139,43 @@ fun TVShowsDetailsScreenContent(
                     try { lastStreamFocusRequester?.requestFocus() } catch (_: Exception) {}
                 }
             }
+            // Dismiss the VidFast player prompt back to the source buttons, which
+            // are still on screen underneath it.
+            vidFastChoiceFor != null -> {
+                vidFastChoiceFor = null
+                coroutineScope.launch {
+                    awaitFrame()
+                    try { providerFocusRequesters.firstOrNull()?.requestFocus() } catch (_: Exception) {}
+                }
+            }
+        }
+    }
+
+    // ── BACK cancels an extraction in progress ───────────────────────────────
+    // While the extractor Activity is in front it handles BACK itself. But the
+    // loading overlay also covers windows where the details screen is the focused
+    // Activity — the gap between a failed attempt and the retry launching, and the
+    // moments around the extractor process starting and dying. BACK there used to
+    // fall through to the Activity's own handler and leave the details screen
+    // entirely, so a retry could only be escaped by abandoning the page.
+    //
+    // Nulling vidFastRetryUrl also CANCELS a queued retry: the relaunch waits in a
+    // LaunchedEffect keyed on that value, so changing it tears the pending
+    // coroutine down mid-delay.
+    BackHandler(enabled = isExtracting || extractPending) {
+        Log.d("scraper-vidfast", "↩️ back during extraction — cancelling")
+        vidFastRetryUrl  = null
+        vidFastAttempt   = 0
+        vidFastNote      = null
+        vidFastFallback  = null
+        isVidFastExtract = false
+        vidFastStatus    = ""
+        extractPending   = false
+        isExtracting     = false
+        extractStage     = 0
+        coroutineScope.launch {
+            awaitFrame()
+            try { lastStreamFocusRequester?.requestFocus() } catch (_: Exception) {}
         }
     }
 
@@ -1118,9 +1396,16 @@ fun TVShowsDetailsScreenContent(
     LaunchedEffect(isExtracting) {
         if (isExtracting) {
             extractStage = 1
-            delay(900);  extractStage = 2
-            delay(2500); extractStage = 3
-            delay(3500); extractStage = 4
+            // VidFast reports its REAL state over a broadcast, so don't drive the
+            // dots on a timer — that would advance while nothing had happened, and
+            // could show "almost there" during a run that's about to fail. The
+            // anime (Miruro) extractor has no such reporting, so it keeps the
+            // estimated pacing below.
+            if (!isVidFastExtract) {
+                delay(900);  extractStage = 2
+                delay(2500); extractStage = 3
+                delay(3500); extractStage = 4
+            }
         } else {
             extractStage = 0
         }
@@ -2334,21 +2619,40 @@ fun TVShowsDetailsScreenContent(
                             }
                         )
                     } else {
+                        // Picking VidFast raises the modal player prompt below
+                        // (DefaultServerPrompt) rather than swapping these inline
+                        // buttons — same centred-card style as the anime DuB/SuB
+                        // "default server?" dialog, so the choice reads as a
+                        // question instead of two more source buttons.
                         EpisodeProviderInlineButtons(
                             passionFont = passionFont,
-                            sources = episodeSources,          // ✅ now episode-specific
+                            sources = episodeSources,
                             focusRequesters = providerFocusRequesters,
                             onSourceSelected = { source ->
                                 val epName = selectedEpisode.title
-                                onEpisodeSelected(selectedSeason, episodeNumber, epName)
-                                // Mark watched immediately — the backend row is written when the
-                                // stream launches, so waiting for a refetch would leave the card
-                                // unmarked until the user re-opens the show.
-                                watchedEpisodes = watchedEpisodes + (selectedSeason to episodeNumber)
-                                onStreamingSourceSelected(source)
+
+                                // Remember which button launched this so focus comes
+                                // back here when the player exits (THE RULE).
+                                lastStreamFocusRequester = providerFocusRequesters.getOrNull(
+                                    episodeSources.indexOfFirst { it.name == source.name }
+                                )
+
+                                if (source.name.equals("VidFast", true)) {
+                                    // Raise the player prompt. Remember the episode
+                                    // now, because the prompt's callbacks fire after
+                                    // this scope is gone.
+                                    pendingSeason      = selectedSeason
+                                    pendingEpisode     = episodeNumber
+                                    pendingEpisodeName = epName
+                                    vidFastChoiceFor   = source
+                                } else {
+                                    // Every other source behaves exactly as before.
+                                    onEpisodeSelected(selectedSeason, episodeNumber, epName)
+                                    watchedEpisodes = watchedEpisodes + (selectedSeason to episodeNumber)
+                                    onStreamingSourceSelected(source)
+                                }
                             },
                             onBack = {
-                                // still close overlay + return focus on BACK
                                 selectedEpisodeOverlayIndex = -1
 
                                 val targetIndex = lastFocusedEpisodeIndex
@@ -2417,13 +2721,35 @@ fun TVShowsDetailsScreenContent(
         // ════════════════════════════════════════════════════════════════════
         if (isExtracting) {
             ExtractionLoadingOverlay(
-                status = when (extractStage) {
-                    0, 1 -> "Locating stream source…"
-                    2    -> "Loading stream source…"
-                    3    -> "Preparing video player…"
-                    else -> "Almost there…"
+                // VidFast: the extractor's OWN words, broadcast as it works.
+                // Anime: estimated labels, since Miruro's extractor doesn't report.
+                status = vidFastStatus.ifBlank {
+                    when (extractStage) {
+                        0, 1 -> "Locating stream source…"
+                        2    -> "Loading stream source…"
+                        3    -> "Preparing video player…"
+                        else -> "Almost there…"
+                    }
                 },
-                stage = extractStage
+                stage = extractStage,
+                // Amber line: "Failure on first extraction — attempting retry 2/2".
+                note  = vidFastNote
+            )
+        }
+
+        // Actionable failure (currently: an ISP/router filter blocking the source).
+        // Without this the screen just returned to the source buttons and the user
+        // had no way to tell a blocked domain from a dead one.
+        extractionError?.let { msg ->
+            com.example.bluehive.webview.ExtractionErrorOverlay(
+                message = msg,
+                onDismiss = {
+                    extractionError = null
+                    coroutineScope.launch {
+                        awaitFrame()
+                        try { lastStreamFocusRequester?.requestFocus() } catch (_: Exception) {}
+                    }
+                }
             )
         }
 
@@ -2445,6 +2771,51 @@ fun TVShowsDetailsScreenContent(
             ExtractionLoadingOverlay(
                 status = "Checking the site for available servers…",
                 stage  = 2
+            )
+        }
+
+        // ── VidFast: which player? ───────────────────────────────────────────
+        // Same centred-card component as the anime "default server?" dialog, so
+        // the two flows look and behave identically (scrim, focus, D-pad, sounds).
+        // ExoPlayer = extract then play in our own player (light, resume-capable);
+        // Gecko = the embed as before (heavier, but always works).
+        vidFastChoiceFor?.let { choiceSrc ->
+            DefaultServerPrompt(
+                message     = "Watch with our player,\nor open the site directly?",
+                defaultText = "Watch on ExoPlayer",
+                chooseText  = "Watch on Gecko",
+                onDefault   = {
+                    vidFastChoiceFor = null
+                    // The episode overlay deliberately STAYS open (it used to be
+                    // dismissed here). It's hidden behind the full-screen extraction
+                    // overlay and then behind the player, so nothing looks different
+                    // — but keeping it composed keeps the VidFast button attached,
+                    // which is what lets focus return to it on the way back. Every
+                    // other source already behaves this way.
+                    onEpisodeSelected(pendingSeason, pendingEpisode, pendingEpisodeName)
+                    vidFastFallback  = choiceSrc
+                    isVidFastExtract = true
+                    vidFastStatus    = "Starting extraction…"
+                    // Fresh play → attempt 1, no retry banner carried over.
+                    vidFastAttempt   = 1
+                    vidFastNote      = null
+                    extractPending   = true
+                    isExtracting     = true
+                    try { BlueHiveApplication.coilImageLoader.memoryCache?.clear() } catch (_: Exception) {}
+                    vidFastExtractorLauncher.launch(
+                        Intent(context, VidFastExtractorActivity::class.java)
+                            .putExtra(VidFastExtractorActivity.EXTRA_URL, choiceSrc.url)
+                    )
+                },
+                onChoose    = {
+                    vidFastChoiceFor = null
+                    // Same as onDefault: leave the overlay composed so focus has
+                    // somewhere to come back to (and so the Gecko path matches the
+                    // other embed sources, which never dismissed it either).
+                    onEpisodeSelected(pendingSeason, pendingEpisode, pendingEpisodeName)
+                    watchedEpisodes = watchedEpisodes + (pendingSeason to pendingEpisode)
+                    onStreamingSourceSelected(choiceSrc)
+                }
             )
         }
 

@@ -66,7 +66,8 @@ import kotlinx.coroutines.android.awaitFrame
 import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.RoundedCornerShape
 import com.example.bluehive.webview.vidapi.VidApiExtractorActivity
-import com.example.bluehive.webview.vidapi.VidApiPlayerActivity
+import com.example.bluehive.webview.hls.HlsExtract
+import com.example.bluehive.webview.hls.HlsPlayerActivity
 
 
 
@@ -440,6 +441,14 @@ private fun getStreamingSources(mediaType: String, mediaId: Int): List<MoviesDet
 
 
 @UnstableApi
+/**
+ * Extraction attempts before handing off to the GeckoView embed. See
+ * VIDFAST_MAX_ATTEMPTS in TVShowsDetailsScreenCompose for the measured reasoning:
+ * these sites time out intermittently and the same title extracts fine seconds
+ * later, so one free retry beats a browser engine resident for the whole film.
+ */
+private const val VIDAPI_MAX_ATTEMPTS = 2
+
 @Composable
 fun MoviesDetailsScreenContent(
     mediaTitle: String,
@@ -522,6 +531,12 @@ fun MoviesDetailsScreenContent(
     val animeSubFocusRequester = remember { FocusRequester() }
     // Whichever button the user pressed last — restored when any overlay closes.
     var lastStreamFocusRequester by remember { mutableStateOf<FocusRequester?>(null) }
+
+    // THE RULE: back out of a player and focus returns to the streaming button that
+    // launched it, never the Favorites button at the top.
+    RestoreFocusOnPlayerReturn("MovieDetailsFocus") {
+        listOfNotNull(lastStreamFocusRequester)
+    }
 
     // Extractor m3u8-extraction error reason (shown as a toast; auto-dismisses).
     var vidApiError by remember { mutableStateOf<String?>(null) }
@@ -742,23 +757,56 @@ fun MoviesDetailsScreenContent(
         mutableStateOf<MoviesDetailsScreenCompose.StreamingSource?>(null)
     }
 
+    // ── Extraction retry ─────────────────────────────────────────────────────
+    // Mirrors the TV screen (see VIDFAST_MAX_ATTEMPTS there for the measured
+    // reasoning): these sites fail intermittently, so one free retry beats
+    // dropping the user into the heavyweight embed for the whole film.
+    var vidApiAttempt   by remember { mutableIntStateOf(0) }
+    var vidApiNote      by remember { mutableStateOf<String?>(null) }
+    // State hop — a launcher can't relaunch itself from inside its own callback.
+    var vidApiRetryUrl  by remember { mutableStateOf<Pair<String, String>?>(null) }
+
     /**
-     * Extraction didn't produce a playable stream — hand the user off to the
-     * GeckoView embed rather than an error screen. The embed is heavier (a full
-     * browser engine for the whole film) but it is the path that always works, so
-     * a site change or a slow probe degrades playback instead of breaking it.
+     * A failed extraction gets one more go. Posts the relaunch to [vidApiRetryUrl]
+     * and shows the amber banner; once the attempts are spent it simply STOPS.
+     *
+     * There is deliberately no GeckoView hand-off any more. The embed is a whole
+     * browser engine resident for the entire film — the thing this extractor exists
+     * to avoid — so a dead source now returns the user to the details screen with
+     * the source buttons still focused rather than silently downgrading them into
+     * the heavy player. Chaining to other sites is the planned replacement.
      */
-    val fallbackToEmbed: (String) -> Unit = { why ->
+    val giveUpOrRetry: (String) -> Unit = { why ->
         val src = extractFallbackSource
-        if (src != null) {
-            Log.w("scraper-vidapi", "↩️ extraction unusable ($why) — falling back to ${src.name} embed")
-            extractFallbackSource = null
-            onStreamingSourceSelected(src)
+        if (vidApiAttempt < VIDAPI_MAX_ATTEMPTS && src != null) {
+            vidApiAttempt += 1
+            Log.w("scraper-vidapi", "⚠️ extraction failed ($why) — retry $vidApiAttempt/$VIDAPI_MAX_ATTEMPTS")
+            vidApiNote = if (vidApiAttempt == 2) {
+                "Failure on first extraction — attempting retry 2/$VIDAPI_MAX_ATTEMPTS"
+            } else {
+                "Failure on attempt ${vidApiAttempt - 1} — " +
+                    "attempting retry $vidApiAttempt/$VIDAPI_MAX_ATTEMPTS"
+            }
+            vidApiRetryUrl = vidApiSourceName to src.url
+            // Hold the overlay up and rewind it: the result handler cleared these a
+            // few lines up, and the user should see one continuous load, not a flash
+            // back to the details screen and a second overlay. Leaving extractPending
+            // set also blocks a double-fire while the retry is in flight.
+            isExtracting   = true
+            extractPending = true
+            extractStage   = 1
         } else {
-            Log.w("scraper-vidapi", "extraction unusable ($why) and no fallback source recorded")
-            vidApiError = "Couldn't find a playable stream — try another source."
+            // Out of attempts. isExtracting was already cleared by the caller, so the
+            // overlay is gone and the details screen is simply back.
+            Log.w("scraper-vidapi",
+                  "🛑 extraction failed after $vidApiAttempt attempt(s) ($why) — " +
+                      "stopping, staying on details")
+            vidApiNote            = null
+            vidApiAttempt         = 0
+            extractFallbackSource = null
         }
     }
+
     // English subtitle fetch, kicked off in parallel with extraction when a VidApi
     // source is played.
     val vidApiExtractorLauncher = rememberLauncherForActivityResult(
@@ -778,11 +826,11 @@ fun MoviesDetailsScreenContent(
                 // intentionally unused).
                 Log.d("scraper-vidapi", "▶️ direct CDN play: $m3u8")
                 // Watch history is logged by the PLAYER on confirmed playback (see
-                // VidApiPlayerActivity.onIsPlayingChanged), not here. Logging on a
+                // HlsPlayerActivity.onIsPlayingChanged), not here. Logging on a
                 // successful extract counted a watch even when the stream never
                 // played — a dead CDN, a failed re-extract, or the user backing out.
                 context.startActivity(
-                    Intent(context, VidApiPlayerActivity::class.java)
+                    Intent(context, HlsPlayerActivity::class.java)
                         .putExtra("M3U8_URL", m3u8)
                         .putExtra("REFERER", referer)
                         .putExtra("UA", ua)
@@ -790,22 +838,33 @@ fun MoviesDetailsScreenContent(
                         // EMBED_URL lets the player re-extract a fresh token on a
                         // mid-play CDN error (important for token'd embeds).
                         .putExtra("EMBED_URL", vidApiEmbedUrl)
+                        // Extractor to re-run on a mid-play CDN failure (the player
+                        // no longer hardcodes one — see HlsExtract).
+                        .putExtra(HlsExtract.EXTRA_EXTRACTOR_CLASS,
+                                  VidApiExtractorActivity::class.java.name)
                         .putExtra("PROFILE_ID",  favoriteProfileId)
                         .putExtra("MEDIA_TYPE",  mediaType)
                         .putExtra("MEDIA_TITLE", mediaTitle)
                         .putExtra("SOURCE_NAME", vidApiSourceName)
                 )
+                vidApiAttempt = 0
+                vidApiNote    = null
             } else {
                 Log.e("scraper-vidapi", "OK result but no m3u8")
-                fallbackToEmbed("no m3u8 captured")
+                giveUpOrRetry("no m3u8 captured")
             }
         } else {
             val data   = result.data
             val failed = data?.getBooleanExtra(VidApiExtractorActivity.RESULT_FAILED, false) == true
             val reason = data?.getStringExtra(VidApiExtractorActivity.RESULT_REASON)
             when {
-                failed -> { Log.w("scraper-vidapi", "failed: $reason"); fallbackToEmbed(reason ?: "extraction failed") }
-                else   -> { Log.w("scraper-vidapi", "user cancelled") /* silent — no fallback */ }
+                failed -> { Log.w("scraper-vidapi", "failed: $reason"); giveUpOrRetry(reason ?: "extraction failed") }
+                // Back button — a deliberate "no". No fallback, and no retry either.
+                else   -> {
+                    Log.w("scraper-vidapi", "user cancelled")
+                    vidApiAttempt = 0
+                    vidApiNote    = null
+                }
             }
         }
     }
@@ -825,6 +884,51 @@ fun MoviesDetailsScreenContent(
                         .putExtra(VidApiExtractorActivity.EXTRA_URL, url)
                 )
             }
+        }
+    }
+
+    // Performs the relaunch posted by retryOrFallback.
+    //
+    // Launches the extractor directly rather than going back through
+    // launchVidApiExtract: that helper guards on !isExtracting && !extractPending,
+    // and retryOrFallback deliberately leaves both set so the overlay never blinks
+    // out. Routing through it would either fight the guard or require dropping the
+    // overlay for the 200ms it waits.
+    LaunchedEffect(vidApiRetryUrl) {
+        val (_, url) = vidApiRetryUrl ?: return@LaunchedEffect
+        // Do NOT clear vidApiRetryUrl here - it is this effect's KEY, so writing it
+        // cancels this coroutine mid-delay and the retry never launches. Cleared
+        // after the launch instead.
+        // Let the failed extractor process die before the next WebView spawns —
+        // two browser engines at once is the memory spike we can't afford.
+        delay(500)
+        Log.d("scraper-vidapi", "🔁 relaunching extractor (attempt $vidApiAttempt) → $url")
+        try { BlueHiveApplication.coilImageLoader.memoryCache?.clear() } catch (_: Exception) {}
+        vidApiExtractorLauncher.launch(
+            Intent(context, VidApiExtractorActivity::class.java)
+                .putExtra(VidApiExtractorActivity.EXTRA_URL, url)
+        )
+        vidApiRetryUrl = null
+    }
+
+    // ── BACK cancels an extraction in progress ───────────────────────
+    // The extractor Activity handles BACK while it is in front, but the loading
+    // overlay also covers windows where THIS screen is focused (the gap before a
+    // retry launches, and the moments around the extractor process starting and
+    // dying). BACK there used to fall through and leave the details screen
+    // entirely. Nulling vidApiRetryUrl also tears down a queued retry.
+    BackHandler(enabled = isExtracting || extractPending) {
+        Log.d("scraper-vidapi", "↩️ back during extraction — cancelling")
+        vidApiRetryUrl        = null
+        vidApiAttempt         = 0
+        vidApiNote            = null
+        extractFallbackSource = null
+        extractPending        = false
+        isExtracting          = false
+        extractStage          = 0
+        coroutineScope.launch {
+            awaitFrame()
+            try { lastStreamFocusRequester?.requestFocus() } catch (_: Exception) {}
         }
     }
 
@@ -935,7 +1039,13 @@ fun MoviesDetailsScreenContent(
 
 
 
-    LaunchedEffect(isExtracting) {
+    // Keyed on vidApiAttempt as well as isExtracting: a retry deliberately keeps
+    // isExtracting true (no overlay blink), so without the attempt key this effect
+    // would NOT restart and the dots would sit frozen at stage 1 for the whole
+    // second attempt — reading as a hang. Unlike the TV screen, these stages are
+    // timer-driven (the VidApi extractor broadcasts no progress), so something has
+    // to re-drive them.
+    LaunchedEffect(isExtracting, vidApiAttempt) {
         if (isExtracting) {
             extractStage = 1
             delay(900);  extractStage = 2
@@ -1593,6 +1703,9 @@ fun MoviesDetailsScreenContent(
                         disableDownSound  = i + 2 >= sources.size,  // no button directly below → mute down
                         onClick = {
                             isTrailerPlaying = false; hasTrailerBeenPlayed = false
+                            // Remember which button launched this so focus comes back
+                            // here when the player exits (THE RULE).
+                            lastStreamFocusRequester = streamerFocus[i]
                             // Extractor sources → headless m3u8 extraction + ExoPlayer
                             // (overlay shows progress); everything else keeps the WebView
                             // path. Keyed off the source flag, not its name/slot.
@@ -1600,6 +1713,9 @@ fun MoviesDetailsScreenContent(
                                 // Remember it so a failed extraction can fall back
                                 // to this same source's embed.
                                 extractFallbackSource = source
+                                // Fresh play → attempt 1, no stale retry banner.
+                                vidApiAttempt = 1
+                                vidApiNote    = null
                                 launchVidApiExtract(source.name, source.url)
                             } else onStreamingSourceSelected(source)
                         }
@@ -1637,7 +1753,8 @@ fun MoviesDetailsScreenContent(
                     3    -> "Preparing video player…"
                     else -> "Almost there…"
                 },
-                stage = extractStage
+                stage = extractStage,
+                note  = vidApiNote
             )
         }
 
