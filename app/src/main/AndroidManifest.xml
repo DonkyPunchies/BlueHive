@@ -161,13 +161,11 @@
             android:process=":vidapiextractor"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
-        <!-- VidFast m3u8 extraction. Own process so the WebView's memory dies with
-             it (the point of extracting instead of keeping GeckoView resident). -->
-        <activity
-            android:name=".webview.vidfast.VidFastExtractorActivity"
-            android:exported="false"
-            android:process=":vidfastextractor"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+        <!-- VidFast m3u8 extraction moved to the backend (/api/extract). The
+             on-device extractor and its :vidfastextractor process are gone: on a
+             filtered line vidfast.vc is refused to every client on the device, so
+             no amount of local retrying could work. VidApi above is unaffected —
+             Movies still extract on-device through it. -->
 
         <activity
             android:name=".webview.hls.HlsPlayerActivity"

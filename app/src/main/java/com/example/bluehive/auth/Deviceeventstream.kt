@@ -13,6 +13,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import com.example.bluehive.net.pinToLan
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
@@ -119,6 +120,10 @@ object DeviceEventStream {
         // server has already torn down its side of the socket. Each SSE connect
         // gets a fresh TCP.
         .connectionPool(okhttp3.ConnectionPool(0, 1, TimeUnit.MILLISECONDS))
+        // The revoke/unpair stream is a long-lived connection to the LAN backend.
+        // A VPN coming up mid-stream kills the socket; the reconnect loop re-dials
+        // through this factory and gets a fresh physical one.
+        .pinToLan()
         .build()
 
     // Bus listeners registered once for the process lifetime.

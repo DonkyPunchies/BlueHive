@@ -7,6 +7,7 @@ import android.content.pm.PackageInstaller
 import android.os.Build
 import android.util.Log
 import com.example.bluehive.BuildConfig
+import com.example.bluehive.net.pinToLan
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -45,6 +46,8 @@ object UpdateManager {
     private val manifestHttp: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(4, TimeUnit.SECONDS)
         .readTimeout(4, TimeUnit.SECONDS)
+        // ServerConfig :8090 is on the LAN — must not enter a VPN tunnel.
+        .pinToLan()
         .build()
 
     // Long timeouts: the APK is large (~200MB).
@@ -53,6 +56,8 @@ object UpdateManager {
         .readTimeout(120, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
+        // Same LAN host as the manifest — the APK is served off :8090, not GitHub.
+        .pinToLan()
         .build()
 
     /**

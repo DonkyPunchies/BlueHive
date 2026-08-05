@@ -324,6 +324,22 @@ object ExoPlayerConfig {
     const val STALL_SEEKS_BEFORE_REPREPARE = 2
 
     /**
+     * Re-prepares that failed before we conclude the MANIFEST is dead, not the
+     * codec.
+     *
+     * MEASURED 2026-08-03 (House of the Dragon, ~31 min in): the playback token
+     * expired mid-episode. Segments stopped arriving with NO error — the request
+     * simply hangs — so onPlayerError never fires and the loop below ran
+     * seek/seek/re-prepare forever against a manifest that could never work
+     * again. The watchdog was doing its job perfectly on the wrong problem.
+     *
+     * Re-preparing re-reads the SAME url, so if the url itself is dead this is
+     * unwinnable locally. After this many rounds, hand off to the host to fetch
+     * a fresh manifest.
+     */
+    const val STALL_REPREPARES_BEFORE_GIVEUP = 2
+
+    /**
      * Recover from a playback deadlock the player itself never reports.
      *
      * MEASURED FAILURE (2026-07-30, VidFast 1080p on the Amlogic box): playback
@@ -356,11 +372,19 @@ object ExoPlayerConfig {
         player: ExoPlayer,
         scope: kotlinx.coroutines.CoroutineScope,
         tag: String,
+        /**
+         * Called once when seeks AND re-prepares have both failed — i.e. the url
+         * itself is the problem. Null (the default) keeps the original
+         * retry-forever behaviour for callers with no way to get a fresh one.
+         */
+        onManifestDead: (() -> Unit)? = null,
     ) {
         scope.launch {
             var lastPos = -1L
             var stalledMs = 0L
             var seeks = 0
+            var reprepares = 0
+            var gaveUp = false
             // delay() is cancellable, so cancelling the scope ends this loop —
             // no isActive check needed.
             while (true) {
@@ -372,12 +396,18 @@ object ExoPlayerConfig {
                 if (!shouldBeMoving) { lastPos = -1L; stalledMs = 0L; seeks = 0; continue }
 
                 val pos = player.currentPosition
-                if (pos != lastPos) { lastPos = pos; stalledMs = 0L; seeks = 0; continue }
+                if (pos != lastPos) {
+                    // Moving again — everything recovered, so forget the history.
+                    lastPos = pos; stalledMs = 0L; seeks = 0; reprepares = 0; gaveUp = false
+                    continue
+                }
 
                 stalledMs += 1_000
                 val wedged = (!player.isLoading && stalledMs >= STALL_WEDGE_MS) ||
                     stalledMs >= STALL_HARD_MS
                 if (!wedged) continue
+
+                if (gaveUp) { stalledMs = 0L; continue }   // handoff already made
 
                 if (seeks < STALL_SEEKS_BEFORE_REPREPARE) {
                     seeks++
@@ -389,6 +419,20 @@ object ExoPlayerConfig {
                     )
                     // Same position: a codec flush, not a user-visible jump.
                     player.seekTo(pos)
+                } else if (reprepares < STALL_REPREPARES_BEFORE_GIVEUP) {
+                    reprepares++
+                    Log.e(tag, "🩺 still wedged after $seeks seeks — re-preparing the source " +
+                        "($reprepares/$STALL_REPREPARES_BEFORE_GIVEUP)")
+                    player.prepare()
+                    seeks = 0
+                } else if (onManifestDead != null) {
+                    // Seeks flush the codec, prepare() re-reads the same url. Both
+                    // exhausted means the url is dead — a expired token looks
+                    // exactly like this, since it hangs rather than erroring.
+                    gaveUp = true
+                    Log.e(tag, "🩺 wedged through $STALL_SEEKS_BEFORE_REPREPARE seeks and " +
+                        "$reprepares re-prepares — manifest looks dead, asking for a fresh one")
+                    onManifestDead()
                 } else {
                     Log.e(tag, "🩺 still wedged after $seeks seeks — re-preparing the source")
                     player.prepare()
@@ -419,6 +463,51 @@ object ExoPlayerConfig {
      */
     fun attachPlaybackLog(player: ExoPlayer, tag: String) {
         player.addAnalyticsListener(object : androidx.media3.exoplayer.analytics.AnalyticsListener {
+
+            /**
+             * Hosts already reported. An episode is ~630 segments, so without this
+             * every successful fetch would log a line; with it, each CDN is named
+             * ONCE and a second entry appearing mid-episode means the stream moved
+             * to a different host — which matters, because only some of them are
+             * reachable on a filtered line.
+             *
+             * WHY LOG SUCCESS AT ALL: until now only FAILURES named their host, so
+             * there was no record of which CDNs actually work. That asymmetry is
+             * what made "is signtime.site blocked, or was it never involved?"
+             * unanswerable without guessing. MEASURED 2026-08-03: the same master
+             * manifest failed on signtime.site and later played fine — the
+             * assignment rotates, and only per-play logging can show how often.
+             */
+            private val seenHosts = mutableSetOf<String>()
+
+            override fun onLoadCompleted(
+                eventTime: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime,
+                loadEventInfo: androidx.media3.exoplayer.source.LoadEventInfo,
+                mediaLoadData: androidx.media3.exoplayer.source.MediaLoadData,
+            ) {
+                val host = loadEventInfo.uri.host ?: return
+                if (!seenHosts.add(host)) return          // already named this one
+
+                val kind = when (mediaLoadData.dataType) {
+                    androidx.media3.common.C.DATA_TYPE_MANIFEST -> "playlist"
+                    androidx.media3.common.C.DATA_TYPE_MEDIA    -> "segment"
+                    else -> "type${mediaLoadData.dataType}"
+                }
+                // Last path element identifies the rung (seg-1-s720p-…) or the
+                // variant bucket (index-s1080p-…) without printing the token.
+                val leaf = loadEventInfo.uri.lastPathSegment ?: ""
+                val ms   = loadEventInfo.loadDurationMs.coerceAtLeast(1)
+                val kb   = loadEventInfo.bytesLoaded / 1024
+                val mbps = (loadEventInfo.bytesLoaded * 8.0) / ms / 1000.0
+
+                Log.i(
+                    tag,
+                    "🌐 host=$host ($kind) ${kb}KB in ${ms}ms " +
+                        "(${"%.1f".format(mbps)} Mbps) — $leaf" +
+                        if (seenHosts.size > 1) "  ⇠ HOST #${seenHosts.size} this play" else ""
+                )
+            }
+
             override fun onPlaybackStateChanged(
                 eventTime: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime,
                 state: Int,
@@ -431,6 +520,26 @@ object ExoPlayerConfig {
                 isLoading: Boolean,
             ) {
                 Log.d(tag, "📥 loading=$isLoading @ ${eventTime.currentPlaybackPositionMs}ms")
+            }
+
+            /**
+             * Rung switches. `🎬 video:` only reports the FIRST format, so an
+             * adaptive drop mid-episode (bad wifi, a throttling CDN) was
+             * invisible — the stream just got blurry with nothing in the log.
+             * Also confirms MAX_VIDEO_WIDTH/HEIGHT is actually holding: nothing
+             * above 1080p should ever appear here.
+             */
+            override fun onDownstreamFormatChanged(
+                eventTime: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime,
+                mediaLoadData: androidx.media3.exoplayer.source.MediaLoadData,
+            ) {
+                val f = mediaLoadData.trackFormat ?: return
+                if (f.height <= 0) return                 // audio/subtitle track
+                Log.i(
+                    tag,
+                    "🔀 rung → ${f.width}x${f.height} @ ${f.bitrate / 1000}kbps " +
+                        "(${f.codecs}) @ ${eventTime.currentPlaybackPositionMs}ms"
+                )
             }
 
             override fun onDroppedVideoFrames(
@@ -448,10 +557,17 @@ object ExoPlayerConfig {
                 error: java.io.IOException,
                 wasCanceled: Boolean,
             ) {
+                // HOST FIRST. takeLast(70) alone prints only the token tail, which
+                // is identical across every rung and every CDN — so a whole night
+                // was spent probing a host that had been INFERRED from a playlist
+                // fetched elsewhere, never observed from the failing request. The
+                // host is the one field that identifies what actually broke.
+                val u = loadEventInfo.uri
                 Log.w(
                     tag,
-                    "⚠️ load error (canceled=$wasCanceled) ${error.javaClass.simpleName}: ${error.message} " +
-                        "— ${loadEventInfo.uri.toString().takeLast(70)}"
+                    "⚠️ load error host=${u.host} (canceled=$wasCanceled) " +
+                        "${error.javaClass.simpleName}: ${error.message} " +
+                        "— …${u.toString().takeLast(45)}"
                 )
             }
 
@@ -568,18 +684,58 @@ object ExoPlayerConfig {
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
 
-    /** Track selector with the shared bitrate policy applied. */
-    fun trackSelector(context: Context): DefaultTrackSelector =
-        DefaultTrackSelector(context).apply {
-            setParameters(
-                buildUponParameters().setForceHighestSupportedBitrate(FORCE_HIGHEST_BITRATE)
-            )
-        }
+    // ── Video ceiling ────────────────────────────────────────────────────────
+    //
+    // MEASURED 2026-08-03 on the Amlogic box:
+    //   wm size        -> Physical 3840x2160, Override 1920x1080
+    //   avc decoder    -> size max 4096x4096   (4K decode IS supported)
+    //
+    // So the hardware can decode 4K, but Android's surface is 1080p — a 2160p
+    // rung is decoded at full size and then downscaled to 1080p for output. That
+    // is 4x the decode work and ~3x the bitrate (16 Mbps vs 5.5) for pixels that
+    // never reach the screen, on a box with 1.9 GB of RAM.
+    //
+    // It also feeds the deadlock this file's stall watchdog exists for: that bug
+    // is display buffers never being returned, and 4K buffers are ~4x larger and
+    // scarcer. Capping is mitigation, NOT a cure — the same wedge was recorded at
+    // 1080p in July — but it costs nothing visible.
+    //
+    // Raise this if the surface override ever goes 4K, or on a stronger device.
+    const val MAX_VIDEO_WIDTH  = 1920
+    const val MAX_VIDEO_HEIGHT = 1080
 
-    /** Applies the shared bitrate policy to a selector that already exists. */
-    fun applyBitratePolicy(selector: DefaultTrackSelector) {
+    // Tunneled playback: OFF. Tried 2026-08-03 and REVERTED the same day.
+    //
+    // The idea was sound — tunneling keeps decode→display inside the vendor
+    // pipeline so the framework never holds the output buffers the stall
+    // watchdog's deadlock exhausts (OUT=11/12 [kAtClient]) — and this decoder
+    // does advertise `tunneled-playback` in media_codecs_amlogic_video.xml.
+    //
+    // But it never demonstrably fixed anything, and it BROKE startup:
+    //
+    //   ERROR_CODE_FAILED_RUNTIME_CHECK
+    //   Caused by: java.lang.IllegalStateException
+    //       at MediaCodecVideoRenderer.onEnabled(MediaCodecVideoRenderer.java:867)
+    //
+    // The video renderer throws while being ENABLED — before any byte is
+    // fetched — when tunneling is requested and no valid tunneling audio session
+    // is available. It fired 4x in one session, BUFFERING→IDLE each time, and
+    // cleared on an app restart, i.e. it depends on audio-session timing. An
+    // unverified mitigation that intermittently prevents playback outright is a
+    // net loss, so it stays off unless someone can show it curing the deadlock.
+    const val TUNNELING_ENABLED = false
+
+    /** Track selector with the shared bitrate, size and tunneling policy applied. */
+    fun trackSelector(context: Context): DefaultTrackSelector =
+        DefaultTrackSelector(context).apply { applyVideoPolicy(this) }
+
+    /** Applies the shared video policy to a selector that already exists. */
+    fun applyVideoPolicy(selector: DefaultTrackSelector) {
         selector.setParameters(
-            selector.buildUponParameters().setForceHighestSupportedBitrate(FORCE_HIGHEST_BITRATE)
+            selector.buildUponParameters()
+                .setForceHighestSupportedBitrate(FORCE_HIGHEST_BITRATE)
+                .setMaxVideoSize(MAX_VIDEO_WIDTH, MAX_VIDEO_HEIGHT)
+                .setTunnelingEnabled(TUNNELING_ENABLED)
         )
     }
 
@@ -651,19 +807,153 @@ object ExoPlayerConfig {
      * @param headers   the site's own Referer/Origin/etc. See the class note on why
      *                  these are NOT centralised.
      */
+    // ── HTTP/3 transport ─────────────────────────────────────────────────────
+    //
+    // WHY: CUJO reads the hostname out of the TLS ClientHello on TCP and severs
+    // the handshake. QUIC runs over UDP/443, which consumer filters
+    // overwhelmingly do not inspect at all — which is why GeckoView plays these
+    // exact CDNs on the same box, in the same second, that OkHttp cannot reach.
+    // MEASURED 2026-08-03: `load error host=signtime.site ... Unable to parse TLS
+    // packet header` in ExoPlayer, while the browser streams fine, and the CDNs
+    // advertise `alt-svc: h3=":443"`.
+    //
+    // OkHttp has no HTTP/3 support, so no amount of tuning it helps. Cronet is
+    // Chrome's stack and speaks QUIC natively — the same road the browser takes.
+    //
+    // Built once and cached; null means "unavailable, use OkHttp". A failure
+    // here must never break playback, so every path degrades to the old one.
+    @Volatile private var cronetTried = false
+    @Volatile private var cronetEngine: org.chromium.net.CronetEngine? = null
+
+    private fun cronet(context: Context): org.chromium.net.CronetEngine? {
+        if (cronetTried) return cronetEngine
+        synchronized(this) {
+            if (cronetTried) return cronetEngine
+            cronetTried = true
+            cronetEngine = runCatching {
+                // PROVEN 2026-08-03 from Firefox on this exact connection:
+                //   GET https://signtime.site/…/seg-22-s2160p-v1-a1.jpg
+                //   Status 200 · Version HTTP/3 · 12.57 MB
+                // while curl to the same host on the same wire gets HTTP 000.
+                // The filter inspects TCP/443 and reads the SNI; QUIC rides
+                // UDP/443 and is not inspected. So the fix is to actually USE h3.
+                //
+                // Why the first attempt failed: Cronet normally discovers h3 from
+                // an `alt-svc` header on a successful TCP response — and that TCP
+                // request is the one being blocked. It never learns, falls back to
+                // TCP, and dies with ERR_SSL_PROTOCOL_ERROR. addQuicHint() alone
+                // did not override that, so force it explicitly:
+                //
+                //   host_whitelist  — QUIC is permitted for these origins
+                //   origins_to_force_quic_on — skip the TCP probe entirely and
+                //                    open QUIC on the FIRST request, which is the
+                //                    only way to reach a host whose TCP is severed
+                val quicHosts = listOf(
+                    "signtime.site", "sandstorm13.site",
+                    "premiumvacations.site", "diskphone12.site",
+                    "moon.ironwallnet.net",
+                )
+                // "*" — force QUIC on EVERY origin, not a host list.
+                //
+                // The per-host form ("signtime.site:443,…") produced no change:
+                // Cronet still reported net::ERR_SSL_PROTOCOL_ERROR, which is a
+                // TCP/TLS failure, meaning it never went over UDP. Either the list
+                // format was silently rejected or it was overridden. "*" is the
+                // documented catch-all and removes that variable entirely.
+                //
+                // Safe here because this engine ONLY serves extracted video
+                // streams — the CDNs all advertise `alt-svc: h3=":443"`, and
+                // CronetDataSource still has an OkHttp fallback factory beneath it
+                // for anything that genuinely cannot do QUIC.
+                val opts = """
+                    {"QUIC":{
+                       "origins_to_force_quic_on":"*",
+                       "idle_connection_timeout_seconds":300,
+                       "migrate_sessions_on_network_change_v2":true
+                    }}
+                """.trimIndent()
+
+                // Pick the APP-PACKAGED (embedded) provider explicitly.
+                //
+                // MEASURED: three separate QUIC configurations all failed with
+                // net::ERR_SSL_PROTOCOL_ERROR, and every stack frame came from
+                //   com.google.android.gms.dynamite_cronetdynamite
+                // i.e. Google Play Services Cronet, NOT the cronet-embedded build
+                // in this APK. Play Services restricts what a caller may
+                // configure, so setExperimentalOptions was very likely dropped —
+                // which matches QUIC never being attempted at all.
+                //
+                // The embedded provider is ours: same process, same version we
+                // pinned, and it honours experimental options. Falls back to the
+                // default builder if for any reason it isn't present.
+                val providers = org.chromium.net.CronetProvider.getAllProviders(
+                    context.applicationContext
+                ).filter { it.isEnabled }
+                Log.d("scraper-vidapi", "🚀 cronet providers: " +
+                        providers.joinToString { "${it.name}@${it.version}" })
+
+                val embedded = providers.firstOrNull {
+                    it.name == org.chromium.net.CronetProvider.PROVIDER_NAME_APP_PACKAGED
+                }
+                val b = (embedded?.createBuilder()
+                    ?: org.chromium.net.ExperimentalCronetEngine
+                        .Builder(context.applicationContext))
+                        as org.chromium.net.ExperimentalCronetEngine.Builder
+                Log.d("scraper-vidapi", "🚀 using provider: " +
+                        (embedded?.name ?: "default (Play Services)"))
+                b.enableQuic(true)
+                b.enableHttp2(true)
+                b.enableBrotli(true)
+                quicHosts.forEach { b.addQuicHint(it, 443, 443) }
+                b.setExperimentalOptions(opts)
+                b.build()
+            }.onFailure {
+                Log.w("scraper-vidapi", "🚀 Cronet unavailable (${it.message}) — using OkHttp")
+            }.getOrNull()
+            cronetEngine?.let {
+                Log.d("scraper-vidapi", "🚀 Cronet ready (QUIC on) — ${it.versionString}")
+            }
+            return cronetEngine
+        }
+    }
+
+    /**
+     * Data source for extracted streams. Cronet (HTTP/3) when available, OkHttp
+     * otherwise — see [cronet] for why the transport is the whole point.
+     *
+     * [context] is optional so existing callers keep working; without it there is
+     * no way to build a Cronet engine and this behaves exactly as before.
+     */
     fun dataSourceFactory(
         userAgent: String,
         headers: Map<String, String>,
         client: OkHttpClient = okHttpClient(),
-    ): DataSource.Factory =
-        // Wrapped so a handshake the NETWORK refuses gets a second chance
-        // through an SNI-safe path — see SniSafeDataSource. Pass-through until
-        // a fetcher is installed, so this changes nothing today.
-        SniSafeDataSource.Factory(
+        context: Context? = null,
+    ): DataSource.Factory {
+        val engine = context?.let { cronet(it) }
+        val http: DataSource.Factory = if (engine != null) {
+            androidx.media3.datasource.cronet.CronetDataSource.Factory(
+                engine, java.util.concurrent.Executors.newSingleThreadExecutor()
+            )
+                .setUserAgent(userAgent)
+                .setDefaultRequestProperties(headers)
+                // A QUIC path that fails must not kill playback outright: fall
+                // back to the TCP stack for that request rather than erroring.
+                .setFallbackFactory(
+                    OkHttpDataSource.Factory(client)
+                        .setUserAgent(userAgent)
+                        .setDefaultRequestProperties(headers)
+                )
+        } else {
             OkHttpDataSource.Factory(client)
                 .setUserAgent(userAgent)
                 .setDefaultRequestProperties(headers)
-        )
+        }
+        // Wrapped so a handshake the NETWORK refuses gets a second chance
+        // through an SNI-safe path — see SniSafeDataSource. Pass-through until
+        // a fetcher is installed, so this changes nothing today.
+        return SniSafeDataSource.Factory(http)
+    }
 
     /** HLS media source from an m3u8 URL. */
     fun hlsMediaSource(url: String, factory: DataSource.Factory): HlsMediaSource =

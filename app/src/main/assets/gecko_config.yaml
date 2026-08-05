@@ -23,3 +23,57 @@ prefs:
 
   # Reduce in-memory network cache.
   browser.cache.memory.capacity: 2048
+
+  # Audible autoplay. Sources launched with ?autoPlay=true (the vidflix/vidfast tv
+  # embeds) call video.play() on load with no user gesture. GeckoView blocks audible
+  # autoplay by default, so play() rejects with NotAllowedError, the site's player
+  # catches it and retries with muted = true — muted playback is always permitted —
+  # and never un-mutes. That is the "tv shows load silent, movies don't" split: the
+  # movie sources that reach GeckoView carry no autoplay param, so a human pressing
+  # play supplies the gesture. MainWebViewer's permissionDelegate can't save it; that
+  # grant is an async round-trip and the first play() has already latched to muted.
+  media.autoplay.default: 0              # 0 = allow all, 1 = block audible, 5 = block all
+  media.autoplay.blocking_policy: 0      # 0 = sticky activation (don't demand a fresh gesture)
+  media.autoplay.ask-permission: false   # don't route through the delegate at all
+  media.autoplay.block-event.enabled: false
+
+  # setupNewSession() loads the URL 250 ms after attach, so the page can begin before
+  # the activity is fully foregrounded. That blocks playback on a separate code path
+  # and trips the same mute fallback.
+  media.block-autoplay-until-in-foreground: false
+
+  # ── Encrypted Client Hello (EXPERIMENTAL) ────────────────────────────────────
+  #
+  # WHY: the ISP filter reads the hostname out of the TLS ClientHello — it is sent
+  # in CLEARTEXT before encryption begins — and severs the connection. MEASURED
+  # 2026-08-03 from this TV: signtime.site returns 256 bytes (handshake severed)
+  # while every other segment CDN returns ~2800 (completes). ECH encrypts that
+  # hostname, so there is nothing left for the filter to match on.
+  #
+  # signtime.site PUBLISHES an ECH config (HTTPS RR type 65 carries `ech=`), so the
+  # capability exists for exactly the host that is blocking playback.
+  #
+  # Gecko can do this on Android 14 because it ships its OWN TLS stack (NSS, inside
+  # libxul.so). It does not use Android's Conscrypt, so it is not waiting on an OS
+  # that this box will never receive.
+  #
+  # ⚠️ mode 2, NOT mode 3. TRR mode 3 is DoH-ONLY with no fallback: if the resolver
+  # is unreachable the browser loses DNS entirely and every page dies. That is what
+  # took the webviewer down earlier in this project. Mode 2 tries DoH first and
+  # falls back to system DNS, so the worst case is "no ECH", not "no browser".
+  network.trr.mode: 2
+  network.trr.uri: "https://mozilla.cloudflare-dns.com/dns-query"
+  # Pin the resolver's own address. Without it Gecko must resolve the DoH hostname
+  # through system DNS first — the exact lookup a filter would intercept.
+  network.trr.bootstrapAddr: "1.1.1.1"
+  # Don't let a slow resolver stall page loads while we are experimenting.
+  network.trr.request_timeout_ms: 3000
+  network.trr.max-fails: 5
+
+  # ECH itself. Requires the HTTPS RR above; useless without TRR.
+  network.dns.echconfig.enabled: true
+  network.dns.http3_echconfig.enabled: true
+  network.dns.use_https_rr_as_altsvc: true
+  # Do NOT fall back to a cleartext-SNI retry when ECH is refused — that silently
+  # re-exposes the hostname and would mask whether ECH actually worked.
+  network.dns.echconfig.fallback_to_origin_when_all_failed: false

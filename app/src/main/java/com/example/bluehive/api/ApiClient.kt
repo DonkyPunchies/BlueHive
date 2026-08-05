@@ -3,6 +3,7 @@ package com.example.bluehive.api
 import android.util.Log
 import com.example.bluehive.BuildConfig
 import com.example.bluehive.auth.SessionManager
+import com.example.bluehive.net.pinToLan
 import okhttp3.Authenticator
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -66,6 +67,9 @@ object ApiClient {
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
+        // API_BASE_URL resolves to 192.168.1.136:8000 in BOTH debug and release
+        // (BLUEHIVE_DEV_BASE_URL), so this is LAN traffic despite the "tmdb" name.
+        .pinToLan()
         .build()
 
     private val tmdbRetrofit: Retrofit = Retrofit.Builder()
@@ -243,6 +247,9 @@ object ApiClient {
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
+        // :8000 is on the LAN. Without this a connected VPN routes profiles and
+        // watch history into the tunnel, where 192.168.1.136 does not exist.
+        .pinToLan()
         .build()
 
     private val bluehiveRetrofit: Retrofit = Retrofit.Builder()
@@ -300,6 +307,10 @@ object ApiClient {
         }
         .addInterceptor(loggingInterceptor)
         .authenticator(platformHostAuthenticator)
+        // :9000 is on the LAN. This is the client whose failure produces the 30s
+        // blank launch + "Set up BlueHive" toast — indistinguishable from Docker
+        // being down, which is exactly how a VPN made it look.
+        .pinToLan()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)

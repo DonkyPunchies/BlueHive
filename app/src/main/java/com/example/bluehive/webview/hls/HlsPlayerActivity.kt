@@ -31,8 +31,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.lifecycleScope
+import com.example.bluehive.api.ApiClient
+import com.example.bluehive.api.RelayGrantRequest
+import com.example.bluehive.auth.SessionManager
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
+import java.net.URLEncoder
 import androidx.media3.common.Player
 import androidx.media3.common.text.Cue
 import androidx.media3.common.util.UnstableApi
@@ -99,6 +103,11 @@ class HlsPlayerActivity : ComponentActivity() {
 
     private var loggedDuration = false
     private var extractRetries = 0
+
+    // Backend relay for this stream, from /api/extract's proxy_url. Null when the
+    // caller didn't pass one, in which case behaviour is exactly as before.
+    private var relayUrl: String? = null
+    private var usingRelay = false
 
     // One watch-history row per launch, written on confirmed playback (see
     // onIsPlayingChanged). The flag survives a mid-play re-extract, so recovering
@@ -197,6 +206,7 @@ class HlsPlayerActivity : ComponentActivity() {
         }
 
         embedUrl = intent.getStringExtra("EMBED_URL")
+        relayUrl = intent.getStringExtra("M3U8_FALLBACK_URL")
         referer  = intent.getStringExtra("REFERER") ?: referer
         ua       = intent.getStringExtra("UA") ?: ua
         tmdbId   = intent.getIntExtra("TMDB_ID", 0)
@@ -245,7 +255,7 @@ class HlsPlayerActivity : ComponentActivity() {
         // ExoPlayerConfig so every site's player behaves identically. Only this
         // file's HEADERS are site-specific (see buildMediaSource).
         val selector = trackSelector ?: ExoPlayerConfig.trackSelector(this).also { trackSelector = it }
-        ExoPlayerConfig.applyBitratePolicy(selector)
+        ExoPlayerConfig.applyVideoPolicy(selector)
 
         player = ExoPlayerConfig.buildPlayer(this, selector)
             .apply {
@@ -261,7 +271,25 @@ class HlsPlayerActivity : ComponentActivity() {
                 ExoPlayerConfig.attachPlaybackLog(this, TAG)
                 // Break the vendor display-stack deadlock that froze playback for
                 // ~10 minutes with the player still reporting "playing".
-                ExoPlayerConfig.attachStallWatchdog(this, lifecycleScope, TAG)
+                // onManifestDead: a wedge that survives seeks AND re-prepares is
+                // a dead url, not a stuck codec — an expired token presents this
+                // way because it hangs instead of erroring, so onPlayerError
+                // never fires and nothing below would otherwise recover.
+                ExoPlayerConfig.attachStallWatchdog(this, lifecycleScope, TAG) {
+                    // A wedge on a blocked CDN looks like this rather than an
+                    // error — the request hangs instead of failing — so the relay
+                    // belongs here too.
+                    if (switchToRelay("STALL_WEDGED")) return@attachStallWatchdog
+                    if (extractRetries < MAX_EXTRACT_RETRIES) {
+                        extractRetries++
+                        Log.w(TAG, "↻ wedged on a dead manifest — re-extracting " +
+                                "($extractRetries/$MAX_EXTRACT_RETRIES)")
+                        relaunchExtraction()
+                    } else {
+                        Log.e(TAG, "🛑 wedged and out of re-extraction attempts — finishing")
+                        finish()
+                    }
+                }
                 addListener(object : Player.Listener {
                     override fun onPlaybackStateChanged(state: Int) {
                         if (state == Player.STATE_READY && !loggedDuration) {
@@ -287,13 +315,25 @@ class HlsPlayerActivity : ComponentActivity() {
                             error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS ||
                                     error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ||
                                     error.errorCode == PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE
+                        // Relay first — see switchToRelay for why re-extraction
+                        // cannot fix a blocked CDN.
+                        if (isCdnFailure && switchToRelay(error.errorCodeName)) return
                         if (isCdnFailure && embedUrl != null && extractRetries < MAX_EXTRACT_RETRIES) {
                             extractRetries++
                             Log.w(TAG, "↻ CDN failure — re-extracting for a fresh server (retry $extractRetries/$MAX_EXTRACT_RETRIES)")
                             relaunchExtraction()
                         } else {
                             if (embedUrl == null) Log.e(TAG, "no EMBED_URL passed — cannot re-extract; finishing")
-                            finish()
+                            // Say something before the screen goes away. Four
+                            // retries with a backoff is ~10s of black screen, and
+                            // closing silently reads as a crash rather than "this
+                            // episode's CDN is unreachable from here".
+                            if (isCdnFailure) {
+                                showToast("Couldn't reach this episode's server. Try another source.")
+                                lifecycleScope.launch { delay(2_500); finish() }
+                            } else {
+                                finish()
+                            }
                         }
                     }
                 })
@@ -415,7 +455,7 @@ class HlsPlayerActivity : ComponentActivity() {
 
         return ExoPlayerConfig.hlsMediaSource(
             url,
-            ExoPlayerConfig.dataSourceFactory(ua, requestHeaders)
+            ExoPlayerConfig.dataSourceFactory(ua, requestHeaders, context = this)
         )
     }
 
@@ -673,18 +713,71 @@ class HlsPlayerActivity : ComponentActivity() {
         toastJob = lifecycleScope.launch { delay(5_000); toastText = null }
     }
 
+    /**
+     * Fall back to the backend relay, once.
+     *
+     * WHY THIS COMES BEFORE RE-EXTRACTION: re-extracting cannot fix a blocked CDN.
+     * The source pins one host per episode and hands back the SAME one, so on a
+     * filtered line the retry loop just fails four times and shows "Couldn't reach
+     * this episode's server" — measured, not assumed. The relay is the only path
+     * that recovers it, because the bytes then come from us and never touch the
+     * blocked host.
+     *
+     * Direct is still tried FIRST and the relay only after a real failure, so an
+     * unfiltered network never costs us the transfer. `usingRelay` makes it
+     * strictly once: if the relay itself dies, we fall through to the old
+     * re-extraction path rather than looping.
+     */
+    private fun switchToRelay(why: String): Boolean {
+        val relay = relayUrl
+        if (relay == null || usingRelay) return false
+        usingRelay = true
+        // Remember the position BEFORE the teardown so recovery resumes.
+        player?.let { if (it.currentPosition > 0) resumePositionMs = it.currentPosition }
+        // Tags the relay session with what drove us here; lands in
+        // bluehive.relay_sessions.error_code via the master-playlist request.
+        val tagged = relay + "&err=" + URLEncoder.encode(why, "UTF-8")
+        Log.w(TAG, "🔀 CDN unreachable ($why) — relaying via backend, " +
+                "resuming at ${resumePositionMs}ms")
+        loggedDuration = false
+        // Posted, not inline: this fires from inside the player's own error
+        // callback, and startPlayback releases that player.
+        lifecycleScope.launch {
+            // The relay refuses an unauthorised URL — see RelayGrantRequest. One
+            // round trip, only ever on the failure path.
+            val granted = runCatching {
+                ApiClient.bluehiveApi.mintRelayGrant(RelayGrantRequest(tagged))
+            }.getOrNull()?.takeIf { it.isSuccessful }?.body()?.relay_url
+
+            if (granted.isNullOrBlank()) {
+                // Over quota, or no valid session. Don't burn the one relay
+                // attempt on a URL that will 401 — fall back to the old path.
+                Log.e(TAG, "🛑 relay grant refused — falling back to re-extraction")
+                relaunchExtraction()
+                return@launch
+            }
+            startPlayback(granted)
+        }
+        return true
+    }
+
     /** Fire the headless extractor again for the same embed URL. Result handled above. */
     private fun relaunchExtraction() {
         val embed = embedUrl ?: run { finish(); return }
+        // Remember where we were BEFORE tearing the player down, so a recovery
+        // resumes the episode instead of restarting it.
+        player?.let { if (it.currentPosition > 0) resumePositionMs = it.currentPosition }
         player?.run { stop(); clearMediaItems(); release() }
         player = null
         // Which extractor to re-run is the caller's decision — this player is
-        // shared by several sources and must not hardcode one of them. No class
-        // name means no recovery path, so stop rather than guess.
+        // shared by several sources and must not hardcode one of them.
         val extractorClass = intent.getStringExtra(HlsExtract.EXTRA_EXTRACTOR_CLASS)
         if (extractorClass.isNullOrBlank()) {
-            Log.e(TAG, "no EXTRACTOR_CLASS passed — cannot re-extract; finishing")
-            finish(); return
+            // No local extractor: VidFast now extracts server-side, so ask the
+            // backend for a fresh manifest instead of giving up. This is the path
+            // that was missing when a token expired mid-episode — the watchdog
+            // re-prepared a dead url forever because nothing could replace it.
+            reextractViaBackend(); return
         }
         val relaunch = Intent()
             .setClassName(this, extractorClass)
@@ -693,6 +786,60 @@ class HlsPlayerActivity : ComponentActivity() {
             .putExtra("VIDAPI_URL", embed)
             .putExtra("VIDFAST_URL", embed)
         reextractLauncher.launch(relaunch)
+    }
+
+    /**
+     * Ask the backend for a FRESH manifest and resume where we left off.
+     *
+     * WHY THIS EXISTS: playback tokens expire. MEASURED 2026-08-03, House of the
+     * Dragon at ~31 min — segments stopped arriving with no error at all (the
+     * request just hangs), so onPlayerError never fired and the stall watchdog
+     * re-prepared the same dead url indefinitely. refresh=1 bypasses the server
+     * cache, which matters because the cached copy is the thing that just died.
+     */
+    private fun reextractViaBackend() {
+        val tmdb = intent.getIntExtra("TMDB_ID", 0)
+        if (tmdb <= 0) {
+            Log.e(TAG, "no TMDB_ID — cannot re-extract via backend; finishing")
+            finish(); return
+        }
+        val type    = intent.getStringExtra("MEDIA_TYPE") ?: "movie"
+        val season  = intent.getIntExtra("SEASON_NUMBER", 0).takeIf { it > 0 }
+        val episode = intent.getIntExtra("EPISODE_NUMBER", 0).takeIf { it > 0 }
+        // Re-ask the SAME source that produced this stream. Defaulting to vidfast
+        // would silently move a VidEasy viewer onto VidFast's extraction.
+        val source  = intent.getStringExtra("EXTRACT_SOURCE") ?: "vidfast"
+
+        Log.w(TAG, "↻ asking backend for a fresh manifest " +
+                "(tmdb=$tmdb $type s=$season e=$episode, resume=${resumePositionMs}ms)")
+
+        lifecycleScope.launch {
+            delay(REEXTRACT_BACKOFF_MS)
+            val body = runCatching {
+                // refresh=1 forces a real browser run rather than a cache hit —
+                // essential here, because the cached entry is the one that just
+                // handed us a blocked CDN. A fresh run re-draws from the pool.
+                ApiClient.bluehiveApi.extractStream(
+                    type = type, tmdbId = tmdb, season = season, episode = episode,
+                    source = source, refresh = 1,
+                    // A re-extract is the LIKELIEST relay of all — it only happens
+                    // after a CDN already failed — so it must carry identity too.
+                    mtype = type, title = intent.getStringExtra("MEDIA_TITLE"),
+                    profile = intent.getIntExtra("PROFILE_ID", -1).takeIf { it > 0 },
+                    device = SessionManager.get().deviceFingerprint,
+                )
+            }.getOrNull()?.takeIf { it.isSuccessful }?.body()
+
+            if (body == null || body.m3u8.isBlank()) {
+                Log.e(TAG, "❌ backend re-extraction failed — finishing")
+                finish(); return@launch
+            }
+            body.referer?.takeIf { it.isNotBlank() }?.let { referer = it }
+            body.user_agent?.takeIf { it.isNotBlank() }?.let { ua = it }
+            Log.d(TAG, "✅ fresh manifest — resuming at ${resumePositionMs}ms")
+            loggedDuration = false
+            startPlayback(body.m3u8)
+        }
     }
 
     // ── onn box CHANNEL UP / DOWN → skip forward / back ──────────────────────
@@ -781,6 +928,28 @@ class HlsPlayerActivity : ComponentActivity() {
     }
 
     companion object {
-        private const val MAX_EXTRACT_RETRIES = 2
+        /**
+         * How many times to re-draw a segment CDN before giving up.
+         *
+         * WHY 4, NOT 2: VidFast hands each extraction a segment host from a pool.
+         * MEASURED 2026-08-03 on this line — `moon.ironwallnet.net` (playlists),
+         * `premiumvacations.site`, `checknews02.site`, `sandstorm13.site` all
+         * serve fine, while `signtime.site` is severed by the ISP filter. So a
+         * failure is usually ONE bad draw out of ~5, not a dead episode: the same
+         * episode failed, then played after a fresh extraction.
+         *
+         * At 2 retries a run of bad luck still ends in a visible failure. At 4 the
+         * odds of drawing the blocked host every single time get small, and the
+         * cost of an extra attempt is one ~2s extraction (deduplicated server-side).
+         */
+        private const val MAX_EXTRACT_RETRIES = 4
+
+        /**
+         * Pause before re-extracting. The point is to draw a DIFFERENT host, and
+         * hammering the backend instantly tends to return the same assignment;
+         * a beat also keeps a genuinely dead episode from burning all four
+         * attempts inside a second and looking like a crash.
+         */
+        private const val REEXTRACT_BACKOFF_MS = 700L
     }
 }

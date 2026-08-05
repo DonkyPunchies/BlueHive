@@ -198,15 +198,24 @@ android {
 
         release {
 
-            // 🔹 Use the same values as debug for now
-            val prodBaseUrl = project.findProperty("BLUEHIVE_DEV_BASE_URL")?.toString()
-                ?: "http://192.168.1.136:8000/"
-            val prodApiKey = project.findProperty("BLUEHIVE_DEV_API_KEY")?.toString()
-                ?: ""
-            val prodPlatformUrl = project.findProperty("BLUEHIVE_DEV_PLATFORM_URL")?.toString()
-                ?: "http://192.168.1.136:9000"
-            val prodUpdateUrl = project.findProperty("BLUEHIVE_DEV_UPDATE_URL")?.toString()
-                ?: "http://192.168.1.136:8090"
+            // PROD-first, DEV as the fallback. Nothing changes until a
+            // BLUEHIVE_PROD_* property exists, so release builds keep pointing at
+            // the LAN box exactly as before — but the cutover is then just adding
+            //   BLUEHIVE_PROD_BASE_URL=https://api.<domain>/
+            // to gradle.properties, with no edit to this file.
+            //
+            // https matters beyond the cert: the release network-security-config
+            // sets cleartextTrafficPermitted=false, so an http:// prod URL would
+            // be refused by the platform, not merely insecure. And HTTP/3 needs
+            // TLS — see the h3 block in the backend Caddyfile.
+            fun prop(name: String): String? =
+                project.findProperty("BLUEHIVE_PROD_$name")?.toString()
+                    ?: project.findProperty("BLUEHIVE_DEV_$name")?.toString()
+
+            val prodBaseUrl     = prop("BASE_URL")     ?: "http://192.168.1.136:8000/"
+            val prodApiKey      = prop("API_KEY")      ?: ""
+            val prodPlatformUrl = prop("PLATFORM_URL") ?: "http://192.168.1.136:9000"
+            val prodUpdateUrl   = prop("UPDATE_URL")   ?: "http://192.168.1.136:8090"
 
             buildConfigField("String", "API_BASE_URL", "\"$prodBaseUrl\"")
             buildConfigField("String", "API_KEY", "\"$prodApiKey\"")
@@ -225,9 +234,17 @@ android {
 
             signingConfig = signingConfigs.getByName("release")
 
+            // armeabi-v7a ONLY for shipped builds.
+            //
+            // Every ARM Android TV device runs v7a, including 64-bit ones, so this
+            // is the universal choice — while x86_64 only serves emulators and a
+            // handful of x86 boxes. It cost nothing until cronet-embedded arrived;
+            // that ships a full Chromium network stack per ABI, which took the
+            // release APK from ~30MB to 204MB. Dropping the unused ABI gives most
+            // of that back. Re-add x86_64 only if you actually ship to x86.
             ndk {
                 abiFilters.clear()
-                abiFilters += listOf("armeabi-v7a", "x86_64")
+                abiFilters += listOf("armeabi-v7a")
             }
         }
 
@@ -320,6 +337,21 @@ dependencies {
 
     implementation("androidx.media3:media3-datasource-okhttp:${media3Version}")
     implementation(libs.okhttp.urlconnection)
+
+    // ── HTTP/3 (QUIC) data source ────────────────────────────────────────────
+    // OkHttp cannot speak HTTP/3 at all. Cronet (Chrome's network stack) can,
+    // and that is the whole point here: CUJO reads the hostname from the TLS
+    // ClientHello on TCP, while QUIC runs over UDP/443 which consumer filters
+    // overwhelmingly do not inspect. MEASURED: GeckoView reached vidfast.vc
+    // where curl failed 0/12 from the same box, and the CDNs advertise
+    // `alt-svc: h3=":443"` — so the browser has a road the player doesn't.
+    //
+    // cronet-embedded, not play-services-cronet: it adds ~10MB but works even
+    // where Play Services Cronet is missing or stale, which on a cheap TV box
+    // is not a safe assumption. ExoPlayerConfig falls back to OkHttp if the
+    // engine fails to build, so this can only add a path, never remove one.
+    implementation("androidx.media3:media3-datasource-cronet:${media3Version}")
+    implementation("org.chromium.net:cronet-embedded:119.6045.31")
 
 
     // ═══════════════════════════════════════════════════════════

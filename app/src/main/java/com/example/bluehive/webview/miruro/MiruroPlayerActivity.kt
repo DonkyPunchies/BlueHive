@@ -42,8 +42,8 @@ import com.example.bluehive.utilities.VideoQualityOverlay
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
-import com.example.bluehive.api.AnimeFallbackRequest
 import com.example.bluehive.api.ApiClient
+import com.example.bluehive.api.RelayGrantRequest
 import com.example.bluehive.webview.exoplayer_resources.ExoPlayerConfig
 import com.example.bluehive.api.WatchHistoryRequest
 import kotlinx.coroutines.CoroutineScope
@@ -94,39 +94,6 @@ class MiruroPlayerActivity : ComponentActivity() {
      */
     private fun isNetworkFailure(error: PlaybackException): Boolean =
         error.errorCode in 2000..2999
-
-    /**
-     * Tell the backend this device had to use the relay, so it lands in
-     * logs/Anime_Fallback_Record.log. Fire-and-forget — a reporting failure must
-     * never disturb the playback that is already recovering.
-     */
-    private fun reportFallback(error: PlaybackException, directUrl: String?) {
-        val mediaId = intent.getStringExtra("MEDIA_ID")?.toIntOrNull() ?: return
-        val cdnHost = directUrl?.let {
-            runCatching { java.net.URI(it).host }.getOrNull()
-        }
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                ApiClient.bluehiveApi.reportAnimeFallback(
-                    AnimeFallbackRequest(
-                        profile_id     = intent.getIntExtra("PROFILE_ID", -1).takeIf { it != -1 },
-                        media_tmdb_id  = mediaId,
-                        media_type     = intent.getStringExtra("MEDIA_TYPE") ?: "tv",
-                        media_title    = intent.getStringExtra("MEDIA_TITLE"),
-                        season_number  = intent.getIntExtra("SEASON_NUMBER", 0).takeIf { it > 0 },
-                        episode_number = intent.getIntExtra("EPISODE_NUMBER", 0).takeIf { it > 0 },
-                        episode_name   = intent.getStringExtra("EPISODE_NAME"),
-                        source_name    = intent.getStringExtra("SOURCE_NAME"),
-                        error_code     = error.errorCodeName,
-                        cdn_host       = cdnHost,
-                    )
-                )
-                Log.d(sCRAPE, "📝 fallback recorded (tmdb=$mediaId cdn=$cdnHost)")
-            } catch (e: Exception) {
-                Log.w(sCRAPE, "fallback report failed (non-fatal): ${e.message}")
-            }
-        }
-    }
 
     /** POST the watch-history row. Fire-and-forget: never block or fail playback. */
     private fun logWatchOnPlaybackConfirmed() {
@@ -219,7 +186,7 @@ class MiruroPlayerActivity : ComponentActivity() {
         // Buffering / bitrate / networking come from the shared ExoPlayerConfig so
         // every site's player behaves identically. Only requestHeaders above are
         // Miruro-specific (its CDN pins Origin to miruro.tv).
-        val httpFactory = ExoPlayerConfig.dataSourceFactory(ua, requestHeaders)
+        val httpFactory = ExoPlayerConfig.dataSourceFactory(ua, requestHeaders, context = this)
 
         fun buildMediaSource(playUrl: String): HlsMediaSource =
             ExoPlayerConfig.hlsMediaSource(playUrl, httpFactory)
@@ -260,11 +227,31 @@ class MiruroPlayerActivity : ComponentActivity() {
                         Log.w(sCRAPE,
                             "🔀 direct CDN unreachable (${error.errorCodeName}) — " +
                             "falling back to HLS relay, resuming at ${resumeAt}ms")
-                        reportFallback(error, url)
-                        setMediaSource(buildMediaSource(fb))
-                        prepare()
-                        if (resumeAt > 0) seekTo(resumeAt)
-                        playWhenReady = true
+                        // Tag the relay with WHAT drove us here. It rides the
+                        // master-playlist request only — _proxify propagates just
+                        // the sid to segments — which is exactly where register()
+                        // reads it, so it costs one query param, once.
+                        val relayUrl = fb + "&err=" + java.net.URLEncoder.encode(
+                            error.errorCodeName, "UTF-8")
+                        // The relay refuses an unauthorised URL, so mint a grant
+                        // first — see RelayGrantRequest. Async, hence the switch
+                        // to the player happens in the coroutine below.
+                        lifecycleScope.launch {
+                            val granted = runCatching {
+                                ApiClient.bluehiveApi.mintRelayGrant(
+                                    RelayGrantRequest(relayUrl))
+                            }.getOrNull()?.takeIf { it.isSuccessful }?.body()?.relay_url
+                            if (granted.isNullOrBlank()) {
+                                Log.e(sCRAPE, "🛑 relay grant refused — cannot recover")
+                                return@launch
+                            }
+                            player?.apply {
+                                setMediaSource(buildMediaSource(granted))
+                                prepare()
+                                if (resumeAt > 0) seekTo(resumeAt)
+                                playWhenReady = true
+                            }
+                        }
                     } else if (usingFallback) {
                         Log.e(sCRAPE, "❌ relay failed too — nothing left to try")
                     }

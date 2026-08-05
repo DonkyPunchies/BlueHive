@@ -223,18 +223,54 @@ data class WatchHistoryResponse(
 )
 
 
-/** Sent when anime playback had to fall back from the direct CDN to the HLS relay. */
-data class AnimeFallbackRequest(
-    val profile_id:     Int?,
-    val media_tmdb_id:  Int,
-    val media_type:     String,
-    val media_title:    String?,
-    val season_number:  Int?,
-    val episode_number: Int?,
-    val episode_name:   String?,
-    val source_name:    String?,
-    val error_code:     String?,
-    val cdn_host:       String?,
+/**
+ * Result of a server-side extraction — see [BluehiveApiService.extractStream].
+ *
+ * `referer` is the EMBED PAGE origin (https://vidfast.vc/), not the manifest's
+ * own host. The CDN validates it, and sending the manifest host instead 403s
+ * every segment while extraction itself looks fine — the exact failure seen on
+ * the first on-device test.
+ *
+ * `proxy_url` is the RELAY fallback, not the normal path. The player tries the
+ * CDN directly and only switches to this after a confirmed IO failure, because
+ * relaying pushes every video byte through the backend (~1 GB per episode each
+ * way). It is what recovers an ISP-filtered line, where re-extraction cannot:
+ * the source pins one CDN host per episode and hands back the same one.
+ */
+data class ExtractResponse(
+    val m3u8:         String,
+    val referer:      String?,
+    val user_agent:   String?,
+    val subtitle_url: String?,
+    val page_url:     String?,
+    val proxy_url:    String?,
+    val cached:       Boolean = false,
+    val expires_in:   Int     = 0,
+)
+
+
+
+/**
+ * Ask the backend to authorise ONE relayed playback.
+ *
+ * The relay refuses a bare X-API-Key: that key is a plaintext constant in this
+ * APK, so on its own it made the proxy usable by anyone who unzipped the app.
+ * A grant is signed server-side from the VERIFIED user token, pinned to this
+ * device and to the stream's host, and expires.
+ *
+ * It rides in the URL rather than a header because the player builds its data
+ * source once and then fetches segments for a whole episode — an access token
+ * would expire long before the credits.
+ */
+data class RelayGrantRequest(
+    val relay_url: String,
+)
+
+data class RelayGrantResponse(
+    val relay_url:        String,
+    val expires_in:       Int  = 0,
+    val daily_used_bytes: Long = 0,
+    val daily_cap_bytes:  Long = 0,
 )
 
 
@@ -383,13 +419,48 @@ interface BluehiveApiService {
     @POST("/api/android/end-session")
     suspend fun endSession(): Response<SimpleOkResponse>
 
-    // Reported when the player could NOT reach the CDN directly and had to fall
-    // back to the HLS relay. Written to logs/Anime_Fallback_Record.log server-side.
-    // user_id / device_id come from the token, not this body.
-    @POST("/api/android/anime-fallback")
-    suspend fun reportAnimeFallback(
-        @Body body: AnimeFallbackRequest,
-    ): Response<Unit>
+    /**
+     * Server-side m3u8 extraction (VidFast).
+     *
+     * Replaces the on-device extractor, which cannot work on a filtered line:
+     * `vidfast.vc` is refused to every client on the device (measured from the TV
+     * 2026-08-02, 0/3 with Spectrum Shield on, 3/3 with it off) because the filter
+     * reads the hostname from the TLS ClientHello and severs the handshake. The
+     * backend loads the embed page where the filter isn't and returns just the
+     * URL; the TV still streams from the CDN directly, so no video bytes cross
+     * the backend.
+     *
+     * Safe to hand a manifest extracted elsewhere: CDN tokens are Referer-bound,
+     * NOT IP-bound — verified by extracting through a VPN and then playing 105s
+     * with the tunnel down and zero load errors.
+     *
+     * Cached server-side per (source, type, tmdb, season, episode), so every
+     * device asking for the same episode gets the same answer without re-running
+     * a browser. Pass refresh=1 to force a fresh extraction when a token dies
+     * mid-play.
+     */
+    @GET("/api/extract")
+    suspend fun extractStream(
+        @Query("type")     type:     String,          // "tv" | "movie"
+        @Query("tmdb_id")  tmdbId:   Int,
+        @Query("season")   season:   Int? = null,
+        @Query("episode")  episode:  Int? = null,
+        @Query("source")   source:   String = "vidfast",
+        @Query("refresh")  refresh:  Int    = 0,
+        // Relay accounting only — these decorate proxy_url so a fallback to the
+        // relay lands in bluehive.relay_sessions as a named title rather than an
+        // anonymous byte count. They are NOT part of the server's cache key, so
+        // omitting them changes nothing about playback.
+        @Query("mtype")    mtype:    String? = null,   // anime_tv | anime_movie
+        @Query("title")    title:    String? = null,
+        @Query("profile")  profile:  Int?    = null,
+        @Query("device")   device:   String? = null,
+    ): Response<ExtractResponse>
+
+    @POST("/api/hls/grant")
+    suspend fun mintRelayGrant(
+        @Body body: RelayGrantRequest,
+    ): Response<RelayGrantResponse>
 
     @POST("/api/android/background")
     suspend fun background(): Response<SimpleOkResponse>

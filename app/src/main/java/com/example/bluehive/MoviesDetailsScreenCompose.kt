@@ -55,6 +55,7 @@ import com.example.bluehive.api.isJapaneseAnimation
 import com.example.bluehive.api.buildJapaneseAnimationSources
 import com.example.bluehive.webview.miruro.MiruroPlayerActivity
 import java.net.URLEncoder
+import com.example.bluehive.auth.SessionManager
 import android.app.Activity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -391,9 +392,9 @@ private fun getStreamingSources(mediaType: String, mediaId: Int): List<MoviesDet
     return when(mediaType) {
         "movie" -> listOf(
             MoviesDetailsScreenCompose.StreamingSource(
-                "Purple Stream",
-                "VidSpark",
-                    "https://ww2.moviesapi.to/movie/$mediaId"
+                "Royal Jelly",
+                "VidEasy",
+                "https://player.videasy.net/movie/$mediaId"
             ),
             MoviesDetailsScreenCompose.StreamingSource(
                 "Queen Stream",
@@ -409,9 +410,9 @@ private fun getStreamingSources(mediaType: String, mediaId: Int): List<MoviesDet
                 useExtractor = true
             ),
             MoviesDetailsScreenCompose.StreamingSource(
-                "Royal Jelly",
-                "VidEasy",
-                "https://player.videasy.net/movie/$mediaId"
+                "Purple Stream",
+                "VidSpark",
+                    "https://ww2.moviesapi.to/movie/$mediaId"
             ),
             MoviesDetailsScreenCompose.StreamingSource(
                 "Swarm Stream",
@@ -513,6 +514,21 @@ fun MoviesDetailsScreenContent(
     var isCheckingServers by remember { mutableStateOf(false) } // phase 1: enumerating servers
     var showServerPicker  by remember { mutableStateOf(false) } // phase 1 result: the picker
     var showServerError   by remember { mutableStateOf(false) } // transient failure toast
+
+    // ── Backend-extracted sources (VidFast / VidEasy / VidSpark) ───────────────
+    // Same flow the TV screen already has: picking one raises a two-button choice
+    // instead of playing immediately — ExoPlayer (server-side m3u8 extraction,
+    // light + resume-capable) or Gecko (the embed, as before).
+    //
+    // Deliberately NOT reusing `useExtractor`: that flag means the ON-DEVICE
+    // VidApi extractor activity, which is a different mechanism (activity-for-
+    // result vs. a suspend HTTP call) with different failure handling. Overloading
+    // it would send VidFast through VidApi's retry/fallback machinery.
+    var backendChoiceFor by remember { mutableStateOf<MoviesDetailsScreenCompose.StreamingSource?>(null) }
+    var isBackendExtract by remember { mutableStateOf(false) }
+    var backendStatus    by remember { mutableStateOf("") }
+    /** Non-null shows ExtractionErrorOverlay — a failure the user can act on. */
+    var extractionError  by remember { mutableStateOf<String?>(null) }
     var pendingUrl        by remember { mutableStateOf<String?>(null) }
     var pendingDub        by remember { mutableStateOf(false) }
     var serverOptions     by remember { mutableStateOf<List<ServerOption>>(emptyList()) }
@@ -651,8 +667,11 @@ fun MoviesDetailsScreenContent(
             // relay works around ISPs that DNS-hijack the CDN, but costs ~1 GB of
             // backend transfer each way per episode, so it is now the fallback
             // rather than the default path.
-            val proxied = BuildConfig.API_BASE_URL.trimEnd('/') +
-                    "/api/hls/proxy?url=" + URLEncoder.encode(m3u8, "UTF-8")
+            val proxied = animeRelayUrl(
+                m3u8 = m3u8, tmdbId = tmdbId, mediaType = "anime_movie",
+                title = mediaTitle, profileId = favoriteProfileId,
+                sourceName = if (pendingDub) "Miruro (Dub)" else "Miruro (Sub)",
+            )
             Log.d("scraper", "M Extract → direct=$m3u8  (relay fallback ready)")
             // ── Record the watch ────────────────────────────────────────
             // The DuB/SuB path goes straight to MiruroPlayerActivity and never
@@ -867,6 +886,93 @@ fun MoviesDetailsScreenContent(
                 }
             }
         }
+    }
+
+    /**
+     * Server-side extraction for VidFast / VidEasy / VidSpark, then our own player.
+     *
+     * The movie twin of TVShowsDetailsScreenCompose.extractAndPlay — same endpoint,
+     * same contract, minus season/episode. Kept as its own function rather than
+     * shared because the two screens hold different state (no pendingSeason here)
+     * and the Intent extras differ.
+     *
+     * WHY SERVER-SIDE: `vidfast.pro` is refused to every client on a Shield-filtered
+     * line — the filter reads the hostname out of the TLS ClientHello and severs
+     * the handshake. The backend loads the embed where the filter isn't and returns
+     * only the URL; the TV still streams from the CDN directly, so no video bytes
+     * cross the backend.
+     *
+     * No retry loop: the server caches per title and deduplicates concurrent
+     * requests, so a second client attempt just re-asks for the same answer.
+     */
+    suspend fun extractAndPlayMovie(src: MoviesDetailsScreenCompose.StreamingSource) {
+        isExtracting     = true
+        isBackendExtract = true
+        extractPending   = true
+        extractStage     = 1
+        backendStatus    = "Finding your stream…"
+
+        // Display name IS the backend key once lowercased — see usesBackendExtraction.
+        val sourceKey = src.name.lowercase()
+
+        val startedAt = System.currentTimeMillis()
+        val result = runCatching {
+            ApiClient.bluehiveApi.extractStream(
+                type   = "movie",
+                tmdbId = tmdbId,
+                source = sourceKey,
+                // Accounting only — see the TV screen's extractAndPlay.
+                mtype   = mediaType,
+                title   = mediaTitle,
+                profile = favoriteProfileId,
+                device  = SessionManager.get().deviceFingerprint,
+            )
+        }
+        val tookMs = System.currentTimeMillis() - startedAt
+
+        isExtracting     = false
+        isBackendExtract = false
+        extractPending   = false
+        backendStatus    = ""
+
+        val body = result.getOrNull()?.takeIf { it.isSuccessful }?.body()
+        if (body == null || body.m3u8.isBlank()) {
+            val resp   = result.getOrNull()
+            val code   = resp?.code()
+            val reason = parseExtractReason(resp)
+            Log.e("scraper-vidfast", "movie extraction failed (http=$code reason=$reason src=${src.name}) " +
+                    "${result.exceptionOrNull()?.javaClass?.simpleName ?: ""}")
+            extractionError = extractionErrorMessage(code, reason, src.name, "movie")
+            return
+        }
+
+        Log.d("scraper-vidfast", "▶️ movie ${src.name} " +
+                "playlist=${runCatching { android.net.Uri.parse(body.m3u8).host }.getOrNull()} " +
+                "cached=${body.cached} expires_in=${body.expires_in}s extract=${tookMs}ms")
+
+        context.startActivity(
+            Intent(context, HlsPlayerActivity::class.java)
+                .putExtra("M3U8_URL", body.m3u8)
+                // The EMBED PAGE origin, not the manifest host — the CDN validates
+                // it, and sending the manifest's own host 403s every segment while
+                // extraction still looks like it worked.
+                .putExtra("REFERER", body.referer)
+                .putExtra("UA", body.user_agent)
+                .putExtra("TMDB_ID", tmdbId)
+                // Blank ON PURPOSE: these sources have no on-device extractor. The
+                // player reads it as "ask the backend instead" and calls
+                // /api/extract?refresh=1 — see HlsPlayerActivity.reextractViaBackend.
+                .putExtra(HlsExtract.EXTRA_EXTRACTOR_CLASS, "")
+                .putExtra("EMBED_URL", src.url)
+                // Which source to re-ask on a mid-play failure; without it the
+                // player would always re-extract VidFast.
+                .putExtra("EXTRACT_SOURCE", sourceKey)
+                .putExtra("PROFILE_ID",  favoriteProfileId)
+                .putExtra("MEDIA_TYPE",  mediaType)
+                .putExtra("MEDIA_TITLE", mediaTitle)
+                .putExtra("SOURCE_NAME", src.name)
+                .putExtra("SUBTITLE_URL", body.subtitle_url)
+        )
     }
 
     val launchVidApiExtract: (String, String) -> Unit = { name, url ->
@@ -1709,7 +1815,12 @@ fun MoviesDetailsScreenContent(
                             // Extractor sources → headless m3u8 extraction + ExoPlayer
                             // (overlay shows progress); everything else keeps the WebView
                             // path. Keyed off the source flag, not its name/slot.
-                            if (source.useExtractor) {
+                            if (usesBackendExtraction(source.name)) {
+                                // Raise the ExoPlayer-vs-Gecko prompt. Checked
+                                // BEFORE useExtractor so a source can never take
+                                // both paths if it somehow carries the flag too.
+                                backendChoiceFor = source
+                            } else if (source.useExtractor) {
                                 // Remember it so a failed extraction can fall back
                                 // to this same source's embed.
                                 extractFallbackSource = source
@@ -1786,6 +1897,39 @@ fun MoviesDetailsScreenContent(
                     .padding(bottom = 70.dp)
                     .background(Color(0xE6000000), RoundedCornerShape(10.dp))
                     .padding(horizontal = 26.dp, vertical = 12.dp)
+            )
+        }
+
+        // ── Backend-extracted sources: which player? ────────────────────────
+        // Same component and wording as the TV screen, so the two flows are
+        // indistinguishable to the user. ExoPlayer = extract server-side then play
+        // in our own player (light, resume-capable); Gecko = the embed as before.
+        backendChoiceFor?.let { choiceSrc ->
+            DefaultServerPrompt(
+                message     = "Watch with our player,\nor open the site directly?",
+                defaultText = "Watch on ExoPlayer",
+                chooseText  = "Watch on Gecko",
+                onDefault   = {
+                    backendChoiceFor = null
+                    isTrailerPlaying = false; hasTrailerBeenPlayed = false
+                    try { BlueHiveApplication.coilImageLoader.memoryCache?.clear() } catch (_: Exception) {}
+                    // Extraction is a suspend HTTP call, not an activity-for-result,
+                    // so it runs on this screen's scope. The function owns the
+                    // overlay state and starts the player itself.
+                    coroutineScope.launch { extractAndPlayMovie(choiceSrc) }
+                },
+                onChoose    = {
+                    backendChoiceFor = null
+                    onStreamingSourceSelected(choiceSrc)
+                }
+            )
+        }
+
+        // Extraction failure the user can act on ("try another source").
+        extractionError?.let { msg ->
+            com.example.bluehive.webview.ExtractionErrorOverlay(
+                message = msg,
+                onDismiss = { extractionError = null }
             )
         }
 

@@ -434,6 +434,13 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
     override fun onCreate() {
         super.onCreate()
 
+        // Deliberately BEFORE the multi-process guard and before any networking.
+        // Backend clients ask LanNetwork for a socket at connect time, and until
+        // the callback has fired they get the default one — which a VPN swallows.
+        // Cheap, idempotent, and per-process, so helper processes running their
+        // own ApiClient are covered too.
+        com.example.bluehive.net.LanNetwork.init(this)
+
         // ── Multi-process guard ──────────────────────────────────────────────
         // GeckoView spawns helper processes (:tab*, :gpu, :crashhelper) that
         // share our Application class. Each one re-runs onCreate(), and without

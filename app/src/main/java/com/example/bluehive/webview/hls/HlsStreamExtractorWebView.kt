@@ -76,7 +76,9 @@ class HlsStreamExtractorWebView private constructor() {
         // we can see which .m3u8 we grab (master vs index) and whether a subtitle
         // request auto-fires. Works in RELEASE builds (not gated on DEBUG). Filter
         // Logcat by tag `scraper-vidapi` + text `REQ`. Flip to false when done.
-        private const val VERBOSE_REQUESTS = false
+        // TEMPORARY — on to capture VidFast's request chain for the server-side
+        // extractor. Revert to false once captured.
+        private const val VERBOSE_REQUESTS = true
 
         private const val TIMEOUT_MS         = 60_000L   // server auto-probe can be slow
         private const val FIRST_CLICK_DELAY  = 2_000L

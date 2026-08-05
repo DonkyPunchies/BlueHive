@@ -105,13 +105,14 @@ import com.example.bluehive.webview.ExtractionLoadingOverlay
 import com.example.bluehive.webview.miruro.MiruroPlayerActivity
 import com.example.bluehive.webview.hls.HlsExtract
 import com.example.bluehive.webview.hls.HlsPlayerActivity
-import com.example.bluehive.webview.vidfast.VidFastExtractorActivity
 import com.example.bluehive.webview.miruro.MiruroExtractorActivity
 import android.app.Activity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import java.net.URLEncoder
+import java.util.UUID
+import com.example.bluehive.auth.SessionManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.android.awaitFrame
 import kotlinx.coroutines.withContext
@@ -122,22 +123,15 @@ import kotlinx.coroutines.withContext
 // uses CW_NAV_REPEAT_MS = 70L; episode tiles are chunkier, so this starts a touch slower.)
 private const val EPISODE_NAV_REPEAT_MS = 140L
 
-/**
- * How many times to attempt VidFast m3u8 extraction before giving up and handing
- * off to the GeckoView embed.
- *
- * WHY A RETRY EXISTS: VidFast is genuinely flaky, not reliably broken. A measured
- * case — extraction hit the 60s timeout with no master.m3u8, and the SAME episode
- * extracted fine 40s later in 39s. Without a retry that user paid a full minute of
- * loading and then got dropped into GeckoView: a whole browser engine resident for
- * the entire episode, which is the thing this extractor exists to avoid (it's what
- * OOM-killed the 2 GB box). One free retry converts most of those into a play.
- *
- * Cost of the bad case is one more extraction window (~60s worst case), which is
- * why this is 2 and not 3. Raising it also changes the retry banner's wording —
- * see where vidFastNote is built.
+/*
+ * VidFast extraction moved to the backend (see extractAndPlay below). The old
+ * on-device retry ladder is gone with it: it existed because the WebView
+ * extractor was flaky, and it could never help against the real failure on a
+ * filtered line, where `vidfast.vc` is refused deterministically and every retry
+ * bought another 60s timeout for the same result. The server caches per episode
+ * and deduplicates concurrent requests, so a client-side retry would only re-ask
+ * for an answer it already has.
  */
-private const val VIDFAST_MAX_ATTEMPTS = 2
 
 class TVShowsDetailsScreenCompose: ComponentActivity() {
 
@@ -457,6 +451,130 @@ class TVShowsDetailsScreenCompose: ComponentActivity() {
 }
 
 
+/**
+ * Sources that get the ExoPlayer-vs-Gecko prompt and the backend extractor,
+ * instead of going straight to the embed.
+ *
+ * The name doubles as the backend's source key once lowercased ("VidEasy" ->
+ * "videasy"), which is why the two must stay in step with `_SOURCES` in
+ * bluehive_plugin/extract.py — adding a source here without a template there
+ * yields a 400 from /api/extract.
+ *
+ * MEASURED 2026-08-03, and the difference matters:
+ *
+ *   VidFast + VidEasy → moon.ironwallnet.net, segments on rotating throwaway
+ *       `.site` hosts. Identical manifest token for the same episode, so they are
+ *       ONE upstream wearing two names — and roughly half those segment hosts are
+ *       severed by the ISP filter (signtime/housestrong/solaratom). Picking the
+ *       other one does not escape a blocked episode.
+ *
+ *   VidSpark → flixcdn.cyou, segments on *.tiktokcdn.com. A genuinely separate
+ *       upstream, and all three hosts complete a TLS handshake from the blocked
+ *       TV (3/3). An ISP cannot blocklist TikTok's CDN without breaking TikTok,
+ *       which makes this the real failover target rather than a second front door.
+ */
+/**
+ * Pull the backend's failure code out of a 502 body.
+ *
+ * /api/extract returns `{"detail": {"reason": "...", "detail": "..."}}` on a
+ * source failure. `reason` is a stable code (source_blocked / no_stream /
+ * timeout / unknown); the human-readable half lives in [extractionErrorMessage]
+ * so the wording is the app's business, not the API's.
+ *
+ * errorBody() is a one-shot stream — read it once, here, or a later caller gets
+ * an empty string and every failure looks like "unknown".
+ */
+internal fun parseExtractReason(resp: retrofit2.Response<*>?): String? = runCatching {
+    val raw = resp?.errorBody()?.string().orEmpty()
+    if (raw.isBlank()) null
+    else org.json.JSONObject(raw).optJSONObject("detail")?.optString("reason")?.ifBlank { null }
+}.getOrNull()
+
+/**
+ * What the user actually reads when extraction fails.
+ *
+ * WHY THIS EXISTS: every failure used to say "This episode isn't available from
+ * this source right now." MEASURED 2026-08-04 — picking VidFast on a filtered
+ * line fails because the ISP blocks `vidfast.vc`, and the app told the user the
+ * episode didn't exist. The remedy for that is "pick another source"; the remedy
+ * for a genuinely missing episode is the opposite. One message could not serve
+ * both, and the wrong one sends people hunting for a problem that isn't there.
+ *
+ * The source is NAMED. "Your network is blocking VidFast" is a fact someone can
+ * act on; "this source is unavailable" is not.
+ */
+internal fun extractionErrorMessage(
+    httpCode: Int?,
+    reason: String?,
+    sourceName: String,
+    unit: String,               // "episode" or "movie"
+): String = when {
+    // Our own extractor, not the source — a restart or a cold container.
+    httpCode == 503 ->
+        "$sourceName is starting up.\n\nGive it a moment and try again."
+
+    // The ISP severed the connection to the source's domain. Nothing the user
+    // can fix by retrying, and nothing wrong with the title itself.
+    reason == "source_blocked" ->
+        "Your network is blocking $sourceName.\n\nPick a different source below — " +
+            "the others usually work."
+
+    // Site loaded fine, produced no video. Usually the title genuinely isn't
+    // there (or hasn't aired yet).
+    reason == "no_stream" ->
+        "$sourceName doesn't have this $unit.\n\nTry a different source."
+
+    reason == "timeout" ->
+        "$sourceName took too long to respond.\n\nTry again, or pick another source."
+
+    else ->
+        "Couldn't load this $unit from $sourceName.\n\nTry another source."
+}
+
+/**
+ * Relay URL for an anime stream, tagged so the fallback can be accounted for.
+ *
+ * VidFast/VidEasy/VidSpark get this minted server-side by /api/extract, which
+ * already knows the episode. Miruro is extracted ON DEVICE, so the backend never
+ * sees the playback — without these tags an anime relay lands in
+ * bluehive.relay_sessions as an anonymous byte count with no title attached.
+ *
+ * The type is forced to anime_* rather than passing the screen's mediaType:
+ * Miruro is anime-only, and the whole point of the column is telling anime
+ * traffic apart from the rest.
+ *
+ * sid is minted per CALL, not per episode — the table answers "how many
+ * playbacks fell back to the relay", so two viewers of one episode are two rows.
+ */
+internal fun animeRelayUrl(
+    m3u8: String,
+    tmdbId: Int,
+    mediaType: String,          // anime_tv | anime_movie
+    title: String,
+    profileId: Int,
+    sourceName: String,
+    season: Int? = null,
+    episode: Int? = null,
+): String {
+    fun q(k: String, v: Any?): String =
+        if (v == null || v.toString().isBlank()) ""
+        else "&" + k + "=" + URLEncoder.encode(v.toString(), "UTF-8")
+
+    return BuildConfig.API_BASE_URL.trimEnd('/') +
+            "/api/hls/proxy?url=" + URLEncoder.encode(m3u8, "UTF-8") +
+            "&sid=" + UUID.randomUUID().toString().replace("-", "") +
+            q("tmdb", tmdbId) + q("mtype", mediaType) +
+            q("season", season) + q("episode", episode) +
+            q("src", sourceName) + q("title", title) +
+            q("profile", profileId.takeIf { it > 0 }) +
+            q("device", runCatching { SessionManager.get().deviceFingerprint }.getOrNull())
+}
+
+internal fun usesBackendExtraction(sourceName: String): Boolean =
+    sourceName.equals("VidFast", true) ||
+        sourceName.equals("VidEasy", true) ||
+        sourceName.equals("VidSpark", true)
+
 private fun getStreamingSources(
     mediaType: String,
     mediaId: Int,
@@ -466,9 +584,9 @@ private fun getStreamingSources(
     return when (mediaType) {
         "tv" -> listOf(
             TVShowsDetailsScreenCompose.StreamingSource(
-                "Purple Stream",
-                "VidSpark",
-                "https://ww2.moviesapi.to/tv/$mediaId/$seasonNumber/$episodeNumber"
+                "Royal Jelly",
+                "VidEasy",
+                "https://player.videasy.net/tv/$mediaId/$seasonNumber/$episodeNumber"
             ),
             TVShowsDetailsScreenCompose.StreamingSource(
                 "Queen Stream",
@@ -476,9 +594,9 @@ private fun getStreamingSources(
                  "https://vidfast.pro/tv/$mediaId/$seasonNumber/$episodeNumber?autoPlay=true"
             ),
             TVShowsDetailsScreenCompose.StreamingSource(
-                "Royal Jelly",
-                "VidEasy",
-                "https://player.videasy.net/tv/$mediaId/$seasonNumber/$episodeNumber"
+                "Purple Stream",
+                "VidSpark",
+                "https://vidflix.club/tv/$mediaId/$seasonNumber/$episodeNumber?autoPlay=true"
             ),
             TVShowsDetailsScreenCompose.StreamingSource(
                 "Swarm Stream",
@@ -873,42 +991,14 @@ fun TVShowsDetailsScreenContent(
     // REAL status text from the extractor process (empty = use the anime flow's
     // stage labels). This is what makes the overlay honest — see the receiver below.
     var vidFastStatus    by remember { mutableStateOf("") }
-    var vidFastFallback  by remember { mutableStateOf<TVShowsDetailsScreenCompose.StreamingSource?>(null) }
 
-    // ── Extraction retry (see VIDFAST_MAX_ATTEMPTS) ──────────────────────────
-    // Which attempt is in flight (1 = first, 2 = retry).
-    var vidFastAttempt by remember { mutableIntStateOf(0) }
-    // Persistent amber line on the loading overlay. Separate from vidFastStatus
-    // because that gets overwritten by the extractor's next milestone broadcast.
-    var vidFastNote    by remember { mutableStateOf<String?>(null) }
     /** Non-null shows ExtractionErrorOverlay — a failure the user can act on. */
     var extractionError by remember { mutableStateOf<String?>(null) }
-    // State hop for the relaunch. The result handler CAN'T relaunch its own
-    // launcher — inside its own lambda the val isn't initialised yet — so it posts
-    // the URL here and a LaunchedEffect declared after the launcher does the
-    // launch. Same trick as failoverRequest below.
-    var vidFastRetryUrl by remember { mutableStateOf<String?>(null) }
 
-    // The extractor runs in :vidfastextractor, so its progress can't be observed
-    // directly — it broadcasts each real milestone and we mirror it onto the
-    // overlay. No timers: a dot only advances when the extractor actually moved on.
-    val extractCtx = LocalContext.current
-    DisposableEffect(Unit) {
-        val receiver = object : android.content.BroadcastReceiver() {
-            override fun onReceive(c: android.content.Context?, i: Intent?) {
-                val s = i?.getStringExtra(VidFastExtractorActivity.EXTRA_STATUS) ?: return
-                vidFastStatus = s
-                extractStage  = i.getIntExtra(VidFastExtractorActivity.EXTRA_STAGE, extractStage)
-                Log.d("scraper-vidfast", "progress → $s (stage $extractStage)")
-            }
-        }
-        androidx.core.content.ContextCompat.registerReceiver(
-            extractCtx, receiver,
-            android.content.IntentFilter(VidFastExtractorActivity.ACTION_PROGRESS),
-            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
-        )
-        onDispose { runCatching { extractCtx.unregisterReceiver(receiver) } }
-    }
+    // The progress BroadcastReceiver is gone with the on-device extractor. It
+    // existed only to observe a separate :vidfastextractor process; extraction is
+    // now a single suspend call in THIS process, so the overlay's stage is set
+    // directly at each step below.
 
 
     var showDefaultPrompt by remember { mutableStateOf(false) }
@@ -950,152 +1040,117 @@ fun TVShowsDetailsScreenContent(
         } ?: emptyList()
     }
 
-    val vidFastExtractorLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { result ->
+    // ── Server-side extraction ───────────────────────────────────────────────
+    // Replaces the on-device extractor and its retry ladder. That extractor could
+    // not work on a filtered line at all: `vidfast.vc` is refused to every client
+    // on the device (measured from this TV 2026-08-02 — 0/3 with Spectrum Shield
+    // on, 3/3 with it off) because the filter reads the hostname out of the TLS
+    // ClientHello and severs the handshake. Retrying a deterministic block just
+    // spent 60s to fail identically.
+    //
+    // The backend loads the embed page where the filter isn't and returns only
+    // the URL. The TV still streams from the CDN directly — no video bytes cross
+    // the backend — which is legal because CDN tokens are Referer-bound, not
+    // IP-bound (verified: extracted through a VPN, played 105s with the tunnel
+    // down, zero load errors).
+    //
+    // No retry loop here on purpose. The server caches per episode and
+    // deduplicates concurrent requests, so a second attempt from the client would
+    // just re-ask for the same cached answer.
+    suspend fun extractAndPlay(src: TVShowsDetailsScreenCompose.StreamingSource) {
+        isExtracting     = true
+        isVidFastExtract = true
+        extractPending   = true
+        extractStage     = 1
+        vidFastStatus    = "Finding your stream…"
+
+        // Display name IS the backend key once lowercased — see
+        // usesBackendExtraction. Keeps one source of truth instead of a mapping
+        // that can silently drift from _SOURCES.
+        val sourceKey = src.name.lowercase()
+
+        val startedAt = System.currentTimeMillis()
+        val result = runCatching {
+            ApiClient.bluehiveApi.extractStream(
+                type    = "tv",
+                tmdbId  = tmdbId,
+                season  = pendingSeason,
+                episode = pendingEpisode,
+                source  = sourceKey,
+                // Accounting only — rides through to proxy_url so that IF this
+                // playback later falls back to the relay, the row says which
+                // title and source cost us the bytes instead of just "1.4 GB".
+                mtype   = mediaType,
+                title   = mediaTitle,
+                profile = favoriteProfileId,
+                device  = SessionManager.get().deviceFingerprint,
+            )
+        }
+        val tookMs = System.currentTimeMillis() - startedAt
+
         isExtracting     = false
         isVidFastExtract = false
         extractPending   = false
         vidFastStatus    = ""
 
-        val fallbackSrc = vidFastFallback
-        val data = result.data
-        val m3u8 = data?.getStringExtra(VidFastExtractorActivity.RESULT_M3U8)
-
-        if (result.resultCode == Activity.RESULT_OK && !m3u8.isNullOrBlank()) {
-            val ua = data.getStringExtra(VidFastExtractorActivity.RESULT_UA)
-            // VidFast's CDN validates the Referer against the EMBED PAGE origin
-            // (https://vidfast.vc/), not the m3u8's own host. The extractor's
-            // default self-referer (the CDN host) gets a 403 — the exact failure
-            // seen on first test: extraction succeeded, playback CDN-errored, and
-            // re-extraction with fresh tokens failed identically (headers, not
-            // tokens). Prefer the captured page origin; fall back to the self-
-            // referer only if the page URL is somehow missing.
-            val pageUrl = data.getStringExtra(VidFastExtractorActivity.RESULT_PAGE_URL)
-            val referer = pageUrl?.let {
-                runCatching {
-                    val u = android.net.Uri.parse(it)
-                    if (u.scheme != null && u.host != null) "${u.scheme}://${u.host}/" else null
-                }.getOrNull()
-            } ?: data.getStringExtra(VidFastExtractorActivity.RESULT_REFERER)
-            Log.d("scraper-vidfast", "▶️ playing extracted stream in ExoPlayer (referer=$referer, page=$pageUrl)")
-            // HlsPlayerActivity is the generic HLS player (headers, quality
-            // picker, on-demand captions). It logs watch history itself on
-            // confirmed playback — see its onIsPlayingChanged.
-            context.startActivity(
-                Intent(context, HlsPlayerActivity::class.java)
-                    .putExtra("M3U8_URL", m3u8)
-                    .putExtra("REFERER", referer)
-                    .putExtra("UA", ua)
-                    .putExtra("TMDB_ID", tmdbId)
-                    // Lets the player re-extract a fresh stream if the CDN token
-                    // dies mid-episode. Without it the player logs "cannot
-                    // re-extract" and just stops. Safe to point at the VidFast
-                    // embed — the probe confirmed this extractor handles it.
-                    .putExtra("EMBED_URL", fallbackSrc?.url)
-                    // Which extractor to re-run on a mid-play CDN failure. The
-                    // player is source-agnostic, so the caller names it.
-                    .putExtra(HlsExtract.EXTRA_EXTRACTOR_CLASS,
-                              VidFastExtractorActivity::class.java.name)
-                    .putExtra("PROFILE_ID",     favoriteProfileId)
-                    .putExtra("MEDIA_TYPE",     mediaType)
-                    .putExtra("MEDIA_TITLE",    mediaTitle)
-                    .putExtra("SEASON_NUMBER",  pendingSeason)
-                    .putExtra("EPISODE_NUMBER", pendingEpisode)
-                    .putExtra("EPISODE_NAME",   pendingEpisodeName)
-                    .putExtra("SOURCE_NAME",    "VidFast")
-                    // The site's own English caption, captured by the extractor's
-                    // subtitle hunt. Null when the hunt found nothing — the player
-                    // then falls back to OpenSubtitles as before.
-                    .putExtra("SUBTITLE_URL",
-                              data.getStringExtra(VidFastExtractorActivity.RESULT_SUBTITLE))
-            )
-        } else {
-            val failed = data?.getBooleanExtra(VidFastExtractorActivity.RESULT_FAILED, false) == true
-            val reason = data?.getStringExtra(VidFastExtractorActivity.RESULT_REASON)
-            // A network filter blocks every attempt identically, so retrying just
-            // costs another 60s timeout and ends with the same generic message.
-            // Say what actually happened instead.
-            val blocked = data?.getBooleanExtra(VidFastExtractorActivity.RESULT_BLOCKED, false) == true
-            val genuineFailure =
-                failed || (result.resultCode == Activity.RESULT_OK && m3u8.isNullOrBlank())
-            val retryUrl = fallbackSrc?.url
-
-            if (blocked) {
-                Log.e("scraper-vidfast", "🚧 blocked by network — not retrying: $reason")
-                extractionError = reason
-                    ?: "Your network is blocking this source."
-                vidFastFallback = null
-                vidFastAttempt  = 0
-                vidFastNote     = null
-                return@rememberLauncherForActivityResult
-            }
-
-            if (genuineFailure && vidFastAttempt < VIDFAST_MAX_ATTEMPTS && retryUrl != null) {
-                // ── Retry, don't fall back yet ───────────────────────────────
-                vidFastAttempt += 1
-                Log.w("scraper-vidfast",
-                      "⚠️ extraction failed (${reason ?: "no m3u8"}) — " +
-                          "retry $vidFastAttempt/$VIDFAST_MAX_ATTEMPTS")
-                vidFastNote = if (vidFastAttempt == 2) {
-                    "Failure on first extraction — attempting retry 2/$VIDFAST_MAX_ATTEMPTS"
-                } else {
-                    "Failure on attempt ${vidFastAttempt - 1} — " +
-                        "attempting retry $vidFastAttempt/$VIDFAST_MAX_ATTEMPTS"
-                }
-                // Keep the overlay up and rewind it to stage 1 — the attempt above
-                // cleared these, and the user should see one continuous load, not a
-                // flash back to the details screen and a second overlay.
-                isExtracting     = true
-                isVidFastExtract = true
-                extractPending   = true
-                extractStage     = 1
-                vidFastStatus    = "Retrying extraction…"
-                vidFastRetryUrl  = retryUrl
-                // Return early so vidFastFallback SURVIVES — the retry needs it for
-                // its own URL, and the Gecko hand-off needs it if the retry fails too.
-                return@rememberLauncherForActivityResult
-            }
-
-            if (genuineFailure) {
-                // Out of attempts → STOP. No GeckoView hand-off: the embed is a whole
-                // browser engine resident for the episode, which is what this
-                // extractor exists to avoid. The overlay is already gone
-                // (isExtracting was cleared at the top) so the user simply lands back
-                // on the details screen with the source buttons still focused, free
-                // to pick another one. Chaining to other sites is the planned
-                // replacement for the embed hand-off.
-                Log.w("scraper-vidfast",
-                      "🛑 extraction failed after $vidFastAttempt attempt(s) " +
-                          "(${reason ?: "no m3u8"}) — stopping, staying on details")
-            } else {
-                // Back button — a deliberate "no". Don't launch anything, and don't
-                // burn a retry on it either.
-                Log.d("scraper-vidfast", "user cancelled — no fallback")
-            }
+        val body = result.getOrNull()?.takeIf { it.isSuccessful }?.body()
+        if (body == null || body.m3u8.isBlank()) {
+            val resp   = result.getOrNull()
+            val code   = resp?.code()
+            val reason = parseExtractReason(resp)
+            Log.e("scraper-vidfast", "extraction failed (http=$code reason=$reason src=${src.name}) " +
+                    "${result.exceptionOrNull()?.javaClass?.simpleName ?: ""}")
+            extractionError = extractionErrorMessage(code, reason, src.name, "episode")
+            return
         }
-        vidFastFallback = null
-        vidFastAttempt  = 0
-        vidFastNote     = null
-    }
 
-    // Performs the relaunch posted by the result handler above. The small delay
-    // lets the failed :vidfastextractor process actually die before the next one
-    // spawns — two WebView processes at once is the memory spike we can't afford.
-    LaunchedEffect(vidFastRetryUrl) {
-        val url = vidFastRetryUrl ?: return@LaunchedEffect
-        // Do NOT clear vidFastRetryUrl here. It is this effect's KEY, so writing it
-        // makes Compose cancel this very coroutine mid-delay and the retry never
-        // launches at all - the overlay then hangs forever with no extractor in
-        // front. Cleared after the launch instead (which just restarts the effect
-        // once, harmlessly, on a null key).
-        delay(500)
-        Log.d("scraper-vidfast", "🔁 relaunching extractor (attempt $vidFastAttempt) → $url")
-        vidFastExtractorLauncher.launch(
-            Intent(context, VidFastExtractorActivity::class.java)
-                .putExtra(VidFastExtractorActivity.EXTRA_URL, url)
+        // Host + timing so an extraction can be matched to the playback it
+        // produced. `cached` explains the latency (a hit is a Redis GET, a miss
+        // is a real browser run) and `expires_in` says how stale the manifest
+        // already was when playback started — the number that mattered when an
+        // episode died 31 minutes in.
+        Log.d("scraper-vidfast", "▶️ s${pendingSeason}e${pendingEpisode} " +
+                "playlist=${runCatching { android.net.Uri.parse(body.m3u8).host }.getOrNull()} " +
+                "cached=${body.cached} expires_in=${body.expires_in}s " +
+                "extract=${tookMs}ms referer=${body.referer}")
+
+        context.startActivity(
+            Intent(context, HlsPlayerActivity::class.java)
+                .putExtra("M3U8_URL", body.m3u8)
+                // DIRECT FIRST, relay only after a confirmed failure. Re-extracting
+                // can't fix a blocked CDN — the source pins one host per episode and
+                // returns the same one — so this is what actually recovers a
+                // filtered line. Already tagged with the episode by /api/extract, so
+                // the fallback lands in bluehive.relay_sessions attributed.
+                .putExtra("M3U8_FALLBACK_URL", body.proxy_url)
+                // The EMBED PAGE origin, not the manifest host. The CDN validates
+                // it; sending the manifest's own host 403s every segment while
+                // extraction still looks like it worked.
+                .putExtra("REFERER", body.referer)
+                .putExtra("UA", body.user_agent)
+                .putExtra("TMDB_ID", tmdbId)
+                // Blank ON PURPOSE: there is no on-device extractor for VidFast any
+                // more. The player reads this as "ask the backend instead" and calls
+                // /api/extract?refresh=1 — see HlsPlayerActivity.reextractViaBackend.
+                // EMBED_URL still travels because the player uses it as the "can I
+                // recover at all" signal before trying.
+                .putExtra(HlsExtract.EXTRA_EXTRACTOR_CLASS, "")
+                .putExtra("EMBED_URL", src.url)
+                // Which backend source to re-ask when a manifest dies mid-play.
+                // Without it the player would always re-extract VidFast, quietly
+                // swapping the user onto a different source's stream.
+                .putExtra("EXTRACT_SOURCE", sourceKey)
+                .putExtra("PROFILE_ID",     favoriteProfileId)
+                .putExtra("MEDIA_TYPE",     mediaType)
+                .putExtra("MEDIA_TITLE",    mediaTitle)
+                .putExtra("SEASON_NUMBER",  pendingSeason)
+                .putExtra("EPISODE_NUMBER", pendingEpisode)
+                .putExtra("EPISODE_NAME",   pendingEpisodeName)
+                .putExtra("SOURCE_NAME",    src.name)
+                // The site's own English caption when the extractor saw one; the
+                // player falls back to OpenSubtitles when it's null, as before.
+                .putExtra("SUBTITLE_URL",   body.subtitle_url)
         )
-        vidFastRetryUrl = null
     }
 
     // Server lists captured during a DEFAULT extraction, cached for the lifetime
@@ -1152,22 +1207,16 @@ fun TVShowsDetailsScreenContent(
     }
 
     // ── BACK cancels an extraction in progress ───────────────────────────────
-    // While the extractor Activity is in front it handles BACK itself. But the
-    // loading overlay also covers windows where the details screen is the focused
-    // Activity — the gap between a failed attempt and the retry launching, and the
-    // moments around the extractor process starting and dying. BACK there used to
-    // fall through to the Activity's own handler and leave the details screen
-    // entirely, so a retry could only be escaped by abandoning the page.
+    // Extraction is an in-process HTTP call now, so the details screen is always
+    // the focused Activity while the overlay is up. Without this, BACK falls
+    // through to the Activity handler and leaves the page entirely instead of
+    // just dismissing the overlay.
     //
-    // Nulling vidFastRetryUrl also CANCELS a queued retry: the relaunch waits in a
-    // LaunchedEffect keyed on that value, so changing it tears the pending
-    // coroutine down mid-delay.
+    // The request itself is left to finish rather than cancelled: it is a few
+    // hundred bytes, and the result lands in the server's cache where the next
+    // play picks it up instantly.
     BackHandler(enabled = isExtracting || extractPending) {
-        Log.d("scraper-vidfast", "↩️ back during extraction — cancelling")
-        vidFastRetryUrl  = null
-        vidFastAttempt   = 0
-        vidFastNote      = null
-        vidFastFallback  = null
+        Log.d("scraper-vidfast", "↩️ back during extraction — dismissing overlay")
         isVidFastExtract = false
         vidFastStatus    = ""
         extractPending   = false
@@ -1247,8 +1296,12 @@ fun TVShowsDetailsScreenContent(
             // backend (~1 GB per episode each way). Most networks reach the CDN
             // fine, so we hand the player both URLs and let it fall back only if
             // the direct attempt actually fails — see MiruroPlayerActivity.
-            val proxied = BuildConfig.API_BASE_URL.trimEnd('/') +
-                    "/api/hls/proxy?url=" + URLEncoder.encode(m3u8, "UTF-8")
+            val proxied = animeRelayUrl(
+                m3u8 = m3u8, tmdbId = tmdbId, mediaType = "anime_tv",
+                title = mediaTitle, profileId = favoriteProfileId,
+                sourceName = if (pendingDub) "Miruro (Dub)" else "Miruro (Sub)",
+                season = pendingSeason, episode = pendingEpisode,
+            )
             Log.d("scraper", "M Extract → direct=$m3u8  (relay fallback ready)")
             // Everything the player needs to log the watch itself. It writes the
             // row only once video is actually rolling (onIsPlayingChanged), so a
@@ -2637,7 +2690,7 @@ fun TVShowsDetailsScreenContent(
                                     episodeSources.indexOfFirst { it.name == source.name }
                                 )
 
-                                if (source.name.equals("VidFast", true)) {
+                                if (usesBackendExtraction(source.name)) {
                                     // Raise the player prompt. Remember the episode
                                     // now, because the prompt's callbacks fire after
                                     // this scope is gone.
@@ -2733,7 +2786,7 @@ fun TVShowsDetailsScreenContent(
                 },
                 stage = extractStage,
                 // Amber line: "Failure on first extraction — attempting retry 2/2".
-                note  = vidFastNote
+                note  = null
             )
         }
 
@@ -2793,19 +2846,11 @@ fun TVShowsDetailsScreenContent(
                     // which is what lets focus return to it on the way back. Every
                     // other source already behaves this way.
                     onEpisodeSelected(pendingSeason, pendingEpisode, pendingEpisodeName)
-                    vidFastFallback  = choiceSrc
-                    isVidFastExtract = true
-                    vidFastStatus    = "Starting extraction…"
-                    // Fresh play → attempt 1, no retry banner carried over.
-                    vidFastAttempt   = 1
-                    vidFastNote      = null
-                    extractPending   = true
-                    isExtracting     = true
                     try { BlueHiveApplication.coilImageLoader.memoryCache?.clear() } catch (_: Exception) {}
-                    vidFastExtractorLauncher.launch(
-                        Intent(context, VidFastExtractorActivity::class.java)
-                            .putExtra(VidFastExtractorActivity.EXTRA_URL, choiceSrc.url)
-                    )
+                    // Extraction is an HTTP call now, not an activity-for-result,
+                    // so it runs on this screen's scope. extractAndPlay owns the
+                    // overlay state and starts the player itself.
+                    coroutineScope.launch { extractAndPlay(choiceSrc) }
                 },
                 onChoose    = {
                     vidFastChoiceFor = null
