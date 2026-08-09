@@ -11,6 +11,7 @@ import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.LoadControl
 import androidx.media3.exoplayer.hls.HlsMediaSource
+import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -958,6 +959,24 @@ object ExoPlayerConfig {
     /** HLS media source from an m3u8 URL. */
     fun hlsMediaSource(url: String, factory: DataSource.Factory): HlsMediaSource =
         HlsMediaSource.Factory(factory).createMediaSource(MediaItem.fromUri(url))
+
+    /**
+     * Whole-file (non-segmented) source, for sources that hand back a video file
+     * instead of a playlist.
+     *
+     * MEASURED 2026-08-07 on vidnest.fun: the video arrives as
+     * hlmv.tripplestream.online/videos/<id> — one progressive file, no .m3u8, no
+     * extension at all. Feeding that to HlsMediaSource fails at the parse: it
+     * expects to read a #EXTM3U playlist and gets raw container bytes, so the
+     * load errors before a frame is decoded.
+     *
+     * Seeking here rides on HTTP range requests rather than segment boundaries,
+     * which is why it must be a different source type and not just a different
+     * URL. The DataSource.Factory is shared, so the site-specific Referer/Origin
+     * headers behave identically on both paths.
+     */
+    fun progressiveMediaSource(url: String, factory: DataSource.Factory): ProgressiveMediaSource =
+        ProgressiveMediaSource.Factory(factory).createMediaSource(MediaItem.fromUri(url))
 
     /**
      * Build a player with the shared buffering + track-selection policy.

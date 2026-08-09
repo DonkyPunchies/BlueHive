@@ -254,7 +254,19 @@ class HlsPlayerActivity : ComponentActivity() {
         // Buffering / bitrate / player construction all come from the shared
         // ExoPlayerConfig so every site's player behaves identically. Only this
         // file's HEADERS are site-specific (see buildMediaSource).
-        val selector = trackSelector ?: ExoPlayerConfig.trackSelector(this).also { trackSelector = it }
+        // A TrackSelector belongs to exactly ONE player. Media3's TrackSelector.init()
+        // fails a checkState if the same instance is handed to a second one, and
+        // this function REBUILDS the player on every retry path — mid-play
+        // re-extraction and the relay fallback both land here. Caching the selector
+        // across those rebuilds crashed the app outright:
+        //
+        //   FATAL java.lang.IllegalStateException
+        //     at TrackSelector.init(TrackSelector.java:145)
+        //     at ExoPlayer$Builder.build → startPlayback → reextractViaBackend
+        //
+        // It only surfaced once a re-extraction actually SUCCEEDED and got as far
+        // as rebuilding; every earlier failure died before this line.
+        val selector = ExoPlayerConfig.trackSelector(this).also { trackSelector = it }
         ExoPlayerConfig.applyVideoPolicy(selector)
 
         player = ExoPlayerConfig.buildPlayer(this, selector)
@@ -431,7 +443,14 @@ class HlsPlayerActivity : ComponentActivity() {
         }
     }
 
-    /** Video-only HLS source. Captions are rendered separately (see class doc). */
+    /**
+     * Video-only source. Captions are rendered separately (see class doc).
+     *
+     * HLS unless the URL is demonstrably a whole file. VidNest returns
+     * hlmv.tripplestream.online/videos/<id> — no .m3u8, no extension — and
+     * HlsMediaSource cannot parse that, so the source TYPE has to follow the
+     * stream shape rather than being fixed.
+     */
     private fun buildMediaSource(url: String): MediaSource {
         val originHeader = try {
             val u = android.net.Uri.parse(referer)
@@ -453,10 +472,29 @@ class HlsPlayerActivity : ComponentActivity() {
         )
         if (isBackendRelay) requestHeaders["X-API-Key"] = BuildConfig.API_KEY
 
-        return ExoPlayerConfig.hlsMediaSource(
-            url,
-            ExoPlayerConfig.dataSourceFactory(ua, requestHeaders, context = this)
-        )
+        val factory = ExoPlayerConfig.dataSourceFactory(ua, requestHeaders, context = this)
+
+        // Decided from the URL, NOT from the backend's is_hls flag. The player is
+        // handed a URL from several places — the relay, a mid-play re-extraction,
+        // an on-device extractor — and only some of them carry that flag. The URL
+        // is the one thing always present, so it is the only signal that can't go
+        // stale mid-session.
+        //
+        // Relay URLs always read as HLS here: the real stream rides in the ?url=
+        // query parameter, so the path is /api/hls/proxy and never matches. That
+        // is correct for segmented streams but WRONG for a relayed progressive
+        // file — see the note in the release write-up; not reachable today because
+        // the relay is only minted on a failure path.
+        val looksProgressive = runCatching {
+            val path = android.net.Uri.parse(url).path.orEmpty().lowercase()
+            !path.endsWith(".m3u8") && !path.endsWith(".mpd") &&
+                !url.lowercase().contains(".m3u8") && !url.lowercase().contains(".mpd")
+        }.getOrDefault(false)
+
+        Log.d(TAG, "🎞 source=${if (looksProgressive) "progressive" else "hls"} url=${url.take(90)}")
+
+        return if (looksProgressive) ExoPlayerConfig.progressiveMediaSource(url, factory)
+               else ExoPlayerConfig.hlsMediaSource(url, factory)
     }
 
     // ── Captions: CC button + self-rendering ─────────────────────────────────
@@ -836,6 +874,16 @@ class HlsPlayerActivity : ComponentActivity() {
             }
             body.referer?.takeIf { it.isNotBlank() }?.let { referer = it }
             body.user_agent?.takeIf { it.isNotBlank() }?.let { ua = it }
+
+            // RE-ARM THE RELAY. A fresh manifest is a fresh playback: it comes with
+            // its own proxy_url, and the previous one is stale. Without this the
+            // relay is spent after a single use and every subsequent retry runs
+            // direct-only — observed as four consecutive re-extractions landing on
+            // the same blocked CDN with no fallback left, then giving up.
+            // MAX_EXTRACT_RETRIES still bounds the loop, so this cannot ping-pong.
+            body.proxy_url?.takeIf { it.isNotBlank() }?.let { relayUrl = it }
+            usingRelay = false
+
             Log.d(TAG, "✅ fresh manifest — resuming at ${resumePositionMs}ms")
             loggedDuration = false
             startPlayback(body.m3u8)

@@ -43,6 +43,8 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.LocalActivity
 import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.foundation.focusable
 import com.example.bluehive.api.ApiClient
 import com.example.bluehive.api.FavoriteRequest
 import com.example.bluehive.api.WatchHistoryRequest
@@ -393,8 +395,8 @@ private fun getStreamingSources(mediaType: String, mediaId: Int): List<MoviesDet
         "movie" -> listOf(
             MoviesDetailsScreenCompose.StreamingSource(
                 "Royal Jelly",
-                "VidEasy",
-                "https://player.videasy.net/movie/$mediaId"
+                "VidNest",
+                "https://vidnest.fun/movie/$mediaId"
             ),
             MoviesDetailsScreenCompose.StreamingSource(
                 "Queen Stream",
@@ -412,18 +414,32 @@ private fun getStreamingSources(mediaType: String, mediaId: Int): List<MoviesDet
             MoviesDetailsScreenCompose.StreamingSource(
                 "Purple Stream",
                 "VidSpark",
-                    "https://ww2.moviesapi.to/movie/$mediaId"
+                    "https://vidflix.club/movie/$mediaId"
             ),
+            // Named VidSrc, not VidLink. The URL was already vidsrc.mov on both
+            // screens, but the MOVIES entry kept the old "VidLink" label — and the
+            // label is the routing key: usesBackendExtraction matches on name, so
+            // "VidLink" fell through to the raw Gecko embed with no server-side
+            // extraction and no relay, while the identical TV button got both.
+            // Renaming is the whole fix; the host does not change.
             MoviesDetailsScreenCompose.StreamingSource(
                 "Swarm Stream",
-                "VidLink",
-                "https://vidlink.pro/movie/$mediaId"
+                "VidSrc",
+                "https://vidsrc.mov/embed/movie/$mediaId"
             ),
 //            MoviesDetailsScreenCompose.StreamingSource(
 //                "Colony Stream",
 //                "VidSuper",
 //                "https://vidsuper.net/movie/$mediaId"
 //            ),
+            // NOTE: `useExtractor` on this entry and on VidFast above is now INERT.
+            // The button tests usesBackendExtraction(name) FIRST, and both VidApi
+            // and VidFast match it, so neither ever reaches the `source.useExtractor`
+            // branch — the on-device VidApiExtractorActivity ladder below is dead
+            // code from the movies screen today. Deliberately left in place rather
+            // than ripped out: it is inert, not wrong, and removing it would mean
+            // deleting the whole retry/failover machinery in one pass. If VidApi is
+            // ever dropped from usesBackendExtraction, this flag makes it work again.
             MoviesDetailsScreenCompose.StreamingSource(
                 "Honeycomb",
                 "VidApi",
@@ -550,7 +566,25 @@ fun MoviesDetailsScreenContent(
 
     // THE RULE: back out of a player and focus returns to the streaming button that
     // launched it, never the Favorites button at the top.
+    //
+    // ...but YIELD while any modal is up. "Choose a server" on a cache MISS launches
+    // MiruroExtractorActivity to enumerate, so this screen genuinely pauses and
+    // RESUMES — and the resume that delivers the server list is the same resume this
+    // restoration fires on. It won that race, pulling focus onto the DuB/Sub button
+    // while the picker sat open on top, so the D-pad drove the details screen behind
+    // the overlay.
+    //
+    // It reads as episode-specific because the SECOND press hits serverListCache and
+    // opens the picker inline — no activity launch, no resume, no race.
+    //
+    // extractionError is in the list for the same reason: that overlay appears on the
+    // very resume this fires on. The TV screen already carried both guards; this one
+    // carried neither.
     RestoreFocusOnPlayerReturn("MovieDetailsFocus") {
+        if (extractionError != null) return@RestoreFocusOnPlayerReturn emptyList()
+        if (showServerPicker || isCheckingServers || showDefaultPrompt) {
+            return@RestoreFocusOnPlayerReturn emptyList()
+        }
         listOfNotNull(lastStreamFocusRequester)
     }
 
@@ -953,6 +987,19 @@ fun MoviesDetailsScreenContent(
         context.startActivity(
             Intent(context, HlsPlayerActivity::class.java)
                 .putExtra("M3U8_URL", body.m3u8)
+                // DIRECT FIRST, relay only after a confirmed failure. Re-extracting
+                // cannot fix a blocked CDN — the source pins one host per title and
+                // returns the same one — so this is what actually recovers a
+                // filtered line. Already tagged with the title by /api/extract, so
+                // the fallback lands in bluehive.relay_sessions attributed rather
+                // than as an anonymous byte count.
+                //
+                // The player mints the grant itself on the failure path
+                // (HlsPlayerActivity.switchToRelay -> mintRelayGrant); passing the
+                // URL is all this screen has to do. Without this extra, relayUrl is
+                // null in the player and switchToRelay returns false immediately —
+                // which is why movies had no relay at all before.
+                .putExtra("M3U8_FALLBACK_URL", body.proxy_url)
                 // The EMBED PAGE origin, not the manifest host — the CDN validates
                 // it, and sending the manifest's own host 403s every segment while
                 // extraction still looks like it worked.
@@ -1044,6 +1091,61 @@ fun MoviesDetailsScreenContent(
     // extractPending is set immediately to block double-fire during the animation
     // window. The loading overlay itself is delayed 300ms so the button press
     // animation fully completes before the scrim appears.
+    /**
+     * Anime MOVIE via the BACKEND extractor. Returns true if playback started.
+     *
+     * Mirror of the TV screen's extractAnimeViaBackend — see there for the full
+     * reasoning. Same restriction: DEFAULT PATH ONLY (sub, default server),
+     * because dub needs the Language dropdown and a named server needs the
+     * Provider dropdown, and neither is expressible as a page load.
+     *
+     * No season/episode: /api/anime/resolve maps a movie straight to its AniList
+     * id with a null episode, and the miruro movie template omits ?ep= entirely.
+     */
+    suspend fun extractAnimeMovieViaBackend(dub: Boolean = false,
+                                            server: String? = null): Boolean {
+        val body = runCatching {
+            ApiClient.bluehiveApi.extractStream(
+                type    = "movie",
+                tmdbId  = tmdbId,
+                source  = "miruro",
+                mtype   = "anime_movie",
+                title   = mediaTitle,
+                profile = favoriteProfileId,
+                device  = SessionManager.get().deviceFingerprint,
+                // Sent always — "sub" is part of the server's cache key, not a
+                // no-op, so omitting it would extract the same stream under a
+                // second key.
+                audio   = if (dub) "dub" else "sub",
+                server  = server,
+            )
+        }.getOrNull()?.takeIf { it.isSuccessful }?.body()
+
+        if (body == null || body.m3u8.isBlank()) return false
+
+        Log.d("scraper", "M Extract (backend movie audio=${if (dub) "dub" else "sub"}" +
+                "${server?.let { " server=$it" } ?: ""}) → ${body.m3u8.take(60)} cached=${body.cached}")
+        context.startActivity(
+            Intent(context, MiruroPlayerActivity::class.java)
+                .putExtra("M3U8_URL", body.m3u8)
+                // Tagged server-side already, so no animeRelayUrl() here — that
+                // helper exists for the on-device path, where the backend never
+                // sees the playback and the relay row would be anonymous.
+                .putExtra("M3U8_FALLBACK_URL", body.proxy_url)
+                .putExtra("REFERER", body.referer)
+                .putExtra("UA", body.user_agent)
+                .putExtra("PROFILE_ID",  favoriteProfileId)
+                .putExtra("MEDIA_ID",    tmdbId.toString())
+                .putExtra("MEDIA_TYPE",  mediaType)
+                .putExtra("MEDIA_TITLE", mediaTitle)
+                // Reflects the track actually extracted — this string is what
+                // watch history and relay_sessions record, so a hardcoded "Sub"
+                // would mislabel every dub playback.
+                .putExtra("SOURCE_NAME", if (dub) "Miruro (Dub)" else "Miruro (Sub)")
+        )
+        return true
+    }
+
     val launchExtract: (String, Boolean, String?) -> Unit = { url, dub, server ->
         Log.d("scraper", "M Extract (dub=$dub, server=${server ?: "default"}) → $url")
         // Fresh play (default attempt) → reset the failover trail. Track the in-flight
@@ -1056,6 +1158,27 @@ fun MoviesDetailsScreenContent(
                 delay(200)
                 isExtracting = true
                 try { BlueHiveApplication.coilImageLoader.memoryCache?.clear() } catch (_: Exception) {}
+
+                // BACKEND FIRST for the default play (sub, default server). Falls
+                // THROUGH on any failure — the on-device extractor below still
+                // works, so a backend outage costs a few seconds rather than the
+                // film. Dub and named-server skip this: the backend cannot drive
+                // those dropdowns.
+                // BACKEND FIRST for EVERY anime play now — sub, dub and named
+                // servers alike. The backend drives the Language and Provider
+                // dropdowns itself, so there is no case left that it cannot serve.
+                // Still falls THROUGH on failure: the on-device extractor below is
+                // untouched, so a backend outage costs seconds, not the film.
+                val played = runCatching {
+                    extractAnimeMovieViaBackend(dub = dub, server = server)
+                }.getOrDefault(false)
+                if (played) {
+                    isExtracting   = false
+                    extractPending = false
+                    return@launch
+                }
+                Log.w("scraper", "M Extract: backend miss (dub=$dub server=$server) — on-device fallback")
+
                 val intent = Intent(context, MiruroExtractorActivity::class.java)
                     .putExtra(MiruroExtractorActivity.EXTRA_URL, url)
                     .putExtra(MiruroExtractorActivity.EXTRA_DUB, dub)
@@ -1082,6 +1205,34 @@ fun MoviesDetailsScreenContent(
                 delay(200)
                 extractPending = false // hand off guard duty to isCheckingServers
                 isCheckingServers = true
+
+                // BACKEND FIRST, which also removes an ACTIVITY HOP. The on-device
+                // path launched MiruroExtractorActivity, pausing and resuming this
+                // screen — and that resume is what RestoreFocusOnPlayerReturn
+                // races, the cause of the picker losing focus. An in-process call
+                // never leaves the screen, so the race cannot arise here.
+                val list = runCatching {
+                    ApiClient.bluehiveApi.extractServers(
+                        type   = "movie",
+                        tmdbId = tmdbId,
+                        audio  = if (dub) "dub" else "sub",
+                        device = SessionManager.get().deviceFingerprint,
+                    )
+                }.getOrNull()?.takeIf { it.isSuccessful }?.body()
+
+                val opts = list?.servers.orEmpty().map { ServerOption(it.name, emptyList()) }
+                if (opts.isNotEmpty()) {
+                    val defIdx = list!!.servers.indexOfFirst { it.is_default }.coerceAtLeast(0)
+                    Log.d("scraper", "M Enumerate (backend) → ${opts.size} servers, default=$defIdx")
+                    serverListCache[serverCacheKey(url, dub)] = opts to defIdx
+                    serverOptions     = opts
+                    serverDefaultIdx  = defIdx
+                    isCheckingServers = false
+                    showServerPicker  = true
+                    return@launch
+                }
+
+                Log.w("scraper", "M Enumerate: backend miss — on-device fallback")
                 try { BlueHiveApplication.coilImageLoader.memoryCache?.clear() } catch (_: Exception) {}
                 enumerateLauncher.launch(
                     Intent(context, MiruroExtractorActivity::class.java)
@@ -1935,10 +2086,40 @@ fun MoviesDetailsScreenContent(
 
         // ── "Checking servers" overlay (No path, phase 1) ───────────────────
         if (isCheckingServers) {
-            ExtractionLoadingOverlay(
-                status = "Checking the site for available servers…",
-                stage  = 2
-            )
+            // Focus TRAP, not decoration. ExtractionLoadingOverlay draws a scrim
+            // but takes no focus of its own, so the D-pad still reaches the details
+            // screen behind it.
+            //
+            // NOTE ON SCOPE: this only covers the window where this Activity is in
+            // FOREGROUND with the overlay up. It does NOT cover the enumerate pass
+            // itself — that runs in MiruroExtractorActivity and this screen is
+            // paused throughout. The bug people actually hit lives on the RESUME
+            // from that activity and is guarded in RestoreFocusOnPlayerReturn above.
+            //
+            // BACK and Escape pass through so the existing BackHandler can still
+            // cancel; swallowing them would leave no way out on a TV remote.
+            val checkingFocus = remember { FocusRequester() }
+            LaunchedEffect(Unit) {
+                awaitFrame()
+                try { checkingFocus.requestFocus() } catch (_: Exception) {}
+            }
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .focusRequester(checkingFocus)
+                    .focusable()
+                    .onPreviewKeyEvent { ev ->
+                        when (ev.key) {
+                            Key.Back, Key.Escape -> false
+                            else -> true
+                        }
+                    }
+            ) {
+                ExtractionLoadingOverlay(
+                    status = "Checking the site for available servers…",
+                    stage  = 2
+                )
+            }
         }
 
         // ── Instant "default server?" Yes/No prompt ─────────────────────────
@@ -1957,13 +2138,11 @@ fun MoviesDetailsScreenContent(
                 },
                 onChoose = {
                     showDefaultPrompt = false
-                    coroutineScope.launch {
-                        awaitFrame()
-                        try { lastStreamFocusRequester?.requestFocus() } catch (_: Exception) {}
-                    }
-                    // If the default extraction already captured this episode's
-                    // server list, skip the enumerate webview pass and open the
-                    // picker instantly. Otherwise fall back to enumerating.
+                    // NO focus restore here, unlike onDefault above. onDefault ENDS
+                    // the dialog flow, so returning focus to the DuB/Sub button is
+                    // right. onChoose CONTINUES into the picker, and handing focus to
+                    // a button on the screen underneath is exactly what the picker
+                    // then has to fight for it.
                     val cached = pendingUrl?.let { serverListCache[serverCacheKey(it, pendingDub)] }
                     if (cached != null) {
                         Log.d("scraper", "🗂 server picker from cache (${cached.first.size} servers)")

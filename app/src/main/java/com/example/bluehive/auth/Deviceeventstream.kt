@@ -123,7 +123,7 @@ object DeviceEventStream {
         // The revoke/unpair stream is a long-lived connection to the LAN backend.
         // A VPN coming up mid-stream kills the socket; the reconnect loop re-dials
         // through this factory and gets a fresh physical one.
-        .pinToLan()
+        .pinToLan(BLUEHIVE_BASE_RAW)
         .build()
 
     // Bus listeners registered once for the process lifetime.

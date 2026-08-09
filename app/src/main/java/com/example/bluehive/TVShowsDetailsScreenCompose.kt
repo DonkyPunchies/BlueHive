@@ -572,8 +572,25 @@ internal fun animeRelayUrl(
 
 internal fun usesBackendExtraction(sourceName: String): Boolean =
     sourceName.equals("VidFast", true) ||
+        // VidEasy is no longer listed on EITHER screen (VidNest replaced it on TV,
+        // VidSpark on movies). Kept matched so an older build's source list, or a
+        // future re-listing, still routes to the backend rather than silently
+        // dropping to the raw embed.
         sourceName.equals("VidEasy", true) ||
-        sourceName.equals("VidSpark", true)
+        sourceName.equals("VidSpark", true) ||
+        // VidApi ("Honeycomb") — BOTH screens now. This match shadows the movies
+        // list's `useExtractor = true` on that entry, because the movies button
+        // tests usesBackendExtraction FIRST: the on-device VidApiExtractorActivity
+        // path is unreachable from the movies screen as a result. Left in place
+        // rather than deleted — see the note in MoviesDetailsScreenCompose.
+        sourceName.equals("VidApi", true) ||
+        // VidSrc ("Swarm Stream") — BOTH screens. The movies entry was labelled
+        // "VidLink" while already pointing at vidsrc.mov, so it missed this match
+        // and lost extraction + relay. Renamed to VidSrc so the two screens behave
+        // identically.
+        sourceName.equals("VidSrc", true) ||
+        // VidNest ("Royal Jelly") — BOTH screens.
+        sourceName.equals("VidNest", true)
 
 private fun getStreamingSources(
     mediaType: String,
@@ -585,8 +602,8 @@ private fun getStreamingSources(
         "tv" -> listOf(
             TVShowsDetailsScreenCompose.StreamingSource(
                 "Royal Jelly",
-                "VidEasy",
-                "https://player.videasy.net/tv/$mediaId/$seasonNumber/$episodeNumber"
+                "VidNest",
+                "https://vidnest.fun/tv/$mediaId/$seasonNumber/$episodeNumber"
             ),
             TVShowsDetailsScreenCompose.StreamingSource(
                 "Queen Stream",
@@ -600,8 +617,8 @@ private fun getStreamingSources(
             ),
             TVShowsDetailsScreenCompose.StreamingSource(
                 "Swarm Stream",
-                "VidLink",
-                "https://vidlink.pro/tv/$mediaId/$seasonNumber/$episodeNumber"
+                "VidSrc",
+                "https://vidsrc.mov/embed/tv/$mediaId/$seasonNumber/$episodeNumber"
             ),
 //            TVShowsDetailsScreenCompose.StreamingSource(
 //                "Colony Stream",
@@ -1032,6 +1049,20 @@ fun TVShowsDetailsScreenContent(
     // of the modal and back onto the details screen behind it.
     RestoreFocusOnPlayerReturn("TVDetailsFocus") {
         if (extractionError != null) return@RestoreFocusOnPlayerReturn emptyList()
+        // Same race as the error overlay above, one modal further along.
+        //
+        // "Choose a server" on a cache MISS launches MiruroExtractorActivity to
+        // enumerate, so this screen genuinely pauses and RESUMES — and the resume
+        // that delivers the server list is the same resume this restoration fires
+        // on. It won, pulling focus onto the source button while the picker sat
+        // open on top, which is why the D-pad drove the details screen underneath.
+        //
+        // It looked episode-specific because the SECOND press hits serverListCache,
+        // opens the picker inline with no activity launch, and therefore no resume
+        // and no race at all. A new episode misses the cache and brings it back.
+        if (showServerPicker || isCheckingServers || showDefaultPrompt) {
+            return@RestoreFocusOnPlayerReturn emptyList()
+        }
         lastStreamFocusRequester?.let { streamButton ->
             listOfNotNull(
                 streamButton,
@@ -1392,6 +1423,77 @@ fun TVShowsDetailsScreenContent(
 
     // Default-server extract (server == null). The 200ms delay lets the button
     // press animation finish before the loading overlay appears.
+    /**
+     * Anime via the BACKEND extractor. Returns true if playback started.
+     *
+     * DEFAULT PATH ONLY — sub, default server. Those are the two things the
+     * backend's generic load-and-nudge run cannot express: dub needs the Language
+     * dropdown opened and the switch confirmed, and a named server needs the
+     * Provider dropdown. That choreography lives in MiruroStreamExtractorWebView
+     * and stays there, so this deliberately declines rather than half-serving it.
+     *
+     * MEASURED 2026-08-07 from the extractor container: miruro.tv extracts in
+     * 2.0s / 2.6s / 1.9s (3/3) through the SAME generic path every other source
+     * uses, well inside the default budget. No bespoke driver was needed, which
+     * is why this is a call rather than a port.
+     *
+     * TMDB coordinates go over the wire, not a Miruro URL: the backend resolves
+     * tmdb -> AniList itself via /api/anime/resolve (AniBridge primary, Fribb
+     * fill-in, multi-cour seasons reconstructed). Sending a URL would fork that
+     * mapping into two places.
+     */
+    suspend fun extractAnimeViaBackend(dub: Boolean = false,
+                                       server: String? = null): Boolean {
+        val body = runCatching {
+            ApiClient.bluehiveApi.extractStream(
+                type    = "tv",
+                tmdbId  = tmdbId,
+                season  = pendingSeason,
+                episode = pendingEpisode,
+                source  = "miruro",
+                // anime_tv, not the screen's mediaType — the whole point of the
+                // column is telling anime traffic apart in relay_sessions.
+                mtype   = "anime_tv",
+                title   = mediaTitle,
+                profile = favoriteProfileId,
+                device  = SessionManager.get().deviceFingerprint,
+                // Sent ALWAYS, not only for dub. "sub" is not a no-op here: it is
+                // part of the server's cache key, so omitting it on the sub path
+                // would write to a different key than an explicit sub request and
+                // extract the same stream twice.
+                audio   = if (dub) "dub" else "sub",
+                server  = server,
+            )
+        }.getOrNull()?.takeIf { it.isSuccessful }?.body()
+
+        if (body == null || body.m3u8.isBlank()) return false
+
+        Log.d("scraper", "M Extract (backend audio=${if (dub) "dub" else "sub"}" +
+                "${server?.let { " server=$it" } ?: ""}) → ${body.m3u8.take(60)} cached=${body.cached}")
+        context.startActivity(
+            Intent(context, MiruroPlayerActivity::class.java)
+                .putExtra("M3U8_URL", body.m3u8)
+                // Already tagged server-side from the query params above, so this
+                // needs no animeRelayUrl() call — that helper exists for the
+                // ON-DEVICE path, where the backend never sees the playback.
+                .putExtra("M3U8_FALLBACK_URL", body.proxy_url)
+                .putExtra("REFERER", body.referer)
+                .putExtra("UA", body.user_agent)
+                .putExtra("PROFILE_ID",     favoriteProfileId)
+                .putExtra("MEDIA_ID",       tmdbId.toString())
+                .putExtra("MEDIA_TYPE",     mediaType)
+                .putExtra("MEDIA_TITLE",    mediaTitle)
+                .putExtra("SEASON_NUMBER",  pendingSeason)
+                .putExtra("EPISODE_NUMBER", pendingEpisode)
+                .putExtra("EPISODE_NAME",   pendingEpisodeName)
+                // Must reflect the track actually extracted — this string is what
+                // watch history and relay_sessions record, so hardcoding "Sub"
+                // would mislabel every dub playback.
+                .putExtra("SOURCE_NAME",    if (dub) "Miruro (Dub)" else "Miruro (Sub)")
+        )
+        return true
+    }
+
     val launchExtract: (String, Boolean, String?) -> Unit = { url, dub, server ->
         Log.d("scraper", "M Extract (dub=$dub, server=${server ?: "default"}) → $url")
         // Fresh play (default attempt) → reset the failover trail. Track the in-flight
@@ -1404,6 +1506,27 @@ fun TVShowsDetailsScreenContent(
                 delay(200)
                 isExtracting = true
                 try { BlueHiveApplication.coilImageLoader.memoryCache?.clear() } catch (_: Exception) {}
+
+                // BACKEND FIRST for EVERY anime play — sub, dub, and named
+                // servers alike. The backend now drives the Language and Provider
+                // dropdowns itself (measured: dub in 1.9s vs 18.4s on-device), so
+                // there is no longer a case this cannot serve.
+                //
+                // Falls THROUGH on any failure rather than surfacing an error. The
+                // on-device extractor below is untouched and still works, so a
+                // backend that is down, unreachable, or beaten by a site change
+                // costs a few seconds and not the episode. That fallback is the
+                // reason this is safe to route unconditionally.
+                val played = runCatching {
+                    extractAnimeViaBackend(dub = dub, server = server)
+                }.getOrDefault(false)
+                if (played) {
+                    isExtracting   = false
+                    extractPending = false
+                    return@launch
+                }
+                Log.w("scraper", "M Extract: backend miss (dub=$dub server=$server) — on-device fallback")
+
                 val intent = Intent(context, MiruroExtractorActivity::class.java)
                     .putExtra(MiruroExtractorActivity.EXTRA_URL, url)
                     .putExtra(MiruroExtractorActivity.EXTRA_DUB, dub)
@@ -1428,6 +1551,37 @@ fun TVShowsDetailsScreenContent(
                 delay(200)
                 extractPending = false
                 isCheckingServers = true
+
+                // BACKEND FIRST, and this one also removes an ACTIVITY HOP. The
+                // on-device path launched MiruroExtractorActivity, which paused
+                // this screen and resumed it — the resume that RestoreFocusOnPlayer-
+                // Return races, which is what stole focus from the picker. An
+                // in-process call never leaves the screen, so that race cannot
+                // occur on this path at all.
+                val list = runCatching {
+                    ApiClient.bluehiveApi.extractServers(
+                        type    = "tv",
+                        tmdbId  = tmdbId,
+                        season  = pendingSeason,
+                        episode = pendingEpisode,
+                        audio   = if (dub) "dub" else "sub",
+                        device  = SessionManager.get().deviceFingerprint,
+                    )
+                }.getOrNull()?.takeIf { it.isSuccessful }?.body()
+
+                val opts = list?.servers.orEmpty().map { ServerOption(it.name, emptyList()) }
+                if (opts.isNotEmpty()) {
+                    val defIdx = list!!.servers.indexOfFirst { it.is_default }.coerceAtLeast(0)
+                    Log.d("scraper", "M Enumerate (backend) → ${opts.size} servers, default=$defIdx")
+                    serverListCache[serverCacheKey(url, dub)] = opts to defIdx
+                    serverOptions    = opts
+                    serverDefaultIdx = defIdx
+                    isCheckingServers = false
+                    showServerPicker = true
+                    return@launch
+                }
+
+                Log.w("scraper", "M Enumerate: backend miss — on-device fallback")
                 try { BlueHiveApplication.coilImageLoader.memoryCache?.clear() } catch (_: Exception) {}
                 enumerateLauncher.launch(
                     Intent(context, MiruroExtractorActivity::class.java)
@@ -2821,10 +2975,44 @@ fun TVShowsDetailsScreenContent(
         }
 
         if (isCheckingServers) {
-            ExtractionLoadingOverlay(
-                status = "Checking the site for available servers…",
-                stage  = 2
-            )
+            // Focus TRAP, not decoration. ExtractionLoadingOverlay draws a scrim
+            // but takes no focus of its own, so the D-pad still reaches the details
+            // screen behind it.
+            //
+            // NOTE ON SCOPE: this only covers the window where this Activity is in
+            // FOREGROUND with the overlay up — the gap between isCheckingServers
+            // going true and MiruroExtractorActivity actually appearing, plus any
+            // non-activity extraction. It does NOT cover the enumerate pass itself,
+            // because that runs in a separate Activity and this screen is paused
+            // throughout. The bug people actually hit lives on the RESUME from that
+            // activity and is guarded in RestoreFocusOnPlayerReturn above.
+            //
+            // Directional and select keys are swallowed; BACK deliberately is not,
+            // so the existing BackHandler can still cancel an enumeration that
+            // hangs. Without that exemption this overlay becomes a trap with no
+            // way out on a remote that has no other keys.
+            val checkingFocus = remember { FocusRequester() }
+            LaunchedEffect(Unit) {
+                awaitFrame()
+                try { checkingFocus.requestFocus() } catch (_: Exception) {}
+            }
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .focusRequester(checkingFocus)
+                    .focusable()
+                    .onPreviewKeyEvent { ev ->
+                        when (ev.key) {
+                            Key.Back, Key.Escape -> false
+                            else -> true
+                        }
+                    }
+            ) {
+                ExtractionLoadingOverlay(
+                    status = "Checking the site for available servers…",
+                    stage  = 2
+                )
+            }
         }
 
         // ── VidFast: which player? ───────────────────────────────────────────
@@ -2876,13 +3064,20 @@ fun TVShowsDetailsScreenContent(
                 },
                 onChoose = {
                     showDefaultPrompt = false
-                    coroutineScope.launch {
-                        awaitFrame()
-                        try { lastStreamFocusRequester?.requestFocus() } catch (_: Exception) {}
-                    }
-                    // If the default extraction already captured this episode's
-                    // server list, skip the enumerate webview pass and open the
-                    // picker instantly. Otherwise fall back to enumerating.
+                    // NO focus restore here, unlike onDefault above.
+                    //
+                    // onDefault ENDS the dialog flow — extraction starts and the
+                    // screen is the user's again, so pulling focus back to the
+                    // source button is right. onChoose CONTINUES into the picker,
+                    // and handing focus to a button on the screen underneath was
+                    // the bug: on a cache MISS the picker is seconds away (an
+                    // enumerate webview pass), so the D-pad spent that window
+                    // driving the details screen behind the "Checking servers…"
+                    // overlay. On a cache HIT it looked fine only because
+                    // showServerPicker flips in this same frame and
+                    // ServerPickerOverlay's own focus request (Overlays.kt) beat
+                    // the restore — which is why the second press on the same
+                    // episode behaved, and a new episode brought it straight back.
                     val cached = pendingUrl?.let { serverListCache[serverCacheKey(it, pendingDub)] }
                     if (cached != null) {
                         Log.d("scraper", "🗂 server picker from cache (${cached.first.size} servers)")

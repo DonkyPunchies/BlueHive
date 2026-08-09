@@ -17,14 +17,52 @@ import java.util.concurrent.TimeUnit
 
 private const val TAG = "ApiClient"
 
-private const val PLATFORM_API_BASE_URL = "http://192.168.1.136:9000/"
+/**
+ * Retrofit REQUIRES a base URL ending in "/" and throws IllegalArgumentException
+ * at construction if it does not — which, from a `val` initialised at class load,
+ * surfaces as an ExceptionInInitializerError on first API use rather than
+ * anything that names the URL.
+ *
+ * This is not hypothetical tidiness. BuildConfig.PLATFORM_BASE_URL is built from
+ * BLUEHIVE_DEV_PLATFORM_URL, whose default in app/build.gradle.kts is
+ * "http://192.168.1.136:9000" — NO trailing slash — while the hardcoded constant
+ * this replaced had one. Wiring the two together without normalising would have
+ * traded a wrong-address bug for a crash on launch.
+ *
+ * Applied to every base URL so a future value set from a Gradle property, an
+ * environment variable or a CI secret cannot reintroduce it.
+ */
+private fun String.asBaseUrl(): String = if (endsWith("/")) this else "$this/"
+
+// ── Backend addresses ────────────────────────────────────────────────────────
+// ALL THREE now come from BuildConfig, and that is the point.
+//
+// Two of them used to be hardcoded here while only trailerApi read the build
+// config. On the LAN that was invisible: every address pointed at the same
+// machine, so it looked like one setting. It is really a TRIPWIRE for the move
+// to a VPS — changing the Gradle property would have relocated media/extraction
+// while login, profiles and watch history kept dialling 192.168.1.136. The
+// failure mode is not "wrong address" either: it is the 30-second blank launch
+// and "Set up BlueHive" toast, which reads as an unreachable backend and sends
+// you hunting for a server problem that does not exist.
+//
+// Defaults in build.gradle.kts are unchanged, so behaviour today is identical.
+// Moving to a VPS is now three Gradle properties and no code edit:
+//   BLUEHIVE_DEV_BASE_URL, BLUEHIVE_DEV_PLATFORM_URL, BLUEHIVE_DEV_UPDATE_URL
+
+// Platform backend (port 9000): login, pairing, account, device sessions.
+private val PLATFORM_API_BASE_URL = BuildConfig.PLATFORM_BASE_URL.asBaseUrl()
 
 // BlueHive streaming backend (port 8000). This is the SAME host that serves
 // trailerApi (BuildConfig.API_BASE_URL), but profile/watch-history/favorites
 // now live here too. These endpoints need Bearer auth + silent refresh (like
 // platformApi) AND the X-API-Key (like trailerApi), so they get their own
 // Retrofit instance below — bluehiveApi — that combines both.
-private const val BLUEHIVE_API_BASE_URL = "http://192.168.1.136:8000/"
+//
+// Deliberately the SAME BuildConfig value as trailerApi rather than a second
+// property: they are one server, and two knobs for one address is how they drift
+// apart.
+private val BLUEHIVE_API_BASE_URL = BuildConfig.API_BASE_URL.asBaseUrl()
 
 
 
@@ -69,11 +107,14 @@ object ApiClient {
         .retryOnConnectionFailure(true)
         // API_BASE_URL resolves to 192.168.1.136:8000 in BOTH debug and release
         // (BLUEHIVE_DEV_BASE_URL), so this is LAN traffic despite the "tmdb" name.
-        .pinToLan()
+        .pinToLan(BLUEHIVE_API_BASE_URL)
         .build()
 
     private val tmdbRetrofit: Retrofit = Retrofit.Builder()
-        .baseUrl(BuildConfig.API_BASE_URL)
+        // Normalised like the other two — this one happens to carry a trailing
+        // slash in its default today, but relying on that is how the next person
+        // to set BLUEHIVE_DEV_BASE_URL from a shell or CI gets a launch crash.
+        .baseUrl(BLUEHIVE_API_BASE_URL)
         .client(tmdbHttpClient)
         .addConverterFactory(GsonConverterFactory.create())
         .build()
@@ -249,7 +290,7 @@ object ApiClient {
         .retryOnConnectionFailure(true)
         // :8000 is on the LAN. Without this a connected VPN routes profiles and
         // watch history into the tunnel, where 192.168.1.136 does not exist.
-        .pinToLan()
+        .pinToLan(BLUEHIVE_API_BASE_URL)
         .build()
 
     private val bluehiveRetrofit: Retrofit = Retrofit.Builder()
@@ -310,7 +351,7 @@ object ApiClient {
         // :9000 is on the LAN. This is the client whose failure produces the 30s
         // blank launch + "Set up BlueHive" toast — indistinguishable from Docker
         // being down, which is exactly how a VPN made it look.
-        .pinToLan()
+        .pinToLan(PLATFORM_API_BASE_URL)
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)

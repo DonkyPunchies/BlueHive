@@ -150,9 +150,64 @@ object LanNetwork {
 }
 
 /**
- * Marks an OkHttp client as talking to the LAN backend, so its sockets skip any
- * active VPN tunnel. Apply to 192.168.x clients ONLY — see the note on
- * [LanNetwork] about why streaming clients must keep the default route.
+ * True when [url] points at an address that genuinely cannot leave the building:
+ * RFC1918 space, loopback, link-local, or a .local/.internal name.
+ *
+ * This is the test the whole bypass rests on. [pinToLan]'s justification is that
+ * skipping the tunnel "costs no privacy at all" because the traffic never leaves
+ * the LAN — true for 192.168.1.136, and FALSE for a public backend.
  */
-fun OkHttpClient.Builder.pinToLan(): OkHttpClient.Builder =
-    socketFactory(LanNetwork.socketFactory())
+fun isPrivateBackend(url: String?): Boolean {
+    val host = runCatching { java.net.URI(url ?: return false).host }
+        .getOrNull()?.lowercase() ?: return false
+    if (host == "localhost" || host.endsWith(".local") || host.endsWith(".internal")) return true
+
+    // NEVER let a hostname reach InetAddress.getByName here. That call performs a
+    // BLOCKING DNS LOOKUP, and these run while an OkHttpClient is being built —
+    // on whatever thread touches the object first, which for a `val` in an object
+    // is the main thread. A lookup there is a frozen UI at best and
+    // NetworkOnMainThreadException at worst.
+    //
+    // A "does it look numeric" character-class test is NOT sufficient: a real
+    // domain made only of hex letters and dots (cafe.dec, add.ed) passes it and
+    // gets resolved. So IPv4 is matched STRUCTURALLY — four dotted octets, each
+    // 0-255 — and IPv6 is recognised by requiring a colon, which no hostname in
+    // a URI host component can contain once the port has been stripped.
+    val isIpv4 = host.matches(
+        Regex("""^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$""")
+    )
+    val isIpv6 = host.contains(':')
+    if (!isIpv4 && !isIpv6) return false          // a hostname: treat as public
+
+    return runCatching {
+        // Safe now: a literal resolves without touching the network.
+        val addr = java.net.InetAddress.getByName(host.trim('[', ']'))
+        addr.isLoopbackAddress || addr.isSiteLocalAddress || addr.isLinkLocalAddress
+    }.getOrDefault(false)
+}
+
+/**
+ * Marks an OkHttp client as talking to the LAN backend, so its sockets skip any
+ * active VPN tunnel — but ONLY when [url] really is a LAN address.
+ *
+ * WHY THE URL ARGUMENT EXISTS
+ *
+ * The unconditional version of this was correct while the backend lived on
+ * 192.168.1.136 and could not be reached from outside the house. Its own comment
+ * says bypassing the VPN "costs no privacy at all" for that reason.
+ *
+ * That premise dies the moment the backend is a public domain. The mechanism
+ * does not change — it still forces these sockets onto the physical interface —
+ * but the consequence inverts: every profile, watch-history and pairing call
+ * would leave the user's tunnel, carrying their real IP to the server and to
+ * anyone watching the link, for users who switched a VPN on precisely to prevent
+ * that. Worse, it would apply only to OUR traffic, so the leak is specific and
+ * attributable rather than lost in a crowd.
+ *
+ * Deriving it from the URL means the behaviour follows the deployment with no
+ * flag to remember: LAN build keeps the bypass, public build silently stops
+ * using it and rides the tunnel like every other app. Streaming clients still
+ * must never call this at all — see the note on [LanNetwork].
+ */
+fun OkHttpClient.Builder.pinToLan(url: String?): OkHttpClient.Builder =
+    if (isPrivateBackend(url)) socketFactory(LanNetwork.socketFactory()) else this

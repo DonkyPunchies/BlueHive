@@ -44,8 +44,9 @@
 
     <application
         android:name=".BlueHiveApplication"
-        android:networkSecurityConfig="@xml/network_security_config"
-        android:allowBackup="true"
+        android:networkSecurityConfig="@xml/${netSecConfig}"
+        android:allowBackup="false"
+
         android:usesCleartextTraffic="true"
         android:hardwareAccelerated="true"
         android:largeHeap="true"

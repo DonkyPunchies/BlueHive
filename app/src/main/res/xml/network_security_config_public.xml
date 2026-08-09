@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    PUBLIC DEPLOYMENT network security config.
+
+    Selected automatically by the manifest placeholder `netSecConfig` when all
+    three backend URLs are https (see the release block in app/build.gradle.kts).
+    LAN builds keep network_security_config.xml instead.
+
+    WHY A SECOND FILE RATHER THAN EDITING THE EXISTING ONE
+
+    The release config carries a cleartext exception for the LAN backend,
+    because release builds are what get installed on the test TV and that TV
+    talks to the backend over plain HTTP. Deleting the exception outright would
+    break the daily build and install loop. Leaving it in a shipped public APK
+    means the app carries a permanent standing permission to speak plaintext to
+    a private address it will never contact again.
+
+    Two files and one derived switch: the public build provably has no cleartext
+    exception at all.
+
+    WHAT THIS ENFORCES
+
+    cleartextTrafficPermitted="false" with no domain-config overrides means the
+    platform itself refuses any http:// request the app makes. Not a warning, an
+    outright failure. That turns "we meant to use HTTPS" into something the OS
+    guarantees, which matters because a missed https:// otherwise fails silently
+    with tokens and session cookies crossing the internet in the clear while
+    everything appears to work.
+
+    It also fails early and legibly if a base URL is ever left as http://
+    ("Cleartext HTTP traffic to <host> not permitted", naming the host) rather
+    than leaking quietly.
+
+    System trust anchors only. No user installed CAs, so a proxy certificate
+    added to the device store cannot silently intercept traffic.
+
+    NOTE: XML comments may not contain a double hyphen, which is why there are
+    no dashed separator lines in this file. An earlier version used them and
+    failed the resource compile with a ParseError.
+-->
+<network-security-config>
+
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+</network-security-config>

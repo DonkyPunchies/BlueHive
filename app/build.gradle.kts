@@ -94,7 +94,6 @@ tasks.named("preBuild") {
 
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose.compiler)
     alias(libs.plugins.androidx.baselineprofile)
 }
@@ -142,6 +141,16 @@ android {
         versionName = appVersionName
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // Default for the ${netSecConfig} placeholder in AndroidManifest.xml.
+        // MUST exist here: a placeholder with no value fails the manifest merge
+        // for EVERY variant that does not set one, so debug and any future build
+        // type would stop building the moment release started overriding it.
+        //
+        // The permissive file is the safe default because it is the one that can
+        // only ever be too lenient on a LAN address. The release block overrides
+        // it to the strict config as soon as all three backend URLs are https.
+        manifestPlaceholders["netSecConfig"] = "network_security_config"
 
         ndk {
             //noinspection ChromeOsAbiSupport
@@ -223,6 +232,33 @@ android {
             // Same dev IP for now — see comment in debug block. The prod cutover
             // is a one-line change here, nothing else in the app touches this.
             buildConfigField("String", "UPDATE_BASE_URL", "\"$prodUpdateUrl\"")
+
+            // ── Network security config, DERIVED from the URLs above ──────────
+            // Deliberately not a separate -P flag. A flag is a second thing to
+            // remember, and the two would drift: someone sets the https URLs,
+            // forgets the flag, and ships a public APK still carrying a standing
+            // permission to speak plaintext to 192.168.1.136. Reading the scheme
+            // means the security posture cannot disagree with the destination.
+            //
+            //   all three https  -> network_security_config_public  (NO cleartext
+            //                       exceptions at all; the platform refuses any
+            //                       http:// the app attempts)
+            //   anything http    -> network_security_config         (keeps the
+            //                       192.168.1.136 exception so LAN builds work)
+            //
+            // The strict config is what makes a missed https:// fail LOUDLY —
+            // "Cleartext HTTP traffic to <host> not permitted", naming the host —
+            // instead of silently shipping tokens over the open internet.
+            val allHttps = listOf(prodBaseUrl, prodPlatformUrl, prodUpdateUrl)
+                .all { it.startsWith("https://") }
+            manifestPlaceholders["netSecConfig"] =
+                if (allHttps) "network_security_config_public" else "network_security_config"
+            println(
+                "BlueHive release: netSecConfig=" +
+                    manifestPlaceholders["netSecConfig"] +
+                    (if (allHttps) " (public, cleartext BLOCKED)"
+                     else " (LAN, cleartext allowed to 192.168.1.136)")
+            )
 
             isMinifyEnabled = false
             isShrinkResources = false

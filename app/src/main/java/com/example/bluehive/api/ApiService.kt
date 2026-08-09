@@ -237,6 +237,24 @@ data class WatchHistoryResponse(
  * way). It is what recovers an ISP-filtered line, where re-extraction cannot:
  * the source pins one CDN host per episode and hands back the same one.
  */
+/**
+ * One provider from [BluehiveApiService.extractServers].
+ *
+ * Names are only meaningful alongside the audio track they were read under —
+ * see the endpoint doc.
+ */
+data class ExtractServerOption(
+    val name:       String,
+    val is_default: Boolean = false,
+)
+
+data class ExtractServersResponse(
+    val audio:    String,
+    val servers:  List<ExtractServerOption>,
+    val page_url: String? = null,
+    val cached:   Boolean = false,
+)
+
 data class ExtractResponse(
     val m3u8:         String,
     val referer:      String?,
@@ -455,7 +473,35 @@ interface BluehiveApiService {
         @Query("title")    title:    String? = null,
         @Query("profile")  profile:  Int?    = null,
         @Query("device")   device:   String? = null,
+        // ── Miruro only ──────────────────────────────────────────────────────
+        // Unlike the accounting params above, these ARE part of the server's
+        // cache key: sub and dub are different streams from one URL, as is each
+        // provider. Sharing a key would serve whichever was extracted first to
+        // everyone — a dub viewer silently getting sub audio, which looks like
+        // a working stream rather than a bug.
+        @Query("audio")    audio:    String? = null,   // "sub" | "dub"
+        @Query("server")   server:   String? = null,   // provider name
     ): Response<ExtractResponse>
+
+    /**
+     * Provider list for one title+track — the backend equivalent of the old
+     * on-device ENUMERATE pass.
+     *
+     * AUDIO IS REQUIRED, not optional. Miruro's provider list is audio-scoped
+     * (sub offers `kiwidlh-sub`/`allydlh-sub`/…, dub offers `kiwidl`/`allydl`/…),
+     * so a list fetched under the wrong track names servers that do not exist on
+     * the one about to play.
+     */
+    @GET("/api/extract/servers")
+    suspend fun extractServers(
+        @Query("type")     type:     String,          // "tv" | "movie"
+        @Query("tmdb_id")  tmdbId:   Int,
+        @Query("season")   season:   Int? = null,
+        @Query("episode")  episode:  Int? = null,
+        @Query("audio")    audio:    String = "sub",
+        @Query("source")   source:   String = "miruro",
+        @Query("device")   device:   String? = null,
+    ): Response<ExtractServersResponse>
 
     @POST("/api/hls/grant")
     suspend fun mintRelayGrant(

@@ -47,7 +47,7 @@ object UpdateManager {
         .connectTimeout(4, TimeUnit.SECONDS)
         .readTimeout(4, TimeUnit.SECONDS)
         // ServerConfig :8090 is on the LAN — must not enter a VPN tunnel.
-        .pinToLan()
+        .pinToLan(ServerConfig.updateBaseUrl)
         .build()
 
     // Long timeouts: the APK is large (~200MB).
@@ -57,7 +57,7 @@ object UpdateManager {
         .writeTimeout(30, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         // Same LAN host as the manifest — the APK is served off :8090, not GitHub.
-        .pinToLan()
+        .pinToLan(ServerConfig.updateBaseUrl)
         .build()
 
     /**
@@ -131,7 +131,19 @@ object UpdateManager {
                 out.delete()
                 return@withContext null
             }
-            Log.i(TAG, "sha256 verified.")
+            // States WHAT the hash proved, because that differs by channel and
+            // the difference is easy to forget: over TLS the manifest came from
+            // us, so a match means the APK is ours. Over plaintext an attacker
+            // in the path serves both the APK and the hash, so a match only
+            // proves the download was not corrupted in transit — it says nothing
+            // about who sent it. Android's own installer still refuses any APK
+            // not signed with the release key, which is the backstop; this line
+            // exists so a plaintext channel is visible in the logs rather than
+            // reading as a clean "verified".
+            Log.i(TAG, if (ServerConfig.isSecureChannel)
+                "sha256 verified (https — authenticated channel)."
+            else
+                "sha256 verified (PLAINTEXT channel — integrity only, NOT authenticity).")
             out
         } catch (e: Exception) {
             Log.w(TAG, "Download/verify error: ${e.message}")

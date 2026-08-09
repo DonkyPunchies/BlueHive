@@ -76,4 +76,8 @@ prefs:
   network.dns.use_https_rr_as_altsvc: true
   # Do NOT fall back to a cleartext-SNI retry when ECH is refused — that silently
   # re-exposes the hostname and would mask whether ECH actually worked.
-  network.dns.echconfig.fallback_to_origin_when_all_failed: false
+  network.dns.echconfig.fallback_to_origin_when_all_failed: true   # MUST stay true: false means an ECH failure is FATAL with no retry.
+                                                     # Measured — vaplayer.ru redirects to a Cloudflare-fronted host that
+                                                     # advertises ECH; the load died silently (StateUpdated uri=null, then
+                                                     # nothing) while the same URL loaded fine in a desktop browser, which
+                                                     # ships this pref as true. ECH stays ON; only the no-fallback bet is off.
