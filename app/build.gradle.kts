@@ -260,7 +260,30 @@ android {
                      else " (LAN, cleartext allowed to 192.168.1.136)")
             )
 
-            isMinifyEnabled = false
+            // ENABLED 2026-08-12. This was false, which quietly disabled the whole
+            // proguard-rules.pro file below — including the -assumenosideeffects
+            // block that strips android.util.Log. Every Log.d/i/w/e call, and the
+            // strings they build, shipped in the release APK, and the diagnostics
+            // "Send Logs" feature then uploaded that output to the backend.
+            //
+            // Minification also raises the cost of patching the APK. It does not
+            // make it impossible — client-side checks are presentation, server-side
+            // is enforcement — but there is no reason to ship readable class names.
+            //
+            // IF A RELEASE BUILD MISBEHAVES AND DEBUG DOES NOT, LOOK HERE FIRST.
+            // R8 breaks reflection-based code SILENTLY: Gson fields come back null
+            // rather than throwing, and a renamed AIDL interface simply fails to
+            // bind. Keep rules for both are in proguard-rules.pro — io.companion.host
+            // is a published contract and must never be obfuscated.
+            isMinifyEnabled = true
+
+            // Left OFF deliberately. Resource shrinking removes drawables R8 cannot
+            // see referenced, breaking anything resolved by name at runtime
+            // (getIdentifier, painterResource behind a variable). The APK is ~198MB
+            // and nearly all of that is cronet's embedded native libraries, which
+            // resource shrinking does not touch — so it buys little here while adding
+            // a second variable to any regression. Revisit once minification has been
+            // running cleanly for a while.
             isShrinkResources = false
 
             proguardFiles(
@@ -309,6 +332,33 @@ kotlin {
 
     compilerOptions {
         jvmTarget.set(JvmTarget.JVM_17)
+    }
+}
+
+// ── Workaround: AGP 9.3.1 + Kotlin 2.3.0 + minification ───────────────────────
+//
+// Turning on isMinifyEnabled activates AGP's `produceReleaseComposeMapping` task,
+// which improves Compose frame names in R8 stack traces. That task resolves
+// org.jetbrains.kotlin:compose-group-mapping at AGP's OWN built-in Kotlin version
+// (2.2.10, via android.builtInKotlin=true in gradle.properties) rather than the
+// project's — and that artifact was never published at 2.2.10.
+//
+// Verified 2026-08-12 by fetching the POMs directly:
+//     2.2.10  Maven Central 404   Google maven 404
+//     2.3.0   Maven Central 200   <- the version this project actually uses
+//
+// So the build failed with "Could not find org.jetbrains.kotlin:compose-group-
+// mapping:2.2.10" the moment minification was switched on. Known-bad interaction
+// with Kotlin 2.3 — see JetBrains KT-83266.
+//
+// Pinning the request to the project's Kotlin version resolves it. Scoped to that
+// single configuration so no other dependency resolution is affected, and read
+// from the version catalog so it follows any future Kotlin bump automatically.
+configurations.matching { it.name.contains("composeMappingProducer") }.configureEach {
+    resolutionStrategy.eachDependency {
+        if (requested.group == "org.jetbrains.kotlin" && requested.name == "compose-group-mapping") {
+            useVersion(libs.versions.kotlin.get())
+        }
     }
 }
 

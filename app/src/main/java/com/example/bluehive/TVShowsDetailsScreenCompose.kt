@@ -639,6 +639,29 @@ private fun getStreamingSources(
 
 
 
+/**
+ * "2022-02-03" -> "02/03/2022" for the date shown above each episode still.
+ *
+ * The API hands us `air_date` as a Python `date.isoformat()` on both the normal
+ * and the season-reconstruction paths, so the input is always ISO or null. Parsed
+ * by substring rather than a DateFormat: this runs per episode card during D-pad
+ * scrolling, and there's no locale question when both ends of the conversion are
+ * fixed formats.
+ *
+ * Returns "" for a missing or malformed date — unaired episodes carry a null
+ * air_date, and the caller renders the blank so the row keeps its height.
+ */
+private fun formatEpisodeAirDate(raw: String?): String {
+    val s = raw?.trim().orEmpty()
+    if (s.length < 10) return ""
+    val year  = s.substring(0, 4)
+    val month = s.substring(5, 7)
+    val day   = s.substring(8, 10)
+    if (!year.all(Char::isDigit) || !month.all(Char::isDigit) || !day.all(Char::isDigit)) return ""
+    return "$month/$day/$year"
+}
+
+
 @Composable
 fun EpisodeBadge(
     current: Int,
@@ -2508,6 +2531,29 @@ fun TVShowsDetailsScreenContent(
                                         }
                                         .focusable()
                                 ) {
+
+                                    // ✅ Air date — above the still, right-aligned. Same font and
+                                    // focus colours as the episode title below it, two points smaller.
+                                    //
+                                    // Rendered UNCONDITIONALLY, unlike that title. The title sits
+                                    // UNDER the image, so it can come and go without disturbing
+                                    // anything; this sits ABOVE it, where appearing and disappearing
+                                    // would shove every thumbnail up and down as the row scrolls.
+                                    // So no isFullyVisible gate here — and a blank string still
+                                    // occupies its line, which keeps unaired episodes (null
+                                    // air_date) exactly the same height as aired ones.
+                                    Text(
+                                        text = formatEpisodeAirDate(episode.airDate),
+                                        fontFamily = dongleRegular,
+                                        fontSize = 11.sp,          // episode title is 13.sp
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        color = if (!isEpisodeFocused) Color(0xFF737373) else Color.White,
+                                        textAlign = TextAlign.End,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(end = 4.dp)
+                                    )
 
                                     // ✅ Image/BADGE/GLOW stack stays inside this Box
                                     Box(

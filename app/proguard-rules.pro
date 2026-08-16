@@ -15,6 +15,25 @@
 # --- 2. Keep stack traces for crash reporting ---
 -keepattributes SourceFile,LineNumberTable
 
+# --- 2b. THE HOST CONTRACT — do not let R8 touch this ---
+#
+# AIDL identifies an interface by its fully-qualified name at RUNTIME: the
+# generated Stub carries a DESCRIPTOR string built from the package + class, and
+# bindService() only succeeds when the descriptor the host exposes matches the one
+# the companion asks for.
+#
+# R8 renames classes. Rename ICompanionHost and the descriptor no longer matches
+# what Off-Grid Drive (or any other host) publishes, so every bind fails and
+# BlueHive never receives a token — presenting as the 30-second blank launch and
+# the "Set up BlueHive" toast, with nothing in the logs naming the cause. Worse,
+# it would only break in RELEASE builds, since debug is not minified.
+#
+# This package is a PUBLISHED CONTRACT shared byte-for-byte with every host, so
+# obfuscating it was never meaningful anyway — the names are the interface.
+-keep class io.companion.host.** { *; }
+-keep interface io.companion.host.** { *; }
+-keepclassmembers class io.companion.host.** { *; }
+
 # --- 3. Retrofit / OkHttp / Gson ---
 -dontwarn okhttp3.**
 -dontwarn okio.**
