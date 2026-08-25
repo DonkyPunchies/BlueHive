@@ -66,7 +66,7 @@ object SidebarReboot {
 
         // Hand the relaunch to RebootActivity, which runs in its OWN process
         // (:phoenix) and therefore survives the kill below. It restarts BlueHive
-        // through HostEntryActivity — fresh host token + the self-update check,
+        // through AuthActivity — stored-session check + the self-update check,
         // so a newly published build installs right on reboot.
         activity.startActivity(Intent(activity, RebootActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)

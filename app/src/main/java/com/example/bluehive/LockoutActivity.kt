@@ -214,6 +214,18 @@ fun LockoutScreen(
 
     val codeFont = FontFamily.Monospace
 
+    // Did we land here because THIS TV released its own slot after sitting idle?
+    //
+    // Without this the copy is actively misleading: the user walked away, we handed
+    // their slot back, somebody else took it, and they return to be told that other
+    // people are using the app — true, but it reads as though the app lost their
+    // place for no reason. Naming the cause is the difference between a rule and a
+    // fault.
+    //
+    // remember, so consuming the latch happens once per composition rather than on
+    // every recomposition — the first read clears it.
+    val afterIdleRelease = remember { IdleWatcher.consumeIdleReleaseFlag() }
+
     val buttonFocusRequester = remember { FocusRequester() }
     LaunchedEffect(Unit) { buttonFocusRequester.requestFocus() }
 
@@ -268,7 +280,13 @@ fun LockoutScreen(
                     "You will be taken back in or asked to re-pair\n" +
                     "depending on the type of revocation."
         }
-        LockoutBus.REASON_WORKSPACE_FULL -> {
+        LockoutBus.REASON_WORKSPACE_FULL -> if (afterIdleRelease) {
+            headline = "Your session timed out."
+            body     = "This TV was left idle, so its streaming slot\n" +
+                    "was released for others on your account.\n\n" +
+                    "All ${LockoutActivity.WORKSPACE_ACTIVE_LIMIT} slots have since been taken. Please wait\n" +
+                    "for one to free up, then tap Refresh to try again."
+        } else {
             headline = "All streaming slots are currently in use."
             body     = "You cannot enter the app right now because all\n" +
                     "${LockoutActivity.WORKSPACE_ACTIVE_LIMIT} streaming slots on this account are occupied.\n\n" +

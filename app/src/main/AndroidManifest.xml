@@ -1,14 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    AndroidManifest.xml — host-model (Phase 2)
-    Entry point: .host.HostEntryActivity only (io.companion.host.action.LAUNCH).
-    No LEANBACK_LAUNCHER tile — BlueHive is reachable solely through a host
-    app. LoadingScreenActivity → ProfileScreenActivity → HomeScreenCompose
-    is the internal flow once the host injects a token.
+    AndroidManifest.xml — standalone (2026-08-16)
+
+    Entry point: .auth.AuthActivity, the only LEANBACK_LAUNCHER tile.
+    AuthActivity → LoadingScreenActivity → ProfileScreenActivity →
+    HomeScreenCompose, with AuthActivity deciding in onCreate whether a stored
+    session lets it skip straight through.
+
+    This replaced the host model, in which the sole entry was
+    .host.HostEntryActivity behind an io.companion.host.action.LAUNCH intent and
+    there was no launcher tile at all — BlueHive could not start without Off-Grid
+    Drive installed and paired. Nothing in that path remains: the AIDL contract,
+    the io.companion.host package and all four host classes are deleted, and
+    BlueHive now authenticates directly against its own backend.
 -->
 <manifest xmlns:tools="http://schemas.android.com/tools"
     xmlns:android="http://schemas.android.com/apk/res/android"
-    tools:ignore="MissingLeanbackLauncher">
+    >
 
     <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
     <uses-permission android:name="android.permission.INTERNET" />
@@ -25,14 +33,19 @@
         <intent>
             <action android:name="android.speech.RecognitionService" />
         </intent>
-        <!-- Lets BlueHive see + bind to ANY installed host that exposes the
-             ICompanionHost service (action BIND_HOST) on Android 11+. Declared by
-             ACTION, so no specific host package is named. Without a <queries>
-             match, queryIntentServices()/bindService() to the host silently
-             return nothing because package visibility is restricted. -->
-        <intent>
-            <action android:name="io.companion.host.action.BIND_HOST" />
-        </intent>
+        <!-- Package-visibility entry for the host entitlement provider.
+             Android 11+ hides other apps unless declared, and without this the
+             provider read silently returns null.
+             Declared BY AUTHORITY, never by package name: the authority states a
+             capability any host could implement, so nothing here ties BlueHive to
+             a particular vendor. A package name would. -->
+        <provider android:authorities="io.host.entitlement.provider" />
+        <!-- The BIND_HOST <queries> entry is gone with the companion contract.
+             It existed so package-visibility rules on Android 11+ would let
+             BlueHive discover and bind a host's ICompanionHost service. BlueHive
+             binds nothing now — it authenticates directly against its own
+             backend — so declaring the visibility would grant a capability the
+             app no longer uses. -->
     </queries>
 
     <uses-feature
@@ -57,12 +70,43 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.BlueHive">
 
-        <!-- PHASE 2: BlueHive has no independent launcher tile. Identity lives in
-             the host app; BlueHive is only reachable via the host's
-             io.companion.host.action.LAUNCH intent (see .host.HostEntryActivity).
-             LoadingScreenActivity is now an internal-only entry point started by
-             HostEntryActivity after the host injects a token, so it's no longer
-             exported and carries no LEANBACK_LAUNCHER category. -->
+        <!-- THE FRONT DOOR (2026-08-16). BlueHive now has its own launcher tile.
+             Until now the only exported entry was HostEntryActivity behind
+             io.companion.host.action.LAUNCH, which meant the app could not be
+             started at all without Off-Grid Drive installed and paired — a
+             sideloaded copy showed no icon and had no way in.
+
+             AuthActivity decides in onCreate, before drawing anything: a stored
+             session goes straight to LoadingScreenActivity, otherwise the
+             sign-in form. Composing first and redirecting after would guarantee
+             a visible flash of the form for every returning user. -->
+        <activity
+            android:name=".auth.AuthActivity"
+            android:exported="true"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.BlueHive">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+
+                <!-- LEANBACK_LAUNCHER is what an Android TV home screen looks for. -->
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+
+                <!-- LAUNCHER as well, and it is not redundant. Some TV boxes ship
+                     a phone-style launcher, and anything resolving the plain
+                     category — including packageManager.getLaunchIntentForPackage(),
+                     which tries LAUNCHER before falling back to LEANBACK — finds
+                     nothing without it. Measured on this device: LEANBACK resolved
+                     to AuthActivity while LAUNCHER returned "No activity found".
+
+                     This is how a host launches BlueHive now: the ordinary
+                     launcher intent, exactly as it launches SmartTube. There is no
+                     BlueHive-specific action to know about any more. -->
+                <category android:name="android.intent.category.LAUNCHER" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
         <activity
             android:name=".LoadingScreenActivity"
             android:exported="false"
@@ -71,8 +115,8 @@
 
         <!-- Phoenix relauncher for the sidebar Reboot button. android:process
              puts it in a SEPARATE process so it survives SidebarReboot killing
-             the main process, then relaunches BlueHive via HostEntryActivity
-             (front door = fresh host token + self-update check) and exits.
+             the main process, then relaunches BlueHive via AuthActivity
+             (front door = stored-session check + self-update check) and exits.
              exported=false — only BlueHive itself starts it. -->
         <activity
             android:name=".sidebarComponents.RebootActivity"
@@ -96,19 +140,15 @@
 
 
 
-        <!-- BlueHive's host-launch front door. The host app targets this
-         via io.companion.host.action.LAUNCH. exported=true is required because a
-         different app (the host) starts it. NO LEANBACK_LAUNCHER here — this is not
-         a home-screen entry point; it's only reachable via the host intent. -->
-        <activity
-            android:name=".host.HostEntryActivity"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="io.companion.host.action.LAUNCH" />
-                <category android:name="io.companion.host.category.COMPANION" />
-                <category android:name="android.intent.category.DEFAULT" />
-            </intent-filter>
-        </activity>
+        <!-- HostEntryActivity REMOVED 2026-08-16, with the rest of the companion
+             contract. It was the only exported entry point, reachable solely via
+             io.companion.host.action.LAUNCH, which meant BlueHive could not start
+             without a paired host. AuthActivity above carries LEANBACK_LAUNCHER
+             instead, so the app opens on its own.
+
+             Its self-update check moved to AuthActivity rather than being deleted
+             with it — that check is now the ONLY way a fielded TV learns a new
+             version exists, since there is no host to orchestrate updates. -->
 
         <activity
             android:name=".sidebarComponents.LiveTvScreenActivity"
@@ -177,6 +217,16 @@
 
         <activity
             android:name=".LockoutActivity"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.BlueHive" />
+
+        <!-- Account-standing lock. Separate from LockoutActivity above, which is
+             the concurrent-device cap: that one is temporary and self-resolving,
+             this one only changes when the subscription does. Raised with
+             CLEAR_TASK from EntitlementLockBus, and re-checked at launch. -->
+        <activity
+            android:name=".auth.ServiceLockoutActivity"
             android:exported="false"
             android:screenOrientation="landscape"
             android:theme="@style/Theme.BlueHive" />

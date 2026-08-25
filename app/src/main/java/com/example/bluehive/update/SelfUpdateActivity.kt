@@ -34,7 +34,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
 import com.example.bluehive.BuildConfig
-import com.example.bluehive.host.HostEntryActivity
+import com.example.bluehive.auth.AuthActivity
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
@@ -130,9 +130,9 @@ class SelfUpdateActivity : ComponentActivity() {
     /** Re-enter via HostEntryActivity but SKIP the update check to avoid a loop. */
     private fun proceedToApp() {
         startActivity(
-            Intent(this, HostEntryActivity::class.java).apply {
+            Intent(this, AuthActivity::class.java).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
-                putExtra(io.companion.host.CompanionHostContract.EXTRA_SKIP_UPDATE_CHECK, true)
+                putExtra(AuthActivity.EXTRA_SKIP_UPDATE_CHECK, true)
             }
         )
         finish()

@@ -295,12 +295,12 @@ fun start() {
                     // PHASE 2: BlueHive holds no refresh token, so it CANNOT self-
                     // rotate. The host owns the only refresh token + the correct
                     // device fingerprint, so we pull a fresh access token over IPC.
-                    when (val result = com.example.bluehive.host.HostTokenProvider.fetchFreshToken()) {
-                        is com.example.bluehive.host.HostToken.Fresh -> {
+                    when (val result = com.example.bluehive.auth.TokenProvider.fetchFreshToken()) {
+                        is com.example.bluehive.auth.TokenResult.Fresh -> {
                             SessionManager.get().setHostAccessToken(result.token)
                             Log.d(TAG, "Host supplied a fresh token for SSE — using it")
                         }
-                        com.example.bluehive.host.HostToken.Revoked -> {
+                        com.example.bluehive.auth.TokenResult.Revoked -> {
                             // Host reachable and explicitly has no identity → genuine
                             // logout/unpair. Drop the session so the app routes to setup.
                             Log.w(TAG, "Host reports revoked — identity gone, stopping stream")
@@ -308,7 +308,7 @@ fun start() {
                             SessionExpiredBus.post()
                             return@withContext null
                         }
-                        com.example.bluehive.host.HostToken.Unavailable -> {
+                        com.example.bluehive.auth.TokenResult.Unavailable -> {
                             // Transient (host not ready / IPC failed). Do NOT clear the
                             // session. Fall through and use whatever token we still have;
                             // the SSE connect will surface a real 401 if it's truly dead,
@@ -366,15 +366,38 @@ fun start() {
         response.use { resp ->
             when (resp.code) {
                 403 -> {
-                    val reason = try {
-                        val body = resp.body.string()
-                        JSONObject(body).optJSONObject("detail")
-                            ?.optString("reason")
-                            ?.takeIf { it.isNotBlank() }
-                            ?: LockoutBus.REASON_REVOKED_BY_ADMIN
+                    val detail = try {
+                        JSONObject(resp.body.string()).optJSONObject("detail")
                     } catch (_: Exception) {
-                        LockoutBus.REASON_REVOKED_BY_ADMIN
+                        null
                     }
+
+                    // ENTITLEMENT IS NOT A REVOCATION, and conflating them told the
+                    // user something false.
+                    //
+                    // This branch read `detail.reason` and fell back to
+                    // REASON_REVOKED_BY_ADMIN whenever it was absent. The server's
+                    // entitlement refusal carries `detail.code`, not `reason` — so
+                    // every entitlement 403 landed on that fallback and raised the
+                    // device-cap screen announcing the account had been REVOKED BY
+                    // AN ADMIN. Wrong screen, wrong cause, and it states outright
+                    // what the entitlement lock screen is deliberately vague about.
+                    //
+                    // Worse, it won the race. Both paths fire on the same refusal,
+                    // but LockoutActivity launches with CLEAR_TASK and only checks
+                    // whether IT is already on top — so it replaced the correct
+                    // screen a moment after the correct screen appeared.
+                    //
+                    // ApiClient's interceptor has always keyed on `code` for exactly
+                    // this. The SSE path simply never got the same treatment.
+                    if (detail?.optString("code") == "entitlement_inactive") {
+                        Log.w(TAG, "SSE connect 403 entitlement_inactive — entitlement lock")
+                        HostEntitlementRelay.markInactiveFromServer()
+                        return@withContext ConnectResult.REVOKED
+                    }
+
+                    val reason = detail?.optString("reason")?.takeIf { it.isNotBlank() }
+                        ?: LockoutBus.REASON_REVOKED_BY_ADMIN
                     Log.w(TAG, "SSE connect 403 — reason=$reason")
                     LockoutBus.post(reason)
                     return@withContext ConnectResult.REVOKED
@@ -388,17 +411,17 @@ fun start() {
                     // Token expired despite the proactive check — ask the host for
                     // a fresh one over IPC. Next loop iteration reconnects with it.
                     Log.w(TAG, "SSE connect 401 — asking host for fresh token")
-                    when (val result = com.example.bluehive.host.HostTokenProvider.fetchFreshToken()) {
-                        is com.example.bluehive.host.HostToken.Fresh -> {
+                    when (val result = com.example.bluehive.auth.TokenProvider.fetchFreshToken()) {
+                        is com.example.bluehive.auth.TokenResult.Fresh -> {
                             SessionManager.get().setHostAccessToken(result.token)
                             Log.d(TAG, "Host supplied a fresh token after 401 — will retry connect")
                         }
-                        com.example.bluehive.host.HostToken.Revoked -> {
+                        com.example.bluehive.auth.TokenResult.Revoked -> {
                             Log.w(TAG, "Host reports revoked after 401 — identity gone, dropping session")
                             SessionManager.get().clearSession()
                             SessionExpiredBus.post()
                         }
-                        com.example.bluehive.host.HostToken.Unavailable -> {
+                        com.example.bluehive.auth.TokenResult.Unavailable -> {
                             // Transient — do NOT clear the session. Just retry the
                             // connect on the next loop iteration with backoff.
                             Log.w(TAG, "Host unavailable (transient) after 401 — keeping session, will retry connect")

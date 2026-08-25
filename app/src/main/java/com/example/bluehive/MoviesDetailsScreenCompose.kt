@@ -413,8 +413,8 @@ private fun getStreamingSources(mediaType: String, mediaId: Int): List<MoviesDet
             ),
             MoviesDetailsScreenCompose.StreamingSource(
                 "Purple Stream",
-                "VidSpark",
-                    "https://vidflix.club/movie/$mediaId"
+                "MoviesAPI",
+                    "https://moviesapi.to/movie/$mediaId"
             ),
             // Named VidSrc, not VidLink. The URL was already vidsrc.mov on both
             // screens, but the MOVIES entry kept the old "VidLink" label — and the

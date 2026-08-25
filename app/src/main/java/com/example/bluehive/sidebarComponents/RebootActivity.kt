@@ -3,7 +3,7 @@ package com.example.bluehive.sidebarComponents
 import android.app.Activity
 import android.content.Intent
 import android.os.Bundle
-import com.example.bluehive.host.HostEntryActivity
+import com.example.bluehive.auth.AuthActivity
 import kotlin.system.exitProcess
 
 /**
@@ -11,8 +11,8 @@ import kotlin.system.exitProcess
  *
  * Runs in its OWN process (android:process=":phoenix" in the manifest), so it
  * keeps executing while SidebarReboot hard-kills the MAIN process. From here it
- * relaunches BlueHive through the real front door — HostEntryActivity — which
- * re-binds the host for a fresh token AND runs the self-update check (no
+ * relaunches BlueHive through the real front door — AuthActivity — which
+ * revalidates the stored session AND runs the self-update check (no
  * EXTRA_SKIP_UPDATE_CHECK), so a freshly published build installs right on
  * reboot. That makes Reboot double as the dev test loop:
  * publish → press Reboot → watch the update screen install the new build.
@@ -25,7 +25,7 @@ import kotlin.system.exitProcess
 class RebootActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        startActivity(Intent(this, HostEntryActivity::class.java).apply {
+        startActivity(Intent(this, AuthActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
         })
         finish()

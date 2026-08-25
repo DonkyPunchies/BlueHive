@@ -3,36 +3,33 @@
 ############################################################
 
 # --- 1. Strip debug/info logs in release ---
+#
+# e() AND wtf() ARE DELIBERATELY NOT STRIPPED, as of 2026-08-16.
+#
+# They were, and it cost a diagnosis. An episode ended prematurely and there was
+# nothing to look at: no crash (a playback failure is not one), no relay row (it
+# played direct), and no app logs (this block had removed them). Three sources,
+# all silent, for a bug that ExoPlayer had already described precisely.
+#
+# The reason for stripping was that log STRINGS shipped inside the APK and the
+# Diagnostics "Send Logs" feature uploaded that output to the backend. That
+# concern is about volume and content, and v/d/i/w is where both live — the
+# chatty per-frame, per-request, per-focus-change lines. Log.e fires on real
+# failures only, so keeping it costs a handful of strings and buys the ability to
+# diagnose the field.
+#
+# If a leak is ever traced to an error string, fix that call site rather than
+# blinding the release build again.
 -assumenosideeffects class android.util.Log {
     public static int v(...);
     public static int d(...);
     public static int i(...);
     public static int w(...);
-    public static int e(...);
-    public static int wtf(...);
 }
 
 # --- 2. Keep stack traces for crash reporting ---
 -keepattributes SourceFile,LineNumberTable
 
-# --- 2b. THE HOST CONTRACT — do not let R8 touch this ---
-#
-# AIDL identifies an interface by its fully-qualified name at RUNTIME: the
-# generated Stub carries a DESCRIPTOR string built from the package + class, and
-# bindService() only succeeds when the descriptor the host exposes matches the one
-# the companion asks for.
-#
-# R8 renames classes. Rename ICompanionHost and the descriptor no longer matches
-# what Off-Grid Drive (or any other host) publishes, so every bind fails and
-# BlueHive never receives a token — presenting as the 30-second blank launch and
-# the "Set up BlueHive" toast, with nothing in the logs naming the cause. Worse,
-# it would only break in RELEASE builds, since debug is not minified.
-#
-# This package is a PUBLISHED CONTRACT shared byte-for-byte with every host, so
-# obfuscating it was never meaningful anyway — the names are the interface.
--keep class io.companion.host.** { *; }
--keep interface io.companion.host.** { *; }
--keepclassmembers class io.companion.host.** { *; }
 
 # --- 3. Retrofit / OkHttp / Gson ---
 -dontwarn okhttp3.**

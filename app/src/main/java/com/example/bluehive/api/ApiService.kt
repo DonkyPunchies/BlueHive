@@ -1,6 +1,12 @@
 // api/ApiService.kt
 package com.example.bluehive.api
 
+import com.example.bluehive.models.HostEntitlementRequest
+import com.example.bluehive.models.BhAuthResponse
+import com.example.bluehive.models.BhLoginRequest
+import com.example.bluehive.models.BhRefreshRequest
+import com.example.bluehive.models.BhHostProvisionRequest
+import com.example.bluehive.models.BhSignupRequest
 import com.example.bluehive.models.GenreDto
 import com.example.bluehive.models.LatestTrailer
 import com.example.bluehive.models.TrailerResponse
@@ -126,6 +132,15 @@ interface ApiService {
 data class AndroidRefreshRequest(
     val refresh_token:      String,
     val device_fingerprint: String,
+)
+
+/**
+ * Playback position in whole seconds, for the progress heartbeat and for closing
+ * a watch session. Seconds, not millis — this feeds `progress_seconds`, and the
+ * server clamps it to a sane session length.
+ */
+data class WatchProgressRequest(
+    val position_seconds: Int,
 )
 
 data class DeviceRenameRequest(
@@ -420,6 +435,55 @@ data class DeviceReportAck(
 // ══════════════════════════════════════════════════════════════════════════════
 interface BluehiveApiService {
 
+    // ── BlueHive's OWN accounts ──────────────────────────────────────────────
+    // These three are the reason the host model is going away. bluehive-api now
+    // issues its own identities, so nothing here involves platform-api, an AIDL
+    // bind, or a token injected by another app.
+    //
+    // UNAUTHENTICATED by definition — they are how a caller GETS a token. That
+    // means they must not go through any interceptor that attaches a stale
+    // Authorization header or tries to refresh on 401, or a failed login turns
+    // into a refresh loop.
+    @POST("/api/bluehive/auth/signup")
+    suspend fun bhSignup(
+        @Body body: BhSignupRequest,
+    ): Response<BhAuthResponse>
+
+    @POST("/api/bluehive/auth/login")
+    suspend fun bhLogin(
+        @Body body: BhLoginRequest,
+    ): Response<BhAuthResponse>
+
+    // Rotates: the old refresh token is revoked server-side and a new one
+    // returned with a fresh 30-day window, so a TV in regular use never has to
+    // sign in again. Replaces HostTokenProvider.fetchFreshToken().
+    /**
+     * Sign in using the host's signed pass instead of an email.
+     *
+     * Creates the account on first use, and returns the SAME account every time
+     * after — including on a different TV, which is what makes profiles follow the
+     * person rather than the television.
+     *
+     * UNAUTHENTICATED, like the two above, and for the same reason: it is how a
+     * caller gets a token in the first place.
+     *
+     * Failure modes worth handling at the call site rather than swallowing:
+     *   401 assertion_expired  — the host needs to mint a fresh pass; retrying
+     *                            later can work, retrying immediately cannot
+     *   401 assertion_invalid  — not a real pass; fall back to the email screen
+     *   409 multiple_accounts  — several accounts share this host, so the server
+     *                            refuses to guess. The email screen is the answer.
+     */
+    @POST("/api/bluehive/auth/host-provision")
+    suspend fun bhHostProvision(
+        @Body body: BhHostProvisionRequest,
+    ): Response<BhAuthResponse>
+
+    @POST("/api/bluehive/auth/refresh")
+    suspend fun bhRefresh(
+        @Body body: BhRefreshRequest,
+    ): Response<BhAuthResponse>
+
     // ── Streaming-session / device-slot (PHASE 3, moved off PlatformApiService) ──
     // These ride bluehiveHttpClient, which sends the host-supplied Bearer and
     // refreshes it over IPC via hostTokenAuthenticator — exactly the auth shape
@@ -545,9 +609,31 @@ interface BluehiveApiService {
         @Body body: WatchHistoryRequest,
     ): WatchHistoryResponse
 
+    /**
+     * Heartbeat the playback position (NEW 2026-08-17).
+     *
+     * progress_seconds used to be filled in server-side as
+     * (stopped_at - watched_at) — the row's wall-clock age, not a position. A
+     * 97-minute film left open 3h41m recorded 13258. Nothing ever sent the real
+     * position because the client discarded the row id and had nothing to send it
+     * against.
+     */
+    @POST("/api/bluehive/watch-history/{watchId}/progress")
+    suspend fun updateWatchProgress(
+        @Path("watchId") watchId: Int,
+        @Body body: WatchProgressRequest,
+    ): WatchHistoryResponse
+
+    /**
+     * Close the session, carrying the final position.
+     *
+     * The body is optional server-side, so a torn-down player that cannot supply
+     * one still closes the row cleanly — it just keeps the last heartbeat instead.
+     */
     @POST("/api/bluehive/watch-history/{watchId}/stop")
     suspend fun stopWatchHistory(
         @Path("watchId") watchId: Int,
+        @Body body: WatchProgressRequest,
     ): WatchHistoryResponse
 
     @POST("/api/bluehive/favorites/toggle")
@@ -608,6 +694,18 @@ interface BluehiveApiService {
      * BlueHive's backend, never the shared platform DB. Sent by CrashReporter
      * ('crash', launch after a crash) and Send Logs ('diagnostic').
      */
+    /**
+     * Report the account-standing assertion the host app handed us at launch.
+     *
+     * Fire-and-forget telemetry: BlueHive is free and this gates nothing. The
+     * body is an opaque signed token the client never reads - the backend
+     * verifies it with a public key and records the standing.
+     */
+    @POST("/api/bluehive/host-entitlement")
+    suspend fun submitHostEntitlement(
+        @Body body: HostEntitlementRequest,
+    ): Response<com.example.bluehive.models.HostEntitlementResponse>
+
     @POST("/api/bluehive/reports")
     suspend fun submitDeviceReport(
         @Body body: DeviceReportBody,

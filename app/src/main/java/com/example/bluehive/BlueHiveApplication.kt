@@ -29,6 +29,9 @@ import com.example.bluehive.models.MediaItem
 import com.example.bluehive.webview.BeeLogo
 import com.example.bluehive.webview.GeckoWebViewManager
 import com.example.bluehive.auth.DeviceEventStream
+import com.example.bluehive.auth.EntitlementLockBus
+import com.example.bluehive.auth.HostEntitlementRelay
+import com.example.bluehive.auth.ServiceLockoutActivity
 import com.example.bluehive.auth.SessionManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -470,8 +473,15 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
         com.example.bluehive.diagnostics.CrashReporter.install(this)
 
         SessionManager.init(this)
-        com.example.bluehive.host.HostTokenProvider.init(this)
-        Log.d("BlueHiveApplication", "HostTokenProvider initialised")
+        // HostTokenProvider.init() removed 2026-08-16. It bound a service
+        // connection to Off-Grid Drive at startup so tokens could be fetched over
+        // AIDL. TokenProvider replaces it and needs no initialisation — it reads
+        // the refresh token SessionManager already holds and calls bluehive-api.
+        //
+        // Leaving the old init in place was what caused sessions to be wiped on
+        // restart: signing in stored a BlueHive session, but the first 401 still
+        // routed to the HOST, which answered Revoked, and the 401 handler
+        // faithfully cleared the session it had no business clearing.
         Log.d(TAG, "✅ SessionManager initialised")
 
         // Upload any crash reports persisted by a previous run (fire-and-forget,
@@ -482,11 +492,32 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
             override fun onActivityResumed(activity: android.app.Activity) {
                 foregroundActivity = java.lang.ref.WeakReference(activity)
+                // Arriving on a new screen is interaction — the user pressed
+                // something to get here. Without this, a navigation that happens to
+                // straddle a tick could be judged against the previous screen's
+                // stale input time.
+                IdleWatcher.noteInteraction()
             }
             override fun onActivityPaused(activity: android.app.Activity) {
                 if (foregroundActivity?.get() === activity) foregroundActivity = null
             }
-            override fun onActivityCreated(activity: android.app.Activity, savedInstanceState: android.os.Bundle?) {}
+            override fun onActivityCreated(activity: android.app.Activity, savedInstanceState: android.os.Bundle?) {
+                // ── GLOBAL INPUT HOOK ──────────────────────────────────────────
+                //
+                // Wrapping the window callback catches EVERY key and touch event on
+                // EVERY activity — Compose screens, the players, GeckoView — from
+                // one place. The obvious alternative is overriding
+                // onUserInteraction() per activity, which would mean editing two
+                // dozen files and, far worse, silently missing the next activity
+                // anyone adds. A screen that forgets to report input is a screen
+                // that releases its slot out from under someone who is sitting
+                // right there.
+                //
+                // DELEGATES EVERYTHING. The wrapper observes and forwards; it never
+                // consumes, so focus, D-pad routing and back handling behave
+                // exactly as they did before.
+                activity.window?.let { w -> w.callback = IdleInputCallback(w.callback) }
+            }
             override fun onActivityStarted(activity: android.app.Activity) {}
             override fun onActivityStopped(activity: android.app.Activity) {}
             override fun onActivitySaveInstanceState(activity: android.app.Activity, outState: android.os.Bundle) {}
@@ -496,6 +527,14 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
         if (SessionManager.get().isAuthenticated) {
             DeviceEventStream.start()
         }
+
+        // ── Idle slot release ──────────────────────────────────────────────────
+        // Covers the case InactivityWatcher structurally cannot: the app sitting in
+        // the FOREGROUND with nobody in front of it. The SSE keepalive is driven by
+        // the socket, so a detail screen, a paused film or a finished one holds a
+        // household slot for as long as the TV has power. See IdleWatcher.
+        IdleWatcher.setForeground(true)
+        IdleWatcher.start()
 
         // ── Inactivity timeout ─────────────────────────────────────────────────
         // All lifecycle decisions go through InactivityWatcher so a single
@@ -508,18 +547,44 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
                 override fun onStop(owner: LifecycleOwner) {
                     Log.d(TAG, "🌙 ProcessLifecycleOwner.onStop fired — app is fully backgrounded")
                     InactivityWatcher.onAppBackgrounded()
+                    // Hand the slot back to InactivityWatcher's Redis grace. Two
+                    // mechanisms counting down on one slot with no coordination is
+                    // how you get a release racing a grace that was already
+                    // handling it.
+                    IdleWatcher.setForeground(false)
                 }
 
                 override fun onStart(owner: LifecycleOwner) {
                     Log.d(TAG, "☀️ ProcessLifecycleOwner.onStart fired — app is foreground")
                     InactivityWatcher.onAppForegrounded()
+                    IdleWatcher.setForeground(true)
                     // Resume the SSE stream. startAfterUserReturn() clears the
                     // intentionally-exited flag so a previous back-button close
                     // can't block this reconnection in a still-alive process.
                     DeviceEventStream.startAfterUserReturn()
+                    // Host entitlement is re-checked from HomeScreenCompose.onResume,
+                    // not from a timer here. Every way back into the app lands on
+                    // the home screen, so that one hook covers returning from the
+                    // TV launcher as well as from any internal screen — and it
+                    // spends the work only when someone is actually navigating.
                 }
             }
         )
+
+        // ── Host reported this account inactive ────────────────────────────────
+        // Close the app immediately and raise the lock screen. NOT a sign-out:
+        // the session is deliberately left intact, because the standing is
+        // expected to flip back and making people re-authenticate after a billing
+        // hiccup would be its own bug.
+        //
+        // The fail-open rule lives in HostEntitlementRelay, not here — by the time
+        // this fires, a definite "inactive" has already been confirmed.
+        HostEntitlementRelay.init(this)
+
+        EntitlementLockBus.register {
+            Log.w(TAG, "🔒 host standing inactive — closing app to the lock screen")
+            ServiceLockoutActivity.launch(this@BlueHiveApplication)
+        }
 
         // ── Session expired ────────────────────────────────────────────────────
         // PHASE 2: identity loss (host revoked/unpaired) means BlueHive closes

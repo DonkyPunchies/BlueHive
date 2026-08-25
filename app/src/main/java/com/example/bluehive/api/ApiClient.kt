@@ -1,5 +1,6 @@
 package com.example.bluehive.api
 
+import com.example.bluehive.auth.HostEntitlementRelay
 import android.util.Log
 import com.example.bluehive.BuildConfig
 import com.example.bluehive.auth.SessionManager
@@ -142,10 +143,10 @@ object ApiClient {
                 return null
             }
 
-            val result = com.example.bluehive.host.HostTokenProvider.fetchFreshToken()
+            val result = com.example.bluehive.auth.TokenProvider.fetchFreshToken()
 
             return when (result) {
-                is com.example.bluehive.host.HostToken.Fresh -> {
+                is com.example.bluehive.auth.TokenResult.Fresh -> {
                     SessionManager.get().setHostAccessToken(result.token)
                     Log.i(TAG, "Got fresh host token — retrying request")
 
@@ -155,14 +156,14 @@ object ApiClient {
                         .build()
                 }
 
-                com.example.bluehive.host.HostToken.Revoked -> {
+                com.example.bluehive.auth.TokenResult.Revoked -> {
                     Log.w(TAG, "Host reports revoked — dropping session")
                     SessionManager.get().clearSession()
                     SessionExpiredBus.post()
                     null
                 }
 
-                com.example.bluehive.host.HostToken.Unavailable -> {
+                com.example.bluehive.auth.TokenResult.Unavailable -> {
                     Log.w(TAG, "Host unavailable transiently — failing this request, keeping session")
                     null
                 }
@@ -205,10 +206,10 @@ object ApiClient {
                 return null
             }
 
-            val result = com.example.bluehive.host.HostTokenProvider.fetchFreshToken()
+            val result = com.example.bluehive.auth.TokenProvider.fetchFreshToken()
 
             return when (result) {
-                is com.example.bluehive.host.HostToken.Fresh -> {
+                is com.example.bluehive.auth.TokenResult.Fresh -> {
                     SessionManager.get().setHostAccessToken(result.token)
                     Log.i(TAG, "Got fresh host token for platformApi — retrying request")
 
@@ -218,8 +219,8 @@ object ApiClient {
                         .build()
                 }
 
-                com.example.bluehive.host.HostToken.Revoked,
-                com.example.bluehive.host.HostToken.Unavailable -> {
+                com.example.bluehive.auth.TokenResult.Revoked,
+                com.example.bluehive.auth.TokenResult.Unavailable -> {
                     Log.w(TAG, "Host gave no usable token for platformApi — failing this request only, keeping session")
                     null
                 }
@@ -279,6 +280,36 @@ object ApiClient {
                 Log.w(TAG, "Got 429 from ${chain.request().url.encodedPath} " +
                         "(reason=$reason) — posting lockout")
                 LockoutBus.post(reason)
+            }
+            response
+        }
+        // ── Server says this account is not entitled ──────────────────────────
+        // THE SERVER IS THE AUTHORITY, and this interceptor is what makes the
+        // lock real rather than cosmetic. The client's own verdict lives in
+        // SharedPreferences, which app data can wipe, and the retry button
+        // deliberately fails open when the network is down. Neither is a bypass
+        // any more: every gated endpoint answers 403 whatever the client believes
+        // about itself, and this turns that answer back into the lock screen.
+        //
+        // MATCHED ON THE CODE, never on the status alone. 403 is a general "no"
+        // that other endpoints use for their own reasons, and treating all of
+        // them as an entitlement lock would boot people out over unrelated
+        // failures.
+        //
+        // peekBody, not body(): reading the body here would consume it and the
+        // actual caller would get an empty response.
+        .addInterceptor { chain ->
+            val response = chain.proceed(chain.request())
+            if (response.code == 403) {
+                val code = runCatching {
+                    JSONObject(response.peekBody(1024).string())
+                        .optJSONObject("detail")?.optString("code")
+                }.getOrNull()
+                if (code == "entitlement_inactive") {
+                    Log.w(TAG, "403 entitlement_inactive from " +
+                            "${chain.request().url.encodedPath} — locking")
+                    HostEntitlementRelay.markInactiveFromServer()
+                }
             }
             response
         }

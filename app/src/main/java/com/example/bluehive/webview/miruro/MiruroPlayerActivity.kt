@@ -56,6 +56,8 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import com.example.bluehive.BuildConfig
+import com.example.bluehive.IdleWatcher
+import com.example.bluehive.StillWatchingOverlay
 import okhttp3.OkHttpClient
 import java.util.concurrent.TimeUnit
 
@@ -268,6 +270,17 @@ class MiruroPlayerActivity : ComponentActivity() {
                 if (state == Player.STATE_READY) {
                     Log.d(sCRAPE, "⏱ duration=${player?.duration}ms | isLive=${player?.isCurrentMediaItemLive}")
                 }
+
+                // Episode over — close rather than sit on a finished player.
+                // See the equivalent branch in HlsPlayerActivity for the full
+                // reasoning; the short version is that an unattended anime player
+                // at STATE_ENDED held a household streaming slot indefinitely and
+                // kept the TV's screen awake doing it.
+                if (state == Player.STATE_ENDED && player?.isCurrentMediaItemLive != true) {
+                    Log.i(sCRAPE, "🏁 episode ended — closing player")
+                    IdleWatcher.setPlaying(IdleWatcher.SOURCE_MIRURO, false)
+                    finish()
+                }
             }
 
             // ✅ THE watched signal for anime. Fires only once video is genuinely
@@ -277,6 +290,14 @@ class MiruroPlayerActivity : ComponentActivity() {
             // episode watched. Guarded by `watchLogged` so a pause/resume can't
             // log the same episode twice.
             override fun onIsPlayingChanged(isPlaying: Boolean) {
+                // Suppress the plain idle release while frames are flowing, and arm
+                // the longer still-watching check instead. The pause hook has to
+                // hop to the main thread — ExoPlayer is single-threaded and
+                // IdleWatcher ticks on IO.
+                IdleWatcher.setPlaying(IdleWatcher.SOURCE_MIRURO, isPlaying) {
+                    runOnUiThread { player?.pause() }
+                }
+
                 if (isPlaying && !watchLogged) {
                     watchLogged = true
                     logWatchOnPlaybackConfirmed()
@@ -317,6 +338,12 @@ class MiruroPlayerActivity : ComponentActivity() {
                             showQualityOverlay.value = false
                         },
                     )
+
+                    // "Still watching?" — LAST, so it draws above the quality
+                    // overlay. Takes no focus and consumes no input; any remote
+                    // press dismisses it through the window hook in
+                    // BlueHiveApplication.
+                    StillWatchingOverlay()
                 }
             }
         }
@@ -531,6 +558,10 @@ class MiruroPlayerActivity : ComponentActivity() {
 
     override fun onDestroy() {
         Log.d(sCRAPE, "🧹 MiruroPlayerActivity onDestroy — releasing player")
+        // Unconditionally and first: onIsPlayingChanged is not guaranteed to fire
+        // false on the way out, and a source stuck in the playing set suppresses
+        // the idle timer for the rest of the process lifetime.
+        IdleWatcher.setPlaying(IdleWatcher.SOURCE_MIRURO, false)
         releasePlayer()
         super.onDestroy()
     }

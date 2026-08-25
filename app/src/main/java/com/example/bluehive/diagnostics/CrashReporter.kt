@@ -217,6 +217,59 @@ object CrashReporter {
         }
     }
 
+    /**
+     * Report a playback failure the way a crash is reported.
+     *
+     * WHY THIS EXISTS
+     * ---------------
+     * A video that stops early is invisible otherwise. It is not a crash, so the
+     * handler above never fires; if the stream played direct rather than through
+     * the relay there is no server-side record either; and since release builds
+     * are minified, the app's own Log lines are stripped from the APK. On
+     * 2026-08-16 an episode ended prematurely and NONE of those three sources had
+     * anything to say about it.
+     *
+     * ExoPlayer already knows exactly what went wrong — errorCodeName gives things
+     * like ERROR_CODE_IO_BAD_HTTP_STATUS or ERROR_CODE_PARSING_CONTAINER_MALFORMED,
+     * which distinguishes an expired stream URL from a decoder fault from a
+     * network drop. This puts that in the same device_reports table as crashes, so
+     * it is answerable from the backend for TVs you cannot reach.
+     *
+     * FIRE AND FORGET, deliberately: a failure to report a failure must never
+     * become a second visible failure. Playback UI does not wait on this.
+     */
+    fun reportPlaybackError(
+        context: Context,
+        errorCodeName: String,
+        message: String?,
+        cause: String?,
+        extraMeta: Map<String, Any?> = emptyMap(),
+    ) {
+        ioScope.launch {
+            try {
+                val body = buildReport(
+                    context,
+                    reportType = "playback_error",
+                    extraMeta = extraMeta + mapOf(
+                        "error_code_name" to errorCodeName,
+                        "cause" to cause,
+                    ),
+                ).copy(
+                    exception_class = errorCodeName,
+                    exception_message = message ?: "Playback ended unexpectedly",
+                )
+                val resp = ApiClient.bluehiveApi.submitDeviceReport(body)
+                if (resp.isSuccessful) {
+                    Log.i(TAG, "📤 Playback error reported ($errorCodeName)")
+                } else {
+                    Log.w(TAG, "Playback report rejected: HTTP ${resp.code()}")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Playback report failed: ${e.message}")
+            }
+        }
+    }
+
     // ── Report assembly ───────────────────────────────────────────────────────
 
     private fun buildReport(

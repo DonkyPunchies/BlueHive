@@ -61,6 +61,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.example.bluehive.api.ApiClient
 import com.example.bluehive.api.ProfileResponse
+import com.example.bluehive.auth.HostEntitlementRelay
 import com.example.bluehive.auth.SessionManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -78,6 +79,14 @@ import com.example.bluehive.utilities.NetworkMonitor
 import com.example.bluehive.utilities.ProfileButtonAnimationConfig
 import com.example.bluehive.utilities.ProfileButtonDimensions
 import com.example.bluehive.utilities.RetryOverlay
+import com.example.bluehive.utilities.ConfirmationOverlay
+import com.example.bluehive.utilities.AppTypography
+import com.example.bluehive.auth.AuthActivity
+import com.example.bluehive.auth.DeviceEventStream
+import androidx.activity.compose.LocalActivity
+import androidx.activity.compose.BackHandler
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Avatar resource map
@@ -116,6 +125,24 @@ val PROFILE_CARD_CORNER: Dp = 5.dp
 
 val GRID_OFFSET_Y_TOP_ROW: Dp    = 185.dp
 val GRID_OFFSET_Y_BOTTOM_ROW: Dp = 330.dp
+
+
+// ── "Signed in as <email>" label ─────────────────────────────────────────────
+// Position of the top-left account label. THESE ARE THE TWO KNOBS — the label is
+// absolutely positioned inside the same 960x540 dp design space everything else
+// on this screen uses (see `screenWidth` in ProfileScreen), so smaller Y = higher
+// on screen and smaller X = further left.
+//
+// Y was 76.dp when the label was added; lowered to 40.dp on request to sit it
+// nearer the top edge, clear of the title block.
+val SIGNED_IN_LABEL_X: Dp = 45.dp
+val SIGNED_IN_LABEL_Y: Dp = 50.dp
+
+/** Font size of that label. Small on purpose — it is a reference, not a heading. */
+val SIGNED_IN_LABEL_FONT_SIZE = 7.sp
+
+/** Muted blue-grey. Readable against the dark background without pulling focus. */
+val SIGNED_IN_LABEL_COLOR = Color(0xFF3D5CA8)
 
 
 // ── Profile card focus glow config ───────────────────────────────────────────
@@ -290,9 +317,18 @@ fun ProfileScreen(
         scope.launch { reloadProfiles() }
     }
 
-    val focusRequesters      = remember { mutableStateListOf<FocusRequester>() }
-    val createFocusRequester = remember { FocusRequester() }
-    val manageFocusRequester = remember { FocusRequester() }
+    val focusRequesters       = remember { mutableStateListOf<FocusRequester>() }
+    val createFocusRequester  = remember { FocusRequester() }
+    val manageFocusRequester  = remember { FocusRequester() }
+    val signOutFocusRequester = remember { FocusRequester() }
+
+    // ── Sign out ──────────────────────────────────────────────────────────────
+    // Read ONCE into a remembered value rather than on each recomposition. The
+    // confirmation overlay names this address, and performSignOut clears the
+    // session underneath it — so reading live would blank the text mid-dismiss.
+    val signedInEmail = remember { SessionManager.get().email }
+    var showSignOutConfirm by remember { mutableStateOf(false) }
+    val activity = LocalActivity.current
 
 
 
@@ -373,6 +409,29 @@ fun ProfileScreen(
             modifier           = Modifier.fillMaxSize(),
         )
 
+        // ── "Signed in as …" ──────────────────────────────────────────────────
+        // Top-left, deliberately quiet. BlueHive keeps you signed in indefinitely
+        // (the refresh token slides), so without this there is nothing anywhere in
+        // the app that tells you WHICH account a TV is on — which matters as soon
+        // as a household has more than one, and matters again the moment someone
+        // presses Sign Out and has to get back in through that address.
+        //
+        // Not focusable: it is a label, and putting it in the D-pad path would
+        // make every trip to the profile grid pass through dead weight.
+        if (!signedInEmail.isNullOrBlank()) {
+            Text(
+                text       = "Signed in as $signedInEmail",
+                color      = SIGNED_IN_LABEL_COLOR,
+                fontFamily = AppTypography.interBold,
+                fontSize   = SIGNED_IN_LABEL_FONT_SIZE,
+                maxLines   = 1,
+                overflow   = TextOverflow.Ellipsis,
+                modifier   = Modifier
+                    .align(Alignment.TopStart)
+                    .offset(x = SIGNED_IN_LABEL_X, y = SIGNED_IN_LABEL_Y),
+            )
+        }
+
         // Invisible focus parking spot — declared first so it's the default focus
         // target during load, holding focus until the grid is ready. canFocus flips
         // to false afterward so D-pad navigation can never land back on it.
@@ -444,8 +503,10 @@ fun ProfileScreen(
             onClick        = { onCreateProfile(creationLauncher) },
             modifier       = Modifier
                 .align(Alignment.TopStart)
+                // Sign Out now sits between Create and Manage, so right-from-Create
+                // lands there first rather than skipping it.
                 .offset(x = createButtonX, y = createButtonY)
-                .focusProperties { right = manageFocusRequester },
+                .focusProperties { right = signOutFocusRequester },
             dimensions = ProfileButtonDimensions(
                 imageSize          = 77.25.dp,
                 imageCornerRadius  = 6.dp,
@@ -470,6 +531,74 @@ fun ProfileScreen(
             ),
         )
 
+        // ── Sign Out button ───────────────────────────────────────────────────
+        // Sits immediately left of Manage Profiles on the same row: x 678..780,
+        // then a 10dp gap before Manage at 790. Same dimensions and colours as
+        // Manage on purpose — the row reads as one control strip, and the red
+        // "this is destructive" signal belongs on the confirm button inside the
+        // overlay, where the user is actually deciding, not out here where it
+        // would just shout at them every time they pick a profile.
+        ModularButton(
+            textConfig = ModularButtonTextConfig(
+                text     = "Sign Out",
+                fontSize = 10f,
+            ),
+            isToggleable   = false,
+            fontFamily     = AppTypography.interBold,
+            focusRequester = signOutFocusRequester,
+            onClick        = { showSignOutConfirm = true },
+            modifier       = Modifier
+                .align(Alignment.TopStart)
+                .offset(x = 678.dp, y = 445.dp)
+                .focusProperties {
+                    // Inherits the left-target Manage used to own; Manage now
+                    // points here instead.
+                    left  = if (profiles.size < 8) createFocusRequester
+                            else focusRequesters.getOrNull(7) ?: FocusRequester.Cancel
+                    right = manageFocusRequester
+                },
+            dimensions = ModularButtonDimensions(
+                mainWidth          = 102.dp,
+                mainHeight         = 27.dp,
+                mainYOffset        = 6.5.dp,
+                secondWidth        = 102.dp,
+                secondHeight       = 12.dp,
+                secondYOffset      = 26.dp,
+                mainCornerRadius   = 7f,
+                secondCornerRadius = 8f,
+                shadowHeight       = 12.dp,
+                glowWidth          = 117.dp,
+                glowHeight         = 41.dp,
+            ),
+            colors = ModularButtonColors(
+                mainDefault   = Color(0xFF1E2439),
+                mainToggled   = Color(0xFF2644A6),
+                mainFocused   = Color(0xFF2644A6),
+                secondDefault = Color(0xFF191923),
+                secondFocused = Color(0xFF282C57),
+                textFocused          = Color(0xFFDADADA),
+                textUnfocused        = Color(0xFF868686),
+                textUnfocusedToggled = Color(0xFF868686),
+                textToggledFocus     = Color(0xFFDADADA),
+            ),
+            glowConfig = ModularButtonGlowConfig(
+                enabled    = true,
+                defaultRes = R.drawable.button_focus_wide_glow,
+                offsetX    = (-7.5).dp,
+                offsetY    = (7).dp,
+                cornerRadius          = 100.dp,
+                fadeOutDurationMillis = 200,
+                fadeInDurationMillis  = 400,
+            ),
+            animationConfig = ModularButtonAnimationConfig(
+                pressOffset           = 3.5.dp,
+                textOffsetDefault     = 7.9.dp,
+                textOffsetPressed     = 9.9.dp,
+                durationMillis        = 110,
+                bounceBackDelayMillis = 200,
+            ),
+        )
+
         // ── Manage Profiles button ────────────────────────────────────────────
         ModularButton(
             textConfig = ModularButtonTextConfig(
@@ -483,10 +612,7 @@ fun ProfileScreen(
             modifier       = Modifier
                 .align(Alignment.TopStart)
                 .offset(x = 790.dp, y = 445.dp)
-                .focusProperties {
-                    left = if (profiles.size < 8) createFocusRequester
-                    else focusRequesters.getOrNull(7) ?: FocusRequester.Cancel
-                },
+                .focusProperties { left = signOutFocusRequester },
             dimensions = ModularButtonDimensions(
                 mainWidth          = 102.dp,
                 mainHeight         = 27.dp,
@@ -534,6 +660,102 @@ fun ProfileScreen(
         // All logic lives in CloseApplication.kt — nothing to maintain here.
         CloseApplicationHandler()
 
+        // ── Sign-out confirmation ─────────────────────────────────────────────
+        // DECLARED AFTER CloseApplicationHandler, and both lines below depend on
+        // that ordering:
+        //
+        //   Drawing — later in a Box means on top, so this overlay is never
+        //   painted underneath the close-app one.
+        //
+        //   Back button — CloseApplicationHandler registers an ALWAYS-enabled
+        //   BackHandler. Compose dispatches back to the most recently registered
+        //   enabled handler first, so registering ours afterwards and gating it on
+        //   showSignOutConfirm gives exactly the right split: while this overlay is
+        //   up, back dismisses it; the rest of the time back falls through to the
+        //   close-app prompt as before. Without the gate we would swallow every
+        //   back press on this screen.
+        BackHandler(enabled = showSignOutConfirm) { showSignOutConfirm = false }
+
+        if (showSignOutConfirm) {
+            ConfirmationOverlay(
+                // Naming the address is the entire point of the warning. Sign-out
+                // is cheap to trigger from a remote and expensive to undo if the
+                // account was created with an address the person at the TV cannot
+                // actually open — a plausible mistake in a shared household, and
+                // one they cannot discover AFTER signing out, because the address
+                // is gone from the screen at that moment.
+                message     = "Sign out of BlueHive?\n\n" +
+                              "Signing back in will require access to\n" +
+                              (signedInEmail ?: "your account email"),
+                confirmText = "Yes, Sign Out",
+                cancelText  = "No, Cancel",
+                onConfirm   = {
+                    showSignOutConfirm = false
+                    activity?.let { performSignOut(it) }
+                },
+                onCancel    = { showSignOutConfirm = false },
+            )
+        }
+
+    }
+}
+
+
+/**
+ * performSignOut
+ *
+ * Tears the session down in an order that matters, then returns to the front door.
+ *
+ *  1. DeviceEventStream.stop() — NOT stopAndMarkExited(). That variant sets a
+ *     process-lifetime flag which blocks start() until the process dies, and it is
+ *     right for closing the app. It is wrong here: signing back in happens in this
+ *     SAME process, so marking the stream permanently exited would leave the next
+ *     session with no event stream and no obvious reason why.
+ *
+ *  2. endSession() BEFORE clearSession(). The call is authenticated, so clearing
+ *     the token first would make it 401 and silently leave the device holding its
+ *     slot until the reaper expires it ~15 minutes later. The 2s timeout means a
+ *     dead network cannot trap the user on a screen they asked to leave, and the
+ *     reaper remains the backstop if the ping is lost.
+ *
+ *  3. clearSession() in the finally, so the local session is destroyed whether or
+ *     not the server was reachable. A sign-out that visibly fails to sign you out
+ *     is worse than one that leaves a stale row for the reaper to collect.
+ *
+ *  4. CLEAR_TASK into AuthActivity so nothing behind this screen survives — back
+ *     from the sign-in page must not walk into a profile grid with no session.
+ *
+ * KNOWN GAP: there is no server-side revoke endpoint yet, so the refresh token
+ * stays valid until it expires even though it has been wiped from this device.
+ * That is acceptable while the token never leaves the TV, but a real
+ * /auth/logout that deletes the bluehive.refresh_tokens row is the correct fix.
+ */
+private fun performSignOut(activity: Activity) {
+    DeviceEventStream.stop()
+
+    CoroutineScope(Dispatchers.IO).launch {
+        try {
+            withTimeout(2_000) { ApiClient.bluehiveApi.endSession() }
+        } catch (e: Exception) {
+            Log.w("ProfileScreen", "sign-out end-session ping failed (reaper backstop): ${e.message}")
+        } finally {
+            SessionManager.get().clearSession()
+            // The host standing belongs to the account that just left, not to the
+            // device. Without this, signing out of a locked account and signing
+            // in as somebody else inherits the lock: the next person is held
+            // behind a "connection trouble" screen over a subscription that was
+            // never theirs. Cleared here rather than at sign-IN so the device is
+            // never carrying a stale verdict between accounts.
+            HostEntitlementRelay.clearStanding(activity)
+            withContext(Dispatchers.Main) {
+                activity.startActivity(
+                    Intent(activity, AuthActivity::class.java).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+                    }
+                )
+                activity.finish()
+            }
+        }
     }
 }
 

@@ -29,6 +29,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.bluehive.webview.MainWebViewer
 import androidx.compose.foundation.Image
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.ContentScale
 import com.example.bluehive.utilities.*
 import coil.compose.AsyncImage
@@ -578,6 +580,13 @@ internal fun usesBackendExtraction(sourceName: String): Boolean =
         // dropping to the raw embed.
         sourceName.equals("VidEasy", true) ||
         sourceName.equals("VidSpark", true) ||
+        // MoviesAPI ("Purple Stream") — the same site VidSpark pointed at, renamed
+        // on both screens 2026-08-21. MUST be listed: without it the button falls
+        // through to the raw Gecko embed, losing the relay and keeping a browser
+        // engine resident for the whole title, which is what OOM-kills the 2 GB
+        // box. The backend extracts this source in ~5s by going straight to the
+        // inner embed and skipping the wrapper's anti-automation redirect.
+        sourceName.equals("MoviesAPI", true) ||
         // VidApi ("Honeycomb") — BOTH screens now. This match shadows the movies
         // list's `useExtractor = true` on that entry, because the movies button
         // tests usesBackendExtraction FIRST: the on-device VidApiExtractorActivity
@@ -612,19 +621,14 @@ private fun getStreamingSources(
             ),
             TVShowsDetailsScreenCompose.StreamingSource(
                 "Purple Stream",
-                "VidSpark",
-                "https://vidflix.club/tv/$mediaId/$seasonNumber/$episodeNumber?autoPlay=true"
+                "MoviesAPI",
+                "https://moviesapi.to/tv/$mediaId/$seasonNumber/$episodeNumber"
             ),
             TVShowsDetailsScreenCompose.StreamingSource(
                 "Swarm Stream",
                 "VidSrc",
                 "https://vidsrc.mov/embed/tv/$mediaId/$seasonNumber/$episodeNumber"
             ),
-//            TVShowsDetailsScreenCompose.StreamingSource(
-//                "Colony Stream",
-//                "VidSuper",
-//                "https://vidsuper.net/tv/$mediaId/$seasonNumber/$episodeNumber"
-//            ),
             TVShowsDetailsScreenCompose.StreamingSource(
                 "Honeycomb",
                 "VidApi",
@@ -638,6 +642,47 @@ private fun getStreamingSources(
 
 
 
+
+/**
+ * Measures [content] at its natural size, reports ZERO height to the parent, and
+ * places it directly ABOVE where it would otherwise sit.
+ *
+ * Exists for the episode air date. That Text sits above the still inside the same
+ * Column, so its line height became real layout space and pushed every thumbnail
+ * down — the tiles visibly sat lower than before the date was added on
+ * 2026-08-16.
+ *
+ * TWO EARLIER ATTEMPTS AND WHY THEY WERE WRONG, so nobody repeats them:
+ *
+ *   Leaving it alone — the tiles stay pushed down by however tall the font
+ *   happens to render. Nothing in the code says how much, so it cannot be
+ *   compensated anywhere else with confidence.
+ *
+ *   Pinning the Text to a fixed height and lifting the Column by the same
+ *   constant — this DELETED THE DATE. dongleRegular's line box at 11.sp is taller
+ *   than the 14.dp that was guessed, so the glyphs were clipped away entirely and
+ *   the strip rendered blank. Any hardcoded height is the same trap with a
+ *   different number: it silently clips the moment a font, size, or fontScale
+ *   changes.
+ *
+ * This measures first and never constrains, so the text renders at whatever size
+ * it actually needs, and the parent is told it took none of the column. The
+ * result is exact rather than tuned — the still returns to precisely the Y it had
+ * before the date existed, for any font metrics, with nothing to keep in sync.
+ */
+@Composable
+private fun ZeroHeightAbove(content: @Composable () -> Unit) {
+    Layout(content = content) { measurables, constraints ->
+        // Natural height: pass the incoming width through, but no height bound.
+        val placeables = measurables.map { it.measure(constraints.copy(minHeight = 0, maxHeight = Constraints.Infinity)) }
+        val width = placeables.maxOfOrNull { it.width } ?: 0
+        // Report height 0 — the Column advances not at all for this child.
+        layout(width, 0) {
+            // Negative Y puts it in the strip above the tile's top edge.
+            placeables.forEach { it.place(0, -it.height) }
+        }
+    }
+}
 
 /**
  * "2022-02-03" -> "02/03/2022" for the date shown above each episode still.
@@ -2542,18 +2587,22 @@ fun TVShowsDetailsScreenContent(
                                     // So no isFullyVisible gate here — and a blank string still
                                     // occupies its line, which keeps unaired episodes (null
                                     // air_date) exactly the same height as aired ones.
-                                    Text(
-                                        text = formatEpisodeAirDate(episode.airDate),
-                                        fontFamily = dongleRegular,
-                                        fontSize = 11.sp,          // episode title is 13.sp
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        color = if (!isEpisodeFocused) Color(0xFF737373) else Color.White,
-                                        textAlign = TextAlign.End,
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(end = 4.dp)
-                                    )
+                                    // Measured at its NATURAL size, then reported as zero height and
+                                    // placed above the baseline — see ZeroHeightAbove.
+                                    ZeroHeightAbove {
+                                        Text(
+                                            text = formatEpisodeAirDate(episode.airDate),
+                                            fontFamily = dongleRegular,
+                                            fontSize = 11.sp,          // episode title is 13.sp
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            color = if (!isEpisodeFocused) Color(0xFF737373) else Color.White,
+                                            textAlign = TextAlign.End,
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(end = 4.dp)
+                                        )
+                                    }
 
                                     // ✅ Image/BADGE/GLOW stack stays inside this Box
                                     Box(

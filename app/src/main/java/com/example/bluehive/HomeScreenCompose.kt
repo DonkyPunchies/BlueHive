@@ -50,6 +50,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.currentStateAsState
 import com.example.bluehive.api.SessionExpiredBus
+import com.example.bluehive.auth.HostEntitlementRelay
 import com.example.bluehive.auth.SessionManager
 import com.example.bluehive.catalog.openMediaCatalogScreen
 import com.example.bluehive.searchBarComponent.openSearchScreen
@@ -216,6 +217,21 @@ class HomeScreenCompose : ComponentActivity() {
             return
         }
         refreshTrigger.intValue++
+
+        // Re-check the host's account standing.
+        //
+        // THIS ONE HOOK COVERS EVERY RETURN PATH. Sidebar pages, watch history,
+        // favorites, settings, the media catalog, a movie or show detail page, the
+        // profile picker, and coming back from the TV launcher all resume this
+        // activity — so there is no need to instrument each of them.
+        //
+        // Placed AFTER the auth guard on purpose: an unauthenticated session is on
+        // its way out of the app and has nothing to report against.
+        //
+        // Rate-limited internally (3s floor — just long enough to collapse a
+        // duplicate onResume) and self-cancelling when the token has not changed,
+        // so bouncing in and out of a detail page costs nothing.
+        HostEntitlementRelay.checkNow(this)
     }
 
     override fun onPause() {

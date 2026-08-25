@@ -29,6 +29,7 @@ import org.mozilla.geckoview.*
 import android.os.Build
 import androidx.compose.ui.layout.onSizeChanged
 import com.example.bluehive.BlueHiveApplication
+import com.example.bluehive.IdleWatcher
 import com.example.bluehive.api.LockoutBus
 import com.example.bluehive.diagnostics.CrashReporter
 import kotlinx.coroutines.launch
@@ -223,6 +224,48 @@ class MainWebViewer : AppCompatActivity() {
                 override fun onPageStop(session: GeckoSession, success: Boolean) {}
             }
 
+            // ── PLAYBACK STATE FOR THE IDLE TIMER ────────────────────────────
+            //
+            // The only surface here whose playback Kotlin cannot see directly.
+            // There is no ExoPlayer in this activity — the video element lives
+            // inside Gecko's own content process — so `isPlaying` has to come from
+            // the engine rather than from us. (The comment further down about
+            // "no ExoPlayer to read a position" is the same limitation.)
+            //
+            // WITHOUT THIS, A FILM WATCHED IN THIS VIEWER LOOKS IDLE. Nothing would
+            // ever report playing, so the plain 30-minute release would fire
+            // mid-film and hand the household slot away while the user was sitting
+            // there watching — much worse than the leak this feature closes.
+            //
+            // onPlay/onPause are delivered whenever the page's media session
+            // changes state, including when the page itself pauses at the end of a
+            // video. That end-of-video pause is what makes the ordinary idle rule
+            // apply again, which is the web equivalent of the STATE_ENDED branch in
+            // the two ExoPlayer activities.
+            mediaSessionDelegate = object : MediaSession.Delegate {
+                override fun onPlay(session: GeckoSession, mediaSession: MediaSession) {
+                    IdleWatcher.setPlaying(IdleWatcher.SOURCE_WEBVIEW, true) {
+                        // Gecko is main-thread-only, same as ExoPlayer.
+                        mainHandler.post { runCatching { mediaSession.pause() } }
+                    }
+                }
+
+                override fun onPause(session: GeckoSession, mediaSession: MediaSession) {
+                    IdleWatcher.setPlaying(IdleWatcher.SOURCE_WEBVIEW, false)
+                }
+
+                override fun onStop(session: GeckoSession, mediaSession: MediaSession) {
+                    IdleWatcher.setPlaying(IdleWatcher.SOURCE_WEBVIEW, false)
+                }
+
+                // A page can drop its media session without ever pausing — a
+                // navigation, or the video element being removed. Same meaning for
+                // us as a stop, and missing it would strand the source as playing.
+                override fun onDeactivated(session: GeckoSession, mediaSession: MediaSession) {
+                    IdleWatcher.setPlaying(IdleWatcher.SOURCE_WEBVIEW, false)
+                }
+            }
+
             contentDelegate = object : GeckoSession.ContentDelegate {
                 override fun onFullScreen(session: GeckoSession, fullScreen: Boolean) {
                     if (!isFinishing && !shutdownInitiated) {
@@ -346,7 +389,13 @@ class MainWebViewer : AppCompatActivity() {
             activeWatchId = null
             kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
                 try {
-                    com.example.bluehive.api.ApiClient.bluehiveApi.stopWatchHistory(watchId)
+                    // Position 0: this viewer has no ExoPlayer to read a position
+                    // from. The server treats the body as a floor, not an
+                    // overwrite, so sending 0 never destroys a real position — it
+                    // just closes the session and leaves whatever was recorded.
+                    com.example.bluehive.api.ApiClient.bluehiveApi.stopWatchHistory(
+                        watchId, com.example.bluehive.api.WatchProgressRequest(0)
+                    )
                     Log.d(TAG, "✅ Watch session stopped: id=$watchId")
                 } catch (e: Exception) {
                     Log.w(TAG, "⚠️ Watch stop failed (non-fatal): ${e.message}")
@@ -408,6 +457,11 @@ class MainWebViewer : AppCompatActivity() {
 
     override fun onDestroy() {
         LockoutBus.unregister(lockoutListener)
+        // Unconditionally and first. A killed content process, or a teardown that
+        // races the delegate, can skip onPause/onStop entirely — and a source left
+        // stuck in the playing set suppresses the idle timer for the rest of the
+        // process lifetime.
+        IdleWatcher.setPlaying(IdleWatcher.SOURCE_WEBVIEW, false)
         if (!shutdownInitiated) {
             initiateGracefulShutdown()
         }
