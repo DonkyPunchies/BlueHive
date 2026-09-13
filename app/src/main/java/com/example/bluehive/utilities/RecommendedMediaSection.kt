@@ -192,28 +192,42 @@ fun RecommendedMediaSection(
                                 }
                         }
 
-                        val runTimeText = remember(mediaItem.runtime) {
-                            val minutes = mediaItem.runtime ?: return@remember null
-                            if (minutes <= 0) null else {
-                                val h = minutes / 60
-                                val m = minutes % 60
-                                when {
-                                    h > 0 && m > 0 -> "${h}h ${m}m"
-                                    h > 0 -> "${h}h"
-                                    m > 0 -> "${m}m"
-                                    else -> null
-                                }
-                            }
+                        // WAS runtime-only — see TitleCardFormat. TV shows in the
+                        // recommendations now show their season count too.
+                        val runTimeText = remember(
+                            mediaItem.runtime, mediaItem.numberOfSeasons, mediaItem.mediaType
+                        ) {
+                            TitleCardFormat.meta(
+                                mediaItem.mediaType, mediaItem.runtime, mediaItem.numberOfSeasons
+                            )
                         }
 
                         val rating = remember(mediaItem.voteAverage) {
                             mediaItem.voteAverage?.takeIf { it > 0.0 }
                         }
 
+                        // THIS ROW HAD NO PRESS ANIMATION AT ALL. Every other card
+                        // list dipped on press; recommendations just jumped straight
+                        // to the details screen, which made them feel unlike the rest
+                        // of the app. Shared timing — see TitleCardPress.
+                        val isPressed = remember { mutableStateOf(false) }
+                        val pressBusy = remember { mutableStateOf(false) }
+                        val cardScale by animateFloatAsState(
+                            targetValue   = if (isPressed.value) TitleCardPress.SCALE else 1f,
+                            animationSpec = tween(
+                                if (isPressed.value) TitleCardPress.SHRINK_MS else TitleCardPress.REGROW_MS
+                            ),
+                            label = "cardScale",
+                        )
+
                         Column(
                             horizontalAlignment = Alignment.CenterHorizontally,
                             modifier = Modifier
                                 .width(112.dp)
+                                .graphicsLayer {
+                                    scaleX = cardScale
+                                    scaleY = cardScale
+                                }
                         ) {
                             MediaCard(
                                 mediaItem = mediaItem,
@@ -276,8 +290,11 @@ fun RecommendedMediaSection(
                                                 Key.Enter,
                                                 Key.NumPadEnter,
                                                 Key.DirectionCenter -> {
+                                                    // Sound now, navigation after the dip.
                                                     BlueHiveApplication.playClickSound()
-                                                    onMediaClick(mediaItem)
+                                                    coroutineScope.runTitleCardPress(isPressed, pressBusy) {
+                                                        onMediaClick(mediaItem)
+                                                    }
                                                     true
                                                 }
 

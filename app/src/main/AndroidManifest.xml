@@ -26,6 +26,16 @@
          ("install unknown apps" toggle for BlueHive), then one confirm dialog
          per update — unavoidable on sideloaded stock Android. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!-- Lets a self-update commit without Android's "Do you want to update this
+         app?" dialog. Normal permission: granted at install, never prompted for,
+         and inert on API < 31. It only takes effect alongside
+         setRequireUserAction(USER_ACTION_NOT_REQUIRED) in UpdateManager.install,
+         and only because an installer updating ITSELF is one of the cases the
+         platform allows — no device-owner provisioning, no root. Without it the
+         flag is ignored and the dialog appears exactly as before. -->
+    <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
+
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <!-- Lets SpeechRecognizer locate the on-device recognition service on API 30+ -->

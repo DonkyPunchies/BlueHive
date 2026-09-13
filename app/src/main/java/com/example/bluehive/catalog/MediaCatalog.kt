@@ -58,6 +58,8 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
+import com.example.bluehive.utilities.TitleCardPress
+import com.example.bluehive.utilities.runTitleCardPress
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -1029,10 +1031,15 @@ fun MediaCatalogScreen(profileId: Int = -1) {
                         val releaseDateText = displayData?.releaseDateText
                         val runTimeText     = displayData?.runTimeText
 
-                        var isPressed by remember { mutableStateOf(false) }
+                        // MutableState, not a delegated var: runTitleCardPress flips
+                        // these from a coroutine after this composition.
+                        val isPressed = remember { mutableStateOf(false) }
+                        val pressBusy = remember { mutableStateOf(false) }
                         val cardScale by animateFloatAsState(
-                            targetValue   = if (isPressed) 0.80f else 1f,
-                            animationSpec = tween(250),
+                            targetValue   = if (isPressed.value) TitleCardPress.SCALE else 1f,
+                            animationSpec = tween(
+                                if (isPressed.value) TitleCardPress.SHRINK_MS else TitleCardPress.REGROW_MS
+                            ),
                             label         = "cardScale",
                         )
 
@@ -1070,9 +1077,9 @@ fun MediaCatalogScreen(profileId: Int = -1) {
                                     }
                                     .onKeyEvent { event ->
                                         if (event.type == KeyEventType.KeyUp) {
-                                            if (event.key == Key.DirectionCenter || event.key == Key.Enter || event.key == Key.NumPadEnter) {
-                                                isPressed = false
-                                            }
+                                            // Release no longer ends the dip — runTitleCardPress
+                                            // owns the whole sequence, so a quick tap animates
+                                            // identically to a long hold.
                                             return@onKeyEvent false
                                         }
                                         if (event.type != KeyEventType.KeyDown) return@onKeyEvent false
@@ -1122,9 +1129,12 @@ fun MediaCatalogScreen(profileId: Int = -1) {
                                             }
                                             Key.DirectionCenter, Key.Enter, Key.NumPadEnter -> {
                                                 if (item != null) {
-                                                    isPressed = true
+                                                    // Sound now, navigation after the
+                                                    // animation — see TitleCardPress.
                                                     BlueHiveApplication.playClickSound()
-                                                    navigateToDetails(item)
+                                                    coroutineScope.runTitleCardPress(isPressed, pressBusy) {
+                                                        navigateToDetails(item)
+                                                    }
                                                 }
                                                 true
                                             }
@@ -1189,26 +1199,12 @@ private data class CardDisplayData(
 )
 
 private fun MediaItem.toCardDisplayData(): CardDisplayData {
-    val releaseDateText = releaseDate
-        ?.takeIf { it.isNotBlank() && it != "N/A" }
-        ?.let { raw ->
-            val parts = raw.split("-")
-            if (parts.size == 3) "${parts[1]}/${parts[2]}/${parts[0]}" else raw
-        }
-    val runTimeText = if (mediaType == "tv") {
-        numberOfSeasons?.takeIf { it > 0 }?.let { "S: $it" }
-    } else {
-        val minutes = runtime
-        if (minutes == null || minutes <= 0) null else {
-            val h = minutes / 60
-            val m = minutes % 60
-            when {
-                h > 0 && m > 0 -> "${h}h ${m}m"
-                h > 0          -> "${h}h"
-                else           -> "${m}m"
-            }
-        }
-    }
+    // Both strings come from TitleCardFormat so every row in the app agrees —
+    // see that file for what the four hand-written copies had drifted into.
+    val releaseDateText = com.example.bluehive.utilities.TitleCardFormat
+        .releaseDate(releaseDate)
+    val runTimeText = com.example.bluehive.utilities.TitleCardFormat
+        .meta(mediaType, runtime, numberOfSeasons)
     return CardDisplayData(releaseDateText, runTimeText)
 }
 

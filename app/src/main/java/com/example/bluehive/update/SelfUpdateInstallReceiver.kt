@@ -38,9 +38,12 @@ class SelfUpdateInstallReceiver : BroadcastReceiver() {
             PackageInstaller.STATUS_SUCCESS ->
                 Log.i("SelfUpdate", "Update installed successfully.")
             else -> {
+                // Forwarded, not just logged. This string is the only account of
+                // why the install failed, and it used to end here in a Log.w that
+                // R8 removes from release builds.
                 val msg = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE)
-                Log.w("SelfUpdate", "Install status=$status msg=$msg")
-                UpdateInstallBus.post(status)
+                Log.e("SelfUpdate", "Install status=$status msg=$msg")
+                UpdateInstallBus.post(status, msg)
             }
         }
     }

@@ -46,6 +46,7 @@ import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.foundation.focusable
 import com.example.bluehive.api.ApiClient
+import com.example.bluehive.api.ExtractOutcome
 import com.example.bluehive.api.FavoriteRequest
 import com.example.bluehive.api.WatchHistoryRequest
 import com.example.bluehive.utilities.AppShapes
@@ -71,6 +72,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import com.example.bluehive.webview.vidapi.VidApiExtractorActivity
 import com.example.bluehive.webview.hls.HlsExtract
 import com.example.bluehive.webview.hls.HlsPlayerActivity
+import com.example.bluehive.api.extractStreamAwait
 
 
 
@@ -398,6 +400,28 @@ private fun getStreamingSources(mediaType: String, mediaId: Int): List<MoviesDet
                 "VidNest",
                 "https://vidnest.fun/movie/$mediaId"
             ),
+            // VidLove — added 2026-08-30 as the second source, beside VidNest. Backend-extracted:
+            // "VidLove" is listed in usesBackendExtraction and keyed as "vidlove"
+            // in the backend's _SOURCES, and the URL shape here MUST match that
+            // template exactly or the two request different pages.
+            //
+            // PLACED BESIDE VIDNEST DELIBERATELY. Both pass the ISP filter
+            // with cleartext SNI (verified 2026-08-30: a2.shows.st and
+            // tiktoks.animanga.fun return certificates, moon.peakstorm.top and
+            // finalroom.top are severed), and neither appears in
+            // relay_sessions at all — while moon.peakstorm.top alone accounts
+            // for 22 of the last 24 hours' 34 relays. Order is the cheapest
+            // lever on relay volume, so the two clean sources lead.
+            //
+            // Verified before listing: both endpoints extract (movie 27205 and
+            // tv 1396 S1E1), and its CDNs a2.shows.st / d.shows.st both publish
+            // ECH with alpn=h3 — so it is covered by the QUIC/ECH path rather
+            // than relying on the relay.
+            MoviesDetailsScreenCompose.StreamingSource(
+                "Nectar Stream",
+                "VidLove",
+                "https://player.vidlove.cc/embed/movie/$mediaId"
+            ),
             MoviesDetailsScreenCompose.StreamingSource(
                 "Queen Stream",
                 "VidFast",
@@ -415,37 +439,13 @@ private fun getStreamingSources(mediaType: String, mediaId: Int): List<MoviesDet
                 "Purple Stream",
                 "MoviesAPI",
                     "https://moviesapi.to/movie/$mediaId"
-            ),
-            // Named VidSrc, not VidLink. The URL was already vidsrc.mov on both
-            // screens, but the MOVIES entry kept the old "VidLink" label — and the
-            // label is the routing key: usesBackendExtraction matches on name, so
-            // "VidLink" fell through to the raw Gecko embed with no server-side
-            // extraction and no relay, while the identical TV button got both.
-            // Renaming is the whole fix; the host does not change.
-            MoviesDetailsScreenCompose.StreamingSource(
-                "Swarm Stream",
-                "VidSrc",
-                "https://vidsrc.mov/embed/movie/$mediaId"
-            ),
-//            MoviesDetailsScreenCompose.StreamingSource(
-//                "Colony Stream",
-//                "VidSuper",
-//                "https://vidsuper.net/movie/$mediaId"
-//            ),
-            // NOTE: `useExtractor` on this entry and on VidFast above is now INERT.
-            // The button tests usesBackendExtraction(name) FIRST, and both VidApi
-            // and VidFast match it, so neither ever reaches the `source.useExtractor`
-            // branch — the on-device VidApiExtractorActivity ladder below is dead
-            // code from the movies screen today. Deliberately left in place rather
-            // than ripped out: it is inert, not wrong, and removing it would mean
-            // deleting the whole retry/failover machinery in one pass. If VidApi is
-            // ever dropped from usesBackendExtraction, this flag makes it work again.
-            MoviesDetailsScreenCompose.StreamingSource(
-                "Honeycomb",
-                "VidApi",
-                "https://vaplayer.ru/embed/movie/$mediaId",
-                useExtractor = true   // vaplayer embed → headless m3u8 extraction
             )
+            // VidSrc (\"Swarm Stream\") and VidApi ("Honeycomb") were removed on
+            // 2026-08-30 at the user's request. Both still work server-side — the
+            // 403s that made them look broken were our own Referer/Origin headers,
+            // fixed the same day — so this is a menu decision, not a capability
+            // one. Re-adding them is just restoring the entries; usesBackendExtraction
+            // already matches both names.
         )
         else -> listOf()
     }
@@ -493,6 +493,11 @@ fun MoviesDetailsScreenContent(
     val dongleRegular = AppTypography.dongleRegular
     val context = LocalContext.current
 
+    // Playback settings are per profile. Re-reading on entry is how a
+    // profile switch mid-session is picked up; it no-ops when the profile
+    // has not changed, so this costs nothing on a normal navigation.
+    LaunchedEffect(Unit) { PlaybackPrefs.load(context) }
+
     // Decode the loading-overlay bee logo now, while the screen is first
     // composing and memory is comparatively free, and cache it process-wide so
     // the Dub/Sub overlay never decodes it under pressure (the 2 GB crash).
@@ -502,12 +507,51 @@ fun MoviesDetailsScreenContent(
 
     // ✅ Add state for extras toggle and recommendations
     var isExtrasToggled by remember(startInExtras) { mutableStateOf(startInExtras) }
+
+    // ── Back collapses Extras before it leaves the page ─────────────────────
+    //
+    // Pressing back while the recommendations row is showing returns to the
+    // normal state; a second press then leaves, which is what "back" means
+    // everywhere else — undo the last thing you did, not the whole journey.
+    //
+    // DELIBERATELY REGISTERED HERE, above the overlay handlers further down.
+    // OnBackPressedDispatcher runs the MOST RECENTLY added enabled callback, and
+    // Compose adds them in composition order — so anything declared below this
+    // (the server picker, the extraction guard) still wins while it is open. Put
+    // this last and back would collapse Extras out from under an open overlay.
+    //
+    // When disabled it does not intercept at all, so back falls through to the
+    // Activity's own callback and the page closes exactly as before.
+    BackHandler(enabled = isExtrasToggled) {
+        BlueHiveApplication.playBackOutSound()
+        isExtrasToggled = false
+    }
+
     var recommendations by remember { mutableStateOf<List<MediaItem>>(emptyList()) }
     val coroutineScope = rememberCoroutineScope()
     var blockHeaderInitialFocus by remember(startInExtras) { mutableStateOf(startInExtras) }
 
     var isTrailerPlaying by remember { mutableStateOf(false) }
     var hasTrailerBeenPlayed by remember { mutableStateOf(false) }
+
+    /**
+     * Silence the backdrop trailer. Called where a playback ACTUALLY starts, and
+     * deliberately NOT when a source button merely opens a prompt.
+     *
+     * WHY THE DISTINCTION. This screen used to clear the flags in each source
+     * button's onClick, so the trailer died the instant you pressed VidFast even
+     * though the next thing on screen was "Watch with our player, or open the
+     * site directly?" — the backdrop went silent and static while you were still
+     * choosing. The TV screen never behaved that way: a backend source only sets
+     * its choice state and the trailer plays on until something really launches.
+     * This matches it.
+     *
+     * Idempotent, so a path crossing two launch points costs nothing.
+     */
+    fun stopTrailer() {
+        isTrailerPlaying = false
+        hasTrailerBeenPlayed = false
+    }
     var shouldExtractTrailer by remember { mutableStateOf(false) }
 
     // Focus requesters
@@ -517,6 +561,21 @@ fun MoviesDetailsScreenContent(
 
     var isExtractingTrailer by remember { mutableStateOf(false) }
     var isExtracting   by remember { mutableStateOf(false) }
+
+    // ── BACK during an extraction ───────────────────────────────────────
+    //
+    // Two pieces, and BOTH are needed. The job handle lets BACK stop the
+    // client's polling loop. The flag is what actually prevents the launch:
+    // the extraction is wrapped in runCatching, which CATCHES the
+    // CancellationException, so a cancelled coroutine still falls through to
+    // `body == null` and would raise the failure modal. Cancelling alone
+    // fixes the wasted requests and none of the user-visible damage.
+    //
+    // Without this, pressing BACK hid the overlay but the coroutine ran on —
+    // up to ExtractAwait.DEADLINE_MS (120s) — and then launched the player or
+    // threw a full-screen error over whatever the user had moved on to.
+    var extractJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    var extractCancelled by remember { mutableStateOf(false) }
     var extractStage   by remember { mutableIntStateOf(0) }
     var extractPending by remember { mutableStateOf(false) }   // guards the 1.5s pre-launch window
     var showNoDub      by remember { mutableStateOf(false) }   // transient "No dub available" toast
@@ -541,6 +600,25 @@ fun MoviesDetailsScreenContent(
     // result vs. a suspend HTTP call) with different failure handling. Overloading
     // it would send VidFast through VidApi's retry/fallback machinery.
     var backendChoiceFor by remember { mutableStateOf<MoviesDetailsScreenCompose.StreamingSource?>(null) }
+
+    // ── Browser button (bottom-right corner) ────────────────────────────────
+    // Mirrors the TV details screen. The composable itself is shared
+    // (utilities/BrowserCornerButton.kt) so the two cannot drift.
+    val browserFocusRequester = remember { FocusRequester() }
+
+    // How to get BACK out. Set by whichever route handed focus over, read by the
+    // button's LEFT/UP. A plain holder rather than state: nothing draws from it,
+    // so writing it must not recompose the screen.
+    val browserReturnFocus = remember { arrayOfNulls<(() -> Unit)>(1) }
+
+    var showPlaybackSettings by remember { mutableStateOf(false) }
+
+    /** Hand focus to the corner button, remembering the way back. */
+    fun focusBrowserButton(returnTo: () -> Unit) {
+        browserReturnFocus[0] = returnTo
+        BlueHiveApplication.playHoverSound()
+        browserFocusRequester.requestFocus()
+    }
     var isBackendExtract by remember { mutableStateOf(false) }
     var backendStatus    by remember { mutableStateOf("") }
     /** Non-null shows ExtractionErrorOverlay — a failure the user can act on. */
@@ -592,12 +670,28 @@ fun MoviesDetailsScreenContent(
     var vidApiError by remember { mutableStateOf<String?>(null) }
 
     // Back closes whichever picker/prompt is open instead of leaving the screen.
-    BackHandler(enabled = showDefaultPrompt || showServerPicker) {
+    //
+    // backendChoiceFor MUST be listed. It is the "Watch on ExoPlayer / Watch on
+    // Gecko" prompt, and without it here BACK found no handler, fell through to
+    // the Activity, and closed the whole details page — losing the user's place
+    // for what should have been a dismissal. The TV screen has always covered its
+    // equivalent (vidFastChoiceFor); only this screen was missing it.
+    BackHandler(enabled = showDefaultPrompt || showServerPicker || backendChoiceFor != null) {
         when {
             showServerPicker -> { showServerPicker = false; showDefaultPrompt = true }
             showDefaultPrompt -> {
                 showDefaultPrompt = false
                 // Return the cursor to whichever stream button opened the prompt.
+                coroutineScope.launch {
+                    awaitFrame()
+                    try { lastStreamFocusRequester?.requestFocus() } catch (_: Exception) {}
+                }
+            }
+            // Dismiss the player prompt back to the source buttons, which are
+            // still on screen underneath it. Focus is restored to the button that
+            // opened it, or a D-pad user is left with nothing selected.
+            backendChoiceFor != null -> {
+                backendChoiceFor = null
                 coroutineScope.launch {
                     awaitFrame()
                     try { lastStreamFocusRequester?.requestFocus() } catch (_: Exception) {}
@@ -726,6 +820,31 @@ fun MoviesDetailsScreenContent(
                     .putExtra("MEDIA_TYPE",  mediaType)
                     .putExtra("MEDIA_TITLE", mediaTitle)
                     .putExtra("SOURCE_NAME", if (pendingDub) "Miruro (Dub)" else "Miruro (Sub)")
+                    // AUDIO EXISTS ONLY FOR MID-PLAYBACK RE-EXTRACTION, and it is not
+                    // optional. Miruro signs its segment URLs with a token that dies
+                    // after roughly nine minutes — MEASURED 2026-08-27, Mushoku Tensei
+                    // s1e6 froze 121 segments in and every request after that was a 403
+                    // — so recovering means fetching a FRESH manifest mid-episode.
+                    // Asking for one without naming the track hands a dub viewer the
+                    // sub, which is worse than the freeze it replaces: it looks like it
+                    // worked.
+                    //
+                    // Derived from the SAME value as SOURCE_NAME, deliberately. If those
+                    // two ever disagree, history records one track while the player
+                    // refetches the other.
+                    .putExtra("AUDIO", if (pendingDub) "dub" else "sub")
+                    // SERVER pins the provider for any mid-playback re-extraction, and
+                    // HOW it is resolved matters as much as that it is sent. triedName is
+                    // what the failover bookkeeping just computed: the manually chosen
+                    // provider when there was one, and otherwise the DEFAULT resolved to
+                    // its actual name instead of left null.
+                    //
+                    // Sending null would re-extract against whatever Miruro defaults to at
+                    // that moment, which is not necessarily the provider this playback
+                    // started on — the list is reordered as servers come and go, so a
+                    // recovery could silently move the viewer to a different source
+                    // mid-episode.
+                    .putExtra("SERVER", triedName)
             )
         } else {
             val data   = result.data
@@ -940,6 +1059,7 @@ fun MoviesDetailsScreenContent(
      * requests, so a second client attempt just re-asks for the same answer.
      */
     suspend fun extractAndPlayMovie(src: MoviesDetailsScreenCompose.StreamingSource) {
+        extractCancelled = false
         isExtracting     = true
         isBackendExtract = true
         extractPending   = true
@@ -951,7 +1071,7 @@ fun MoviesDetailsScreenContent(
 
         val startedAt = System.currentTimeMillis()
         val result = runCatching {
-            ApiClient.bluehiveApi.extractStream(
+            ApiClient.bluehiveApi.extractStreamAwait(
                 type   = "movie",
                 tmdbId = tmdbId,
                 source = sourceKey,
@@ -968,6 +1088,13 @@ fun MoviesDetailsScreenContent(
         isBackendExtract = false
         extractPending   = false
         backendStatus    = ""
+
+        // The user left. Do not raise an error and do not start a player over
+        // whatever they are looking at now.
+        if (extractCancelled) {
+            Log.d("scraper-vidapi", "extraction finished after BACK — discarding result")
+            return
+        }
 
         val body = result.getOrNull()?.takeIf { it.isSuccessful }?.body()
         if (body == null || body.m3u8.isBlank()) {
@@ -1004,6 +1131,7 @@ fun MoviesDetailsScreenContent(
                 // it, and sending the manifest's own host 403s every segment while
                 // extraction still looks like it worked.
                 .putExtra("REFERER", body.referer)
+                .putExtra("IS_HLS", body.isHls ?: true)
                 .putExtra("UA", body.user_agent)
                 .putExtra("TMDB_ID", tmdbId)
                 // Blank ON PURPOSE: these sources have no on-device extractor. The
@@ -1022,8 +1150,21 @@ fun MoviesDetailsScreenContent(
         )
     }
 
+    /** See the TV screen's twin: one body shared by the prompt's default button
+     *  and the skip-the-prompt path, so the two cannot drift apart. */
+    fun startBuiltInPlayer(src: MoviesDetailsScreenCompose.StreamingSource) {
+        stopTrailer()
+        try { BlueHiveApplication.coilImageLoader.memoryCache?.clear() } catch (_: Exception) {}
+        extractJob = coroutineScope.launch { extractAndPlayMovie(src) }
+    }
+
+
     val launchVidApiExtract: (String, String) -> Unit = { name, url ->
         Log.d("scraper-vidapi", "$name Extract → $url")
+        // Inside the launcher rather than at its call sites: this is reached
+        // from the DuB/SuB prompt, the SERVER PICKER and the failover retry,
+        // and a future caller should not have to remember. Idempotent.
+        stopTrailer()
         if (!isExtracting && !extractPending && !isCheckingServers) {
             extractPending = true
             vidApiSourceName = name          // label watch-history + failover with this
@@ -1072,6 +1213,9 @@ fun MoviesDetailsScreenContent(
     // entirely. Nulling vidApiRetryUrl also tears down a queued retry.
     BackHandler(enabled = isExtracting || extractPending) {
         Log.d("scraper-vidapi", "↩️ back during extraction — cancelling")
+        extractCancelled      = true
+        extractJob?.cancel()
+        extractJob            = null
         vidApiRetryUrl        = null
         vidApiAttempt         = 0
         vidApiNote            = null
@@ -1092,7 +1236,28 @@ fun MoviesDetailsScreenContent(
     // window. The loading overlay itself is delayed 300ms so the button press
     // animation fully completes before the scrim appears.
     /**
-     * Anime MOVIE via the BACKEND extractor. Returns true if playback started.
+     * Mirror of the TV screen's ensureServerList — see there for why the
+     * "Default server" path has no list to fail over through until this fetches
+     * one, and why warming it for the track that just played is now cheap.
+     */
+    suspend fun ensureServerList(url: String, dub: Boolean) {
+        if (serverListCache[serverCacheKey(url, dub)] != null) return
+        val list = runCatching {
+            ApiClient.bluehiveApi.extractServers(
+                type   = "movie",
+                tmdbId = tmdbId,
+                audio  = if (dub) "dub" else "sub",
+                device = SessionManager.get().deviceFingerprint,
+            )
+        }.getOrNull()?.takeIf { it.isSuccessful }?.body() ?: return
+        val opts = list.servers.map { ServerOption(it.name, emptyList()) }
+        if (opts.isEmpty()) return
+        serverListCache[serverCacheKey(url, dub)] =
+            opts to list.servers.indexOfFirst { it.is_default }.coerceAtLeast(0)
+    }
+
+    /**
+     * Anime MOVIE via the BACKEND extractor.
      *
      * Mirror of the TV screen's extractAnimeViaBackend — see there for the full
      * reasoning. Same restriction: DEFAULT PATH ONLY (sub, default server),
@@ -1101,11 +1266,15 @@ fun MoviesDetailsScreenContent(
      *
      * No season/episode: /api/anime/resolve maps a movie straight to its AniList
      * id with a null episode, and the miruro movie template omits ?ep= entirely.
+     *
+     * @param acceptAnyTrack play the wrong track anyway — set only once every
+     *        dub server has been tried. See the TV screen for the reasoning.
      */
     suspend fun extractAnimeMovieViaBackend(dub: Boolean = false,
-                                            server: String? = null): Boolean {
+                                            server: String? = null,
+                                            acceptAnyTrack: Boolean = false): ExtractOutcome {
         val body = runCatching {
-            ApiClient.bluehiveApi.extractStream(
+            ApiClient.bluehiveApi.extractStreamAwait(
                 type    = "movie",
                 tmdbId  = tmdbId,
                 source  = "miruro",
@@ -1121,7 +1290,17 @@ fun MoviesDetailsScreenContent(
             )
         }.getOrNull()?.takeIf { it.isSuccessful }?.body()
 
-        if (body == null || body.m3u8.isBlank()) return false
+        if (body == null || body.m3u8.isBlank()) return ExtractOutcome.MISS
+
+        // Dub asked for, sub delivered — see the TV screen for the full note. A
+        // null `audio` is an older backend: unknowable, so treat it as before.
+        val wrongTrack = dub && body.audio?.equals("dub", ignoreCase = true) == false
+        if (wrongTrack && !acceptAnyTrack) {
+            Log.e("scraper", "🎧 asked for dub, backend returned '${body.audio}'" +
+                    " (server=${server ?: "default"}) — not playing it yet")
+            return ExtractOutcome.WRONG_TRACK
+        }
+        val playingDub = dub && !wrongTrack
 
         Log.d("scraper", "M Extract (backend movie audio=${if (dub) "dub" else "sub"}" +
                 "${server?.let { " server=$it" } ?: ""}) → ${body.m3u8.take(60)} cached=${body.cached}")
@@ -1133,6 +1312,7 @@ fun MoviesDetailsScreenContent(
                 // sees the playback and the relay row would be anonymous.
                 .putExtra("M3U8_FALLBACK_URL", body.proxy_url)
                 .putExtra("REFERER", body.referer)
+                .putExtra("IS_HLS", body.isHls ?: true)
                 .putExtra("UA", body.user_agent)
                 .putExtra("PROFILE_ID",  favoriteProfileId)
                 .putExtra("MEDIA_ID",    tmdbId.toString())
@@ -1140,14 +1320,34 @@ fun MoviesDetailsScreenContent(
                 .putExtra("MEDIA_TITLE", mediaTitle)
                 // Reflects the track actually extracted — this string is what
                 // watch history and relay_sessions record, so a hardcoded "Sub"
-                // would mislabel every dub playback.
-                .putExtra("SOURCE_NAME", if (dub) "Miruro (Dub)" else "Miruro (Sub)")
+                // would mislabel every dub playback. `playingDub`, not `dub`: a
+                // last-resort sub is recorded as the sub it is.
+                .putExtra("SOURCE_NAME", if (playingDub) "Miruro (Dub)" else "Miruro (Sub)")
+                // See the on-device site above for why AUDIO is carried. `playingDub`
+                // rather than `dub` for the same reason SOURCE_NAME uses it: a
+                // last-resort sub must re-extract as the sub it actually is.
+                //
+                // SERVER is best-effort and only exists on this path — the backend was
+                // told which one to use, so a refetch can ask for the same one instead
+                // of redrawing whichever the site defaults to. Null is fine and simply
+                // means "no preference".
+                .putExtra("AUDIO", if (playingDub) "dub" else "sub")
+                // Manual selection wins; failing that, resolve the default to its
+                // name so a refetch returns to the SAME provider rather than redrawing
+                // whatever the site defaults to now. Null only when the picker never
+                // ran and there is nothing to resolve from — the backend then picks
+                // its own default, exactly as it did for the original extraction.
+                .putExtra("SERVER", server ?: serverOptions.getOrNull(serverDefaultIdx)?.name)
         )
-        return true
+        return ExtractOutcome.PLAYED
     }
 
     val launchExtract: (String, Boolean, String?) -> Unit = { url, dub, server ->
         Log.d("scraper", "M Extract (dub=$dub, server=${server ?: "default"}) → $url")
+        // Inside the launcher rather than at its call sites: this is reached
+        // from the DuB/SuB prompt, the SERVER PICKER and the failover retry,
+        // and a future caller should not have to remember. Idempotent.
+        stopTrailer()
         // Fresh play (default attempt) → reset the failover trail. Track the in-flight
         // provider so its result can mark it tried.
         if (server == null) triedServers.clear()
@@ -1169,10 +1369,43 @@ fun MoviesDetailsScreenContent(
                 // dropdowns itself, so there is no case left that it cannot serve.
                 // Still falls THROUGH on failure: the on-device extractor below is
                 // untouched, so a backend outage costs seconds, not the film.
-                val played = runCatching {
+                //
+                // Burn the provider here, not in extractorLauncher — that handler
+                // only sees ON-DEVICE results, so triedServers never grew and the
+                // dub failover below would return the same server forever.
+                server?.let { triedServers.add(it) }
+
+                var outcome = runCatching {
                     extractAnimeMovieViaBackend(dub = dub, server = server)
-                }.getOrDefault(false)
-                if (played) {
+                }.getOrDefault(ExtractOutcome.MISS)
+
+                if (outcome == ExtractOutcome.WRONG_TRACK) {
+                    ensureServerList(url, true)
+                    // The DUB list specifically, not pickNextServer — that helper
+                    // falls back to `serverOptions`, which may still hold the sub
+                    // list from the last picker. See the TV screen.
+                    val next = serverListCache[serverCacheKey(url, true)]?.first
+                        ?.firstOrNull { it.name !in triedServers }?.name
+                    if (next != null) {
+                        Log.e("scraper", "🔁 dub came back as sub — failing over to server '$next'")
+                        triedServers.add(next)
+                        isExtracting   = false
+                        extractPending = false
+                        failoverRequest = Triple(url, true, next)
+                        return@launch
+                    }
+                    Log.e("scraper", "🔁 dub unavailable on every server — playing sub as last resort")
+                    outcome = runCatching {
+                        extractAnimeMovieViaBackend(dub = dub, server = server, acceptAnyTrack = true)
+                    }.getOrDefault(ExtractOutcome.MISS)
+                }
+
+                if (outcome == ExtractOutcome.PLAYED) {
+                    // Warm the picker for the track that just played — see the
+                    // TV screen. Playback has already started and the list is
+                    // cached server-side by the extraction, so this is one
+                    // round trip and delays nothing.
+                    ensureServerList(url, dub)
                     isExtracting   = false
                     extractPending = false
                     return@launch
@@ -1894,8 +2127,9 @@ fun MoviesDetailsScreenContent(
                     focusRequester = animeDubFocusRequester,
                     offsetX = 27.75.dp, offsetY = 332.5.dp,
                     onClick = {
-                        isTrailerPlaying = false
-                        hasTrailerBeenPlayed = false
+                        // No stopTrailer() here: this only OPENS the DuB/SuB prompt.
+                        // The trailer plays on until the prompt is answered, which
+                        // is where a launch actually happens.
                         if (sources.size > 2) {
                             Log.d("scraper", "DuB pressed → prompt: ${sources[2].url}")
                             lastStreamFocusRequester = animeDubFocusRequester
@@ -1916,8 +2150,7 @@ fun MoviesDetailsScreenContent(
                     focusRequester = animeSubFocusRequester,
                     offsetX = 228.dp, offsetY = 332.5.dp,
                     onClick = {
-                        isTrailerPlaying = false
-                        hasTrailerBeenPlayed = false
+                        // No stopTrailer() here — see the DuB button above.
                         if (sources.size > 2) {
                             Log.d("scraper", "SuB pressed → prompt: ${sources[2].url}")
                             lastStreamFocusRequester = animeSubFocusRequester
@@ -1958,8 +2191,23 @@ fun MoviesDetailsScreenContent(
                         disableLeftSound  = aloneInRow || col == 0, // left column / lone centered → mute left edge
                         disableRightSound = aloneInRow || col == 1, // right column / lone centered → mute right edge
                         disableDownSound  = i + 2 >= sources.size,  // no button directly below → mute down
+                        // RIGHT off the right column and DOWN off the bottom row
+                        // both used to dead-end. They now reach the corner button,
+                        // matching the TV screen. Only wired when the button is
+                        // actually on screen, so the edges stay silent dead ends
+                        // on an anime title exactly as before.
+                        onExitToCorner = if (!isAnime) {
+                            {
+                                focusBrowserButton {
+                                    streamerFocus.getOrNull(i)?.requestFocus()
+                                }
+                            }
+                        } else null,
                         onClick = {
-                            isTrailerPlaying = false; hasTrailerBeenPlayed = false
+                            // No stopTrailer() here. A backend-extracted source only
+                            // raises the ExoPlayer/Gecko prompt below, and the trailer
+                            // should survive that choice. The branches that really
+                            // launch stop it themselves.
                             // Remember which button launched this so focus comes back
                             // here when the player exits (THE RULE).
                             lastStreamFocusRequester = streamerFocus[i]
@@ -1970,7 +2218,17 @@ fun MoviesDetailsScreenContent(
                                 // Raise the ExoPlayer-vs-Gecko prompt. Checked
                                 // BEFORE useExtractor so a source can never take
                                 // both paths if it somehow carries the flag too.
-                                backendChoiceFor = source
+                                if (PlaybackPrefs.askPlayerEachTime) {
+                                    backendChoiceFor = source
+                                } else {
+                                    // Prompt turned off in the playback settings
+                                    // (reached from the TV details screen): take
+                                    // its default answer. The setting is global,
+                                    // so it has to apply here too -- a viewer who
+                                    // turned the prompt off would otherwise still
+                                    // meet it on every film.
+                                    startBuiltInPlayer(source)
+                                }
                             } else if (source.useExtractor) {
                                 // Remember it so a failed extraction can fall back
                                 // to this same source's embed.
@@ -1978,8 +2236,12 @@ fun MoviesDetailsScreenContent(
                                 // Fresh play → attempt 1, no stale retry banner.
                                 vidApiAttempt = 1
                                 vidApiNote    = null
+                                stopTrailer()
                                 launchVidApiExtract(source.name, source.url)
-                            } else onStreamingSourceSelected(source)
+                            } else {
+                                stopTrailer()
+                                onStreamingSourceSelected(source)
+                            }
                         }
                     )
                 }
@@ -2059,18 +2321,14 @@ fun MoviesDetailsScreenContent(
             DefaultServerPrompt(
                 message     = "Watch with our player,\nor open the site directly?",
                 defaultText = "Watch on ExoPlayer",
-                chooseText  = "Watch on Gecko",
+                chooseText  = "Watch on website",
                 onDefault   = {
                     backendChoiceFor = null
-                    isTrailerPlaying = false; hasTrailerBeenPlayed = false
-                    try { BlueHiveApplication.coilImageLoader.memoryCache?.clear() } catch (_: Exception) {}
-                    // Extraction is a suspend HTTP call, not an activity-for-result,
-                    // so it runs on this screen's scope. The function owns the
-                    // overlay state and starts the player itself.
-                    coroutineScope.launch { extractAndPlayMovie(choiceSrc) }
+                    startBuiltInPlayer(choiceSrc)
                 },
                 onChoose    = {
                     backendChoiceFor = null
+                    stopTrailer()
                     onStreamingSourceSelected(choiceSrc)
                 }
             )
@@ -2134,6 +2392,7 @@ fun MoviesDetailsScreenContent(
                         awaitFrame()
                         try { lastStreamFocusRequester?.requestFocus() } catch (_: Exception) {}
                     }
+                    stopTrailer()
                     pendingUrl?.let { launchExtract(it, pendingDub, null) }
                 },
                 onChoose = {
@@ -2206,6 +2465,46 @@ fun MoviesDetailsScreenContent(
             )
         }
 
+        // ── Browser button (bottom-right) ───────────────────────────────
+        // Same rules as the TV screen: hidden while Extras is showing the
+        // recommended row (it would sit on top of it, and the routes into it are
+        // themselves inside that branch), and never shown on an anime title,
+        // whose DuB/SuB flow has no ExoPlayer-vs-website fork for the setting to
+        // act on.
+        if (!isExtrasToggled && !isAnime) {
+            BrowserCornerButton(
+                focusRequester = browserFocusRequester,
+                onExit = { browserReturnFocus[0]?.invoke() },
+                onClick = { showPlaybackSettings = true },
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = BROWSER_BUTTON_MARGIN, bottom = BROWSER_BUTTON_MARGIN)
+            )
+        }
+
+        // Declared LAST so its BackHandler is the most recently added enabled one
+        // and therefore beats the Extras collapse above it.
+        if (showPlaybackSettings) {
+            PlaybackSettingsOverlay(
+                askEachTime = PlaybackPrefs.askPlayerEachTime,
+                onChoose = { ask ->
+                    PlaybackPrefs.setAskPlayerEachTime(context, ask)
+                    showPlaybackSettings = false
+                    coroutineScope.launch {
+                        awaitFrame()
+                        try { browserFocusRequester.requestFocus() } catch (_: Exception) {}
+                    }
+                },
+                onDismiss = {
+                    showPlaybackSettings = false
+                    coroutineScope.launch {
+                        awaitFrame()
+                        try { browserFocusRequester.requestFocus() } catch (_: Exception) {}
+                    }
+                },
+            )
+        }
+
     }   // ← Box closes here
 }   // ← MoviesDetailsScreenContent closes here
 
@@ -2257,15 +2556,8 @@ fun MoviesFavoriteButton(
             mainCornerRadius = 7f,
             secondCornerRadius = 8f,
         ),
-        colors = ModularButtonColors(
-            mainDefault = Color(0xFF6C6C6C),
-            mainToggled = Color(0xFF535C67),
-            secondDefault = Color(0xFF2E2C37),
-            secondFocused = Color(0xFF52505A),
-            shadowColor = Color(0x50000000),
-            textFocused = Color.White,
-            textUnfocused = Color(0xFFBEBEBE)
-        ),
+        // Shared — see FavoriteButtonColors in utilities/ModularButton.kt.
+        colors = FavoriteButtonColors,
         glowConfig = ModularButtonGlowConfig(
             enabled = true,
             defaultRes = R.drawable.button_focus_wide_glow,
@@ -2304,10 +2596,16 @@ fun MoviesExtrasButton(
 ) {
     ModularButton(
         textConfig = ModularButtonTextConfig(
-            text = "Extras",
-            toggledText = "Providers"
+            // NOT a toggle any more — the label is driven from outside, exactly
+            // like the trailer button's "Play/Pause Trailer". ModularButton only
+            // consults toggledText when isToggleable is true, so setting one here
+            // would be dead config; the state has to arrive through `text`.
+            text = if (isToggled) "Providers" else "Extras"
         ),
-        isToggleable = true,
+        // false, so this behaves as a plain button: press animation, a brief
+        // pressed flash, then back to rest. Previously true, which parked it in a
+        // permanently "held down" visual state whenever providers were showing.
+        isToggleable = false,
         fontFamily = fontFamily,
         focusRequester = focusRequester,
         modifier = Modifier
@@ -2336,15 +2634,8 @@ fun MoviesExtrasButton(
             mainCornerRadius = 7f,
             secondCornerRadius = 6f,
         ),
-        colors = ModularButtonColors(
-            mainDefault = Color(0xFF6C6C6C),
-            mainToggled = Color(0xFF535C67),
-            secondDefault = Color(0xFF2E2C37),
-            secondFocused = Color(0xFF52505A),
-            shadowColor = Color(0x50000000),
-            textFocused = Color.White,
-            textUnfocused = Color(0xFFBEBEBE)
-        ),
+        // Shared — see ExtrasButtonColors in utilities/ModularButton.kt.
+        colors = ExtrasButtonColors,
         glowConfig = ModularButtonGlowConfig(
             enabled = true,
             defaultRes = R.drawable.button_focus_narrow_glow,
@@ -2359,7 +2650,6 @@ fun MoviesExtrasButton(
             durationMillis = 180,
             bounceBackDelayMillis = 140
         ),
-        externalToggled = isToggled,     // 🔹 NEW: drive visual state from outside
         onClick = {
             BlueHiveApplication.playClickSound()
             onClick()
@@ -2416,15 +2706,8 @@ fun MoviesTrailerButton(
             mainCornerRadius = 7f,
             secondCornerRadius = 6f,
         ),
-        colors = ModularButtonColors(
-            mainDefault = Color(0xFF6C6C6C),
-            mainToggled = Color(0xFF535C67),
-            secondDefault = Color(0xFF2E2C37),
-            secondFocused = Color(0xFF52505A),
-            shadowColor = Color(0x50000000),
-            textFocused = Color.White,
-            textUnfocused = Color(0xFFBEBEBE)
-        ),
+        // Shared — see TrailerControlButtonColors in utilities/ModularButton.kt.
+        colors = TrailerControlButtonColors,
         glowConfig = ModularButtonGlowConfig(
             enabled = true,
             defaultRes = R.drawable.button_focus_wide_glow,
@@ -2489,15 +2772,8 @@ fun MoviesRewindButton(
             mainCornerRadius = 7f,
             secondCornerRadius = 6f,
         ),
-        colors = ModularButtonColors(
-            mainDefault = Color(0xFF6C6C6C),
-            mainToggled = Color(0xFF535C67),
-            secondDefault = Color(0xFF2E2C37),
-            secondFocused = Color(0xFF52505A),
-            shadowColor = Color(0x50000000),
-            textFocused = Color.White,
-            textUnfocused = Color(0xFFBEBEBE)
-        ),
+        // Shared — see TrailerControlButtonColors in utilities/ModularButton.kt.
+        colors = TrailerControlButtonColors,
         glowConfig = ModularButtonGlowConfig(
             enabled = true,
             defaultRes = R.drawable.button_focus_narrow_glow,
@@ -2565,15 +2841,8 @@ fun MoviesFastForwardButton(
             mainCornerRadius = 7f,
             secondCornerRadius = 6f,
         ),
-        colors = ModularButtonColors(
-            mainDefault = Color(0xFF6C6C6C),
-            mainToggled = Color(0xFF535C67),
-            secondDefault = Color(0xFF2E2C37),
-            secondFocused = Color(0xFF52505A),
-            shadowColor = Color(0x50000000),
-            textFocused = Color.White,
-            textUnfocused = Color(0xFFBEBEBE)
-        ),
+        // Shared — see TrailerControlButtonColors in utilities/ModularButton.kt.
+        colors = TrailerControlButtonColors,
         glowConfig = ModularButtonGlowConfig(
             enabled = true,
             defaultRes = R.drawable.button_focus_narrow_glow,
@@ -2607,6 +2876,9 @@ fun MoviesStreamerButton(
     disableRightSound: Boolean = false,
     disableUpSound: Boolean = false,
     disableDownSound: Boolean = false,
+    /** Non-null only when the corner browser button is on screen. Fires when the
+     *  viewer presses RIGHT off the right column or DOWN off the bottom row. */
+    onExitToCorner: (() -> Unit)? = null,
     onClick: () -> Unit
 ) {
     ModularButton(
@@ -2633,7 +2905,9 @@ fun MoviesStreamerButton(
                         }
                         Key.DirectionRight -> {
                             if (disableRightSound) {
-                                // edge: no sound, no navigation (fixes jump to Rewind)
+                                // Right edge. Used to be a plain dead end; now it
+                                // hands off to the corner button when there is one.
+                                onExitToCorner?.invoke()
                                 true
                             } else {
                                 BlueHiveApplication.playHoverSound()
@@ -2650,8 +2924,16 @@ fun MoviesStreamerButton(
                         }
                         Key.DirectionDown -> {
                             if (disableDownSound) {
-                                // bottom-row buttons: no sound, but allow navigation
-                                false
+                                // Bottom row. Routed explicitly rather than left to
+                                // Compose's own directional search, which has to
+                                // cross most of the page to find the corner and is
+                                // not reliable over that distance.
+                                if (onExitToCorner != null) {
+                                    onExitToCorner.invoke()
+                                    true
+                                } else {
+                                    false   // no button: unchanged, no sound
+                                }
                             } else {
                                 BlueHiveApplication.playHoverSound()
                                 false
@@ -2676,15 +2958,9 @@ fun MoviesStreamerButton(
             mainCornerRadius = 7f,
             secondCornerRadius = 8f,
         ),
-        colors = ModularButtonColors(
-            mainDefault = Color(0xFF0004FF),
-            mainToggled = Color(0xFF07052F),
-            secondDefault = Color(0xFF471C98),
-            secondFocused = Color(0xFF342180),
-            shadowColor = Color(0x60000000),
-            textFocused = Color.White,
-            textUnfocused = Color(0xFFD6D6D6)
-        ),
+        // Shared with the TV screen — see StreamSourceButtonColors in
+        // utilities/ModularButton.kt. Change the blues there, not here.
+        colors = StreamSourceButtonColors,
         glowConfig = ModularButtonGlowConfig(
             enabled = true,
             defaultRes = R.drawable.button_focus_wide_glow,
@@ -2692,17 +2968,14 @@ fun MoviesStreamerButton(
             offsetX = (-11.8).dp,
             offsetY = (-2.5).dp
         ),
-        animationConfig = ModularButtonAnimationConfig(
-            pressOffset = 2.5.dp,
-            textOffsetDefault = 1.dp,
-            textOffsetPressed = 2.4.dp,
-            durationMillis = 180,
-            bounceBackDelayMillis = 140
-        ),
-        onClick = {
-            BlueHiveApplication.playClickSound()
-            onClick()
-        }
+        // Timing shared with the TV screen — see WatchButtonAnimation in
+        // utilities/ModularButton.kt. Change the press feel there, not here.
+        animationConfig = WatchButtonAnimation,
+        // No playClickSound() here: ModularButton already plays it, immediately,
+        // and this second call fired a duplicate. Harmless while the two landed
+        // on the same frame — audible as a real double-click once onClick became
+        // deferred by clickDelayMillis.
+        onClick = onClick
     )
 }
 
@@ -2739,26 +3012,19 @@ fun AnimeDubButton(
             shadowHeight = 12.dp, glowWidth = 185.8.dp, glowHeight = 55.8.dp,
             mainCornerRadius = 7f, secondCornerRadius = 8f,
         ),
-        colors = ModularButtonColors(
-            mainDefault   = Color(0xFFCC0000),
-            mainToggled   = Color(0xFF7A0000),
-            secondDefault = Color(0xFF7A0000),
-            secondFocused = Color(0xFF8B1400),
-            shadowColor   = Color(0x60000000),
-            textFocused   = Color.White,
-            textUnfocused = Color(0xFFD6D6D6)
-        ),
+        // Palette and press feel are shared with the TV screen — see
+        // AnimeDubButtonColors / WatchButtonAnimation in utilities/ModularButton.kt.
+        colors = AnimeDubButtonColors,
         glowConfig = ModularButtonGlowConfig(
             enabled = true,
             defaultRes = R.drawable.button_focus_wide_glow,
             toggledRes = R.drawable.button_focus_wide_nonglow,
             offsetX = (-11.8).dp, offsetY = (-2.5).dp
         ),
-        animationConfig = ModularButtonAnimationConfig(
-            pressOffset = 2.5.dp, textOffsetDefault = 1.dp,
-            textOffsetPressed = 2.4.dp, durationMillis = 180, bounceBackDelayMillis = 140
-        ),
-        onClick = { BlueHiveApplication.playClickSound(); onClick() }
+        animationConfig = WatchButtonAnimation,
+        // ModularButton already plays the click, immediately. This second call
+        // was a duplicate, inaudible only because both landed on one frame.
+        onClick = onClick
     )
 }
 
@@ -2794,26 +3060,19 @@ fun AnimeSubButton(
             shadowHeight = 12.dp, glowWidth = 185.8.dp, glowHeight = 55.8.dp,
             mainCornerRadius = 7f, secondCornerRadius = 8f,
         ),
-        colors = ModularButtonColors(
-            mainDefault   = Color(0xFFCCA000),
-            mainToggled   = Color(0xFF6B5000),
-            secondDefault = Color(0xFF7A5500),
-            secondFocused = Color(0xFF8B6500),
-            shadowColor   = Color(0x60000000),
-            textFocused   = Color.White,
-            textUnfocused = Color(0xFFD6D6D6)
-        ),
+        // Palette and press feel are shared with the TV screen — see
+        // AnimeSubButtonColors / WatchButtonAnimation in utilities/ModularButton.kt.
+        colors = AnimeSubButtonColors,
         glowConfig = ModularButtonGlowConfig(
             enabled = true,
             defaultRes = R.drawable.button_focus_wide_glow,
             toggledRes = R.drawable.button_focus_wide_nonglow,
             offsetX = (-11.8).dp, offsetY = (-2.5).dp
         ),
-        animationConfig = ModularButtonAnimationConfig(
-            pressOffset = 2.5.dp, textOffsetDefault = 1.dp,
-            textOffsetPressed = 2.4.dp, durationMillis = 180, bounceBackDelayMillis = 140
-        ),
-        onClick = { BlueHiveApplication.playClickSound(); onClick() }
+        animationConfig = WatchButtonAnimation,
+        // ModularButton already plays the click, immediately. This second call
+        // was a duplicate, inaudible only because both landed on one frame.
+        onClick = onClick
     )
 }
 

@@ -131,6 +131,28 @@ data class HostEntitlementRequest(
      */
     @SerializedName("host_present")
     val hostPresent: Boolean? = null,
+
+    /**
+     * Does the installed host still hold an account?
+     *
+     * THE THIRD QUESTION, and the one [hostPresent] cannot reach. Unpairing
+     * leaves the package installed, so the presence check sees a perfectly
+     * healthy machine while the television behind it is attached to nothing.
+     * Before this field that device kept working off our mirrored pass until it
+     * expired on its own, which is up to two days.
+     *
+     * NULL IS THE SAFE ANSWER, same as above and for the same reason. It covers
+     * no host installed, a host too old to publish the column, and any read that
+     * failed. Only an explicit false counts, and only a host that is present and
+     * says outright that it holds no session produces one.
+     *
+     * An explicit false marks this machine abandoned — reversibly. Re-pairing
+     * mints a newer pass and the mark lifts; replaying the old one cannot lift
+     * it. The effect stops at this machine and never reaches the account's other
+     * televisions or the licence's member accounts.
+     */
+    @SerializedName("host_paired")
+    val hostPaired: Boolean? = null,
 )
 
 /**

@@ -2,6 +2,7 @@ package com.example.bluehive.auth
 
 import android.util.Base64
 import android.util.Log
+import com.example.bluehive.ForceUpdateBus
 import com.example.bluehive.api.LockoutBus
 import com.example.bluehive.api.SessionExpiredBus
 import com.example.bluehive.api.SlotFreedBus
@@ -292,9 +293,10 @@ fun start() {
 
                 if (exp - nowSeconds < TOKEN_REFRESH_BUFFER_S) {
                     Log.d(TAG, "Access token expires in ${exp - nowSeconds}s — asking host for fresh token")
-                    // PHASE 2: BlueHive holds no refresh token, so it CANNOT self-
-                    // rotate. The host owns the only refresh token + the correct
-                    // device fingerprint, so we pull a fresh access token over IPC.
+                    // BlueHive owns its refresh token and rotates it against its
+                    // own backend. (This used to read "the host owns the only refresh
+                    // token, so we pull one over IPC" — true before TokenProvider
+                    // replaced HostTokenProvider; there is no IPC on this path now.)
                     when (val result = com.example.bluehive.auth.TokenProvider.fetchFreshToken()) {
                         is com.example.bluehive.auth.TokenResult.Fresh -> {
                             SessionManager.get().setHostAccessToken(result.token)
@@ -303,7 +305,7 @@ fun start() {
                         com.example.bluehive.auth.TokenResult.Revoked -> {
                             // Host reachable and explicitly has no identity → genuine
                             // logout/unpair. Drop the session so the app routes to setup.
-                            Log.w(TAG, "Host reports revoked — identity gone, stopping stream")
+                            Log.e(TAG, "Host reports revoked — identity gone, stopping stream")
                             SessionManager.get().clearSession()
                             SessionExpiredBus.post()
                             return@withContext null
@@ -313,13 +315,13 @@ fun start() {
                             // session. Fall through and use whatever token we still have;
                             // the SSE connect will surface a real 401 if it's truly dead,
                             // and the next loop iteration retries.
-                            Log.w(TAG, "Host unavailable (transient) — keeping session, using existing token")
+                            Log.e(TAG, "Host unavailable (transient) — keeping session, using existing token")
                         }
                         else -> {
                             // Unknown HostToken result — treat as transient. Keep the
                             // session and fall through to the existing token, same as
                             // Unavailable. Never clear the session on an unknown result.
-                            Log.w(TAG, "Unknown host result for SSE — keeping session, using existing token")
+                            Log.e(TAG, "Unknown host result for SSE — keeping session, using existing token")
                         }
                     }
                 }
@@ -408,28 +410,28 @@ fun start() {
                     return@withContext ConnectResult.WORKSPACE_FULL
                 }
                 401 -> {
-                    // Token expired despite the proactive check — ask the host for
-                    // a fresh one over IPC. Next loop iteration reconnects with it.
-                    Log.w(TAG, "SSE connect 401 — asking host for fresh token")
+                    // Token expired despite the proactive check — refresh it
+                    // against our own backend. Next loop iteration reconnects with it.
+                    Log.w(TAG, "SSE connect 401 — refreshing token")
                     when (val result = com.example.bluehive.auth.TokenProvider.fetchFreshToken()) {
                         is com.example.bluehive.auth.TokenResult.Fresh -> {
                             SessionManager.get().setHostAccessToken(result.token)
                             Log.d(TAG, "Host supplied a fresh token after 401 — will retry connect")
                         }
                         com.example.bluehive.auth.TokenResult.Revoked -> {
-                            Log.w(TAG, "Host reports revoked after 401 — identity gone, dropping session")
+                            Log.e(TAG, "Host reports revoked after 401 — identity gone, dropping session")
                             SessionManager.get().clearSession()
                             SessionExpiredBus.post()
                         }
                         com.example.bluehive.auth.TokenResult.Unavailable -> {
                             // Transient — do NOT clear the session. Just retry the
                             // connect on the next loop iteration with backoff.
-                            Log.w(TAG, "Host unavailable (transient) after 401 — keeping session, will retry connect")
+                            Log.e(TAG, "Host unavailable (transient) after 401 — keeping session, will retry connect")
                         }
                         else -> {
                             // Unknown HostToken result — treat as transient. Keep the
                             // session and let the loop retry the connect with backoff.
-                            Log.w(TAG, "Unknown host result after 401 — keeping session, will retry connect")
+                            Log.e(TAG, "Unknown host result after 401 — keeping session, will retry connect")
                         }
                     }
                     return@withContext ConnectResult.ERROR
@@ -495,13 +497,24 @@ fun start() {
 
 
                 "unpaired" -> {
-                    Log.w(TAG, "Device was unpaired by admin — routing to pairing screen")
+                    Log.e(TAG, "Device was unpaired by admin — routing to pairing screen")
                     SessionManager.get().clearSession()
                     SessionExpiredBus.post()
                 }
 
                 "slot_freed" -> {
                     SlotFreedBus.post()
+                }
+
+                // Operator asked every live device to re-check the update channel
+                // now, rather than waiting for the next cold start or the next
+                // return to the home screen. The DEVICE still decides: this only triggers
+                // the check, and the manifest decides whether anything happens
+                // and whether it may be declined. Nothing here trusts the event
+                // to say a particular version is required.
+                "force_update" -> {
+                    Log.w(TAG, "Operator requested an update check")
+                    ForceUpdateBus.post()
                 }
 
                 else -> Log.d(TAG, "Unknown SSE event type: $event")

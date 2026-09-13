@@ -7,7 +7,10 @@ import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
+import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.LoadControl
 import androidx.media3.exoplayer.hls.HlsMediaSource
@@ -21,6 +24,7 @@ import okhttp3.OkHttpClient
 import okhttp3.dnsoverhttps.DnsOverHttps
 import java.net.InetAddress
 import java.util.concurrent.TimeUnit
+import com.example.bluehive.BlueHiveApplication
 
 /**
  * ONE place for every ExoPlayer setting shared by the site-specific players
@@ -273,6 +277,42 @@ object ExoPlayerConfig {
         // beats a bespoke delayed overlay; swap in a custom one if it reads as
         // noisy.
         playerView.setShowBuffering(androidx.media3.ui.PlayerView.SHOW_BUFFERING_WHEN_PLAYING)
+
+        // ── Pause leaves focus on PLAY, not on skip-previous ────────────────
+        //
+        // Press pause on the remote and media3 raises the control bar. Nothing
+        // held focus, so Android hands it to the first focusable child of
+        // exo_center_controls — which is exo_prev. The button under the cursor
+        // after pausing was therefore "skip to previous episode", one click away
+        // from losing your place entirely, when the only thing anyone wants
+        // there is to resume.
+        //
+        // HOOKED ON THE PLAYER, NOT ON CONTROLLER VISIBILITY, and that is not a
+        // stylistic choice: PlayerView.setControllerVisibilityListener is a
+        // single setter, and HlsPlayerActivity installs its own AFTER calling
+        // this to inject the subtitle buttons. A listener set here would be
+        // silently replaced, and only on that screen — the bug would look fixed
+        // in Miruro and untouched in HLS.
+        //
+        // playWhenReady, not isPlaying: isPlaying also drops on every rebuffer,
+        // which would yank focus mid-stall while the viewer is aiming at
+        // something else. This fires on a deliberate pause only.
+        //
+        // posted, because the controller is still being laid out when the
+        // callback arrives; requestFocus on a view that is not yet shown is a
+        // no-op that returns false. Guarded on isShown so a pause with the bar
+        // hidden does not steal focus from an overlay.
+        playerView.player?.addListener(object : Player.Listener {
+            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                if (playWhenReady) return
+                playerView.post {
+                    playerView
+                        .findViewById<android.view.View>(androidx.media3.ui.R.id.exo_play_pause)
+                        ?.takeIf { it.isShown && it.isFocusable }
+                        ?.requestFocus()
+                }
+            }
+        })
     }
 
     /**
@@ -849,10 +889,37 @@ object ExoPlayerConfig {
                 //   origins_to_force_quic_on — skip the TCP probe entirely and
                 //                    open QUIC on the FIRST request, which is the
                 //                    only way to reach a host whose TCP is severed
+                // MEASURED 2026-08-29, and this list is why the filter still wins.
+                // addQuicHint is what makes Cronet open QUIC on the FIRST request,
+                // without waiting to learn alt-svc from an HTTP/2 response — which
+                // is the only way to reach a host whose TCP handshake is severed
+                // before any response can arrive.
+                //
+                // Proof from one session's transport log:
+                //   ultralamp.top      -> protocol=h3  http=200   played direct
+                //   moon.peakstorm.top -> protocol=none http=-1   severed, relayed
+                // ultralamp was never filtered, so TCP connected, alt-svc advertised
+                // h3, and it upgraded on its own. moon.peakstorm.top never gets that
+                // chance, and it is not in this list, so it only ever tried TCP.
+                //
+                // NOTE origins_to_force_quic_on:"*" DOES NOT substitute for this.
+                // The same session measured h2 on crypto.cloudflare.com and on our
+                // own API, so the wildcard force is not taking effect — the hint
+                // list is what actually decides.
+                //
+                // THE HOSTS ROTATE, which is the real defect: ironwallnet was this
+                // CDN's name when the list was written and it is peakstorm today.
+                // A hardcoded list is stale the moment the CDN moves. This is a
+                // measurement to confirm the mechanism, not the fix — see the
+                // backend-supplied host list that should replace it.
                 val quicHosts = listOf(
                     "signtime.site", "sandstorm13.site",
                     "premiumvacations.site", "diskphone12.site",
                     "moon.ironwallnet.net",
+                    // current, from relay_sessions + extractor logs 2026-08-29
+                    "moon.peakstorm.top", "s1.piltover.li", "s1.watami.win",
+                    "proudotter.top", "tinytower.top", "grandpearl.top",
+                    "ultralamp.top", "tiktoks.animanga.fun",
                 )
                 // "*" — force QUIC on EVERY origin, not a host list.
                 //
@@ -866,11 +933,222 @@ object ExoPlayerConfig {
                 // streams — the CDNs all advertise `alt-svc: h3=":443"`, and
                 // CronetDataSource still has an OkHttp fallback factory beneath it
                 // for anything that genuinely cannot do QUIC.
+                // ── AsyncDNS: the switch that arms ECH ───────────────────────
+                //
+                // ECH IS ALREADY IN THIS APK AND HAS NEVER ONCE BEEN USED.
+                // Verified 2026-08-28 by reading the shipped binary:
+                // lib/armeabi-v7a/libcronet.119.0.6045.31.so contains
+                // encrypted_client_hello.cc, the EncryptedClientHello and
+                // EncryptedClientHelloQuic feature strings, the ech_config_list
+                // SvcParam parser, and ten UseDnsHttpsSvcb* symbols.
+                //
+                // WE ALREADY PROVED THE MECHANISM WORKS ON THIS NETWORK — in the
+                // other engine. gecko_config.yaml turns on network.trr.mode 2 plus
+                // network.dns.echconfig.enabled for exactly this filter, and the
+                // note there records the measurement: signtime.site returned 256
+                // bytes (handshake severed) while every other CDN returned ~2800.
+                // GeckoView can do it because it carries its own TLS stack (NSS)
+                // rather than Android's Conscrypt. Cronet carries BoringSSL for the
+                // same reason and is no more dependent on the OS — so the argument
+                // that justified ECH in the webviewer applies here unchanged.
+                //
+                // WHY IT LIES DORMANT: the blocker is DNS, not TLS. Chromium only
+                // attempts ECH when it holds an HTTPS (type 65) record carrying an
+                // `ech=` parameter, and it only queries type 65 through its OWN
+                // async resolver. Cronet defaults to Android's getaddrinfo, which
+                // cannot return type 65 at all — so the record never arrives, ECH
+                // is never attempted, and the hostname goes out in cleartext for
+                // the filter to read. Enabling AsyncDNS is what closes that gap.
+                // It is the Cronet spelling of what network.trr.mode already does
+                // for Gecko.
+                //
+                // FALLS BACK ON ITS OWN. Unlike Gecko's TRR mode 3 — which took the
+                // webviewer down earlier in this project by having no fallback —
+                // Chromium's resolver keeps the system resolver beneath it. Worst
+                // case here is "no ECH", never "no DNS".
+                // ── Why the broken-QUIC backoff is shortened, not disabled ───
+                //
+                // Chromium marks a host QUIC-BROKEN after a failed QUIC attempt and
+                // refuses QUIC for a cooldown that GROWS with each failure. That is
+                // correct on an ordinary network, where TCP is a fine fallback and
+                // there is no point hammering a dead path.
+                //
+                // IT IS BACKWARDS HERE. On an SNI-filtering line the fallback is the
+                // thing that does not work: TCP is exactly what the ISP severs. So a
+                // single QUIC hiccup disables the ONLY working transport, and every
+                // retry re-arms the timer and makes it worse.
+                //
+                // MEASURED 2026-08-29, repeatedly replaying one title:
+                //   16:31  moon.peakstorm.top -> protocol=(none) http=-1   relayed
+                //   16:31  api.<domain>       -> h3 http=429   (our own relay,
+                //                                RELAY BUSY at 2 concurrent)
+                //   16:40  moon.peakstorm.top -> protocol=h3 http=200      direct
+                // Ten minutes untouched was the entire fix. Retrying was what kept
+                // it broken, from both ends at once.
+                //
+                // NOT SET TO ZERO, DELIBERATELY. Somewhere with UDP genuinely
+                // blocked — hotel wifi, a corporate guest network — the backoff is
+                // what stops every single request paying for a doomed QUIC attempt
+                // before falling back. One second is long enough to avoid that
+                // thrash and short enough that a transient failure costs nothing.
+                //
+                // retry_without_alt_svc_on_quic_errors is left at its default (true)
+                // so a network with no QUIC at all still degrades to TCP rather than
+                // failing outright.
+                // SUPERSEDED 2026-08-29 — READ THIS BEFORE TRUSTING THE
+                // IPv6 STORY BELOW. The identical signature (quic_error 9,
+                // "Largest acked is 0.", injected packet_number 2147483648)
+                // now reproduces over IPv4 with this flag confirmed live in
+                // cronetExperimentalParams. The original dataset had no
+                // IPv4-CDN case, so address family was perfectly confounded
+                // with "is a filtered CDN host" — the flag was never the fix,
+                // it just happened to correlate. The real mechanism is an
+                // on-path device forging replies to any handshake carrying a
+                // blocked hostname in cleartext; see the ECH block above.
+                // Keeping the flag: it is harmless and removes a variable.
+                // ── disable_ipv6_on_wifi: THE actual fix ─────────────────────
+                //
+                // PROVEN BY CRONET'S OWN NETLOG, 2026-08-29. Every QUIC session to
+                // a filtered CDN died the same way, and every one was IPv6:
+                //
+                //   host                     family  closed-with
+                //   api.<domain>             IPv4    ok
+                //   moon.peakstorm.top       IPv6    quic_error 9
+                //   moon.peakstorm.top       IPv6    quic_error 9   (x4)
+                //
+                // Error 9 is QUIC_INVALID_ACK_DATA, "Largest acked is 0", with
+                // from_peer:false — the CLIENT tore the connection down, because it
+                // received a packet acknowledging something never sent. The bogus
+                // packet header carried packet_number 2147483648 (0x80000000). That
+                // is a middlebox injecting into the QUIC handshake, not a clean
+                // block, and it happens on Charter's IPv6 path.
+                //
+                // The one host that always worked, api.<domain>, is not virtuous —
+                // IONOS simply issued the VPS no IPv6 address, so it could only ever
+                // use v4. Cloudflare CDNs publish AAAA, Cronet prefers IPv6, and
+                // every one of those connections walked into the mangler. QUIC then
+                // failed, TCP fell back into the SNI filter, and playback relayed.
+                //
+                // That is why hinting looked broken: 42 hints applied,
+                // ALT_SVC_FOUND is_broken:false, a QUIC_SESSION created — the hint
+                // worked perfectly every time. The transport underneath it did not.
+                //
+                // SCOPED TO WI-FI, which is what this box uses (wlan0) and all the
+                // evidence covers. A wired client keeps IPv6.
+                //
+                // ALSO FIXING A KEY NAME: the backoff option is
+                // initial_delay_for_broken_alternative_service_SECONDS. Build 86 set
+                // it without the suffix, so Cronet ignored it and the setting has
+                // done nothing since — visible in the option-name table inside
+                // libcronet itself.
+                // ── The 5 ms race that was costing us ECH ───────────────────
+                //
+                // MEASURED 2026-08-29 from NetLog (fail.json, resolver job sid 91):
+                //
+                //   18286873  DNS_TRANSACTION finalroom.top query_type=1   (A)
+                //   18286874  DNS_TRANSACTION finalroom.top query_type=65  (HTTPS)
+                //   18286894  A answered, +21ms
+                //   18286899  HOST_RESOLVER_MANAGER_DNS_TASK_TIMEOUT       +5ms
+                //   18286899  type-65 CANCELLED, net_error -3
+                //   18286899  endpoint_metadatas: []
+                //   18286907  first QUIC INITIAL sent, SNI IN THE CLEAR
+                //
+                // Chromium waits clamp(percent x address-resolve-time, min, max)
+                // for the supplemental HTTPS record after the address answer
+                // lands. The default floor is 5 ms, and 20% of a 21 ms lookup
+                // rounds under it — so the record is discarded 8 ms before the
+                // ClientHello goes out, every time.
+                //
+                // CHARTER SERVES THE RECORD. Probed directly 2026-08-29 against
+                // 192.168.1.1, 1.1.1.1 and 8.8.8.8 — all three return rcode=0
+                // ancount=1 rdlen=136 with ech= present and alpn=h3. The record
+                // was never unavailable; we were hanging up before it arrived.
+                // A working host proves the timing is the only variable:
+                // orbitpanda.top's two transactions took 95 ms and 424 ms, no
+                // timeout fired, ECH engaged, and that connection was never
+                // touched by the filter.
+                //
+                // WHY IT MATTERS, proven by controlled experiment 2026-08-29 —
+                // one IP (172.67.205.53:443), only the SNI string varied:
+                //   SNI finalroom.top       -> no certificate, blocked
+                //   SNI moon.peakstorm.top  -> no certificate, blocked
+                //   SNI example.com         -> CN=example.com, 200
+                //   SNI cloudflare-ech.com  -> CN=cloudflare-ech.com, 200
+                // The filter keys on the hostname string. cloudflare-ech.com is
+                // exactly the public_name ECH puts in the OUTER ClientHello, and
+                // it passes — so concealing the inner name defeats the match.
+                //
+                // 500 ms floor / 2 s ceiling: orbitpanda's answer arrived 424 ms
+                // after its sibling, so anything under ~500 ms would still lose
+                // the race. Cold first resolution per host only; cached after.
                 val opts = """
-                    {"QUIC":{
-                       "origins_to_force_quic_on":"*",
+                    {"AsyncDNS":{"enable":true},
+                     "UseDnsHttpsSvcb":{
+                       // "enable" IS NOT OPTIONAL — build 98 omitted it and the
+                       // feature switched OFF, which is the opposite of the
+                       // intent and measurably worse than the default.
+                       //   build 97 (no group declared):
+                       //       HOST_RESOLVER_MANAGER_JOB dns_query_types ["A","HTTPS"]
+                       //   build 98 (group declared, no "enable"):
+                       //       HOST_RESOLVER_MANAGER_JOB dns_query_types ["A"]
+                       // Declaring the group replaces the feature's defaults, so
+                       // without the switch Cronet configures it and leaves it
+                       // disabled — the HTTPS query is never sent, ECH can never
+                       // arm, and moon.peakstorm.top (which had been surviving on
+                       // a cached ECH config) started failing too. Same silent-
+                       // ignore class as the initial_delay_for_broken_alternative
+                       // _service_seconds typo: Cronet validates nothing.
+                       "enable":true,
+                       "use_alpn":true,
+                       // 1500, not 500. MEASURED 2026-08-30, 24 type-65 lookups
+                       // against Charter's resolver for the CDN hosts we actually
+                       // use:  median 262ms, p95 530ms, max 587ms. A 500ms floor
+                       // therefore CANCELS roughly the slowest 5-10% of lookups —
+                       // and a cancelled lookup caches the host with no ECH config,
+                       // which is precisely the failure it was meant to prevent.
+                       //
+                       // Raising it is nearly free, because the wait ends when an
+                       // answer ARRIVES, not when the timer expires. A host with no
+                       // HTTPS record still answers, just with ancount=0: verified
+                       // for api.daigurrenblue.com, which has no record and replies
+                       // promptly. Only a query that gets no response at all pays
+                       // the full floor, and that is the case worth being patient
+                       // for anyway.
+                       "insecure_extra_time_min":1500,
+                       "insecure_extra_time_percent":100,
+                       "insecure_extra_time_max":2000
+                     },
+                     "disable_ipv6_on_wifi":true,
+                     "QUIC":{
+                       // origins_to_force_quic_on REMOVED 2026-08-31.
+                       //
+                       // It forced a QUIC attempt at EVERY origin, including hosts
+                       // that advertise alpn=h2 and nothing else. Combined with the
+                       // 1s broken-alternative-service delay below and backoff
+                       // disabled, Cronet marked QUIC broken for such a host and
+                       // then un-marked it a second later — retrying a doomed
+                       // handshake on essentially every new connection, forever.
+                       //
+                       // MEASURED 2026-08-31 on My Hero Academia via Miruro, whose
+                       // CDNs (s1.piltover.li, s1.watami.win) publish an HTTPS
+                       // record with alpn=h2 and no h3: segment reads died with
+                       // SocketTimeoutException inside TsExtractor while the same
+                       // segments fetched at 3-9 MB/s over curl, the box pinged the
+                       // host at 17ms with 0% loss, and its Wi-Fi linked at
+                       // 866Mbps. curl and ping never attempt QUIC, which is
+                       // exactly why every external test came back clean.
+                       //
+                       // It was also not load-bearing: when the hint list was
+                       // emptied for the 2026-08-29 SVCB experiment, NO QUIC
+                       // happened anywhere despite this being set. addQuicHint is
+                       // what actually opens QUIC first for the CDNs we care about,
+                       // and hosts that genuinely speak h3 still get it via their
+                       // own alt-svc. This only ever forced failures on hosts that
+                       // cannot.
                        "idle_connection_timeout_seconds":300,
-                       "migrate_sessions_on_network_change_v2":true
+                       "migrate_sessions_on_network_change_v2":true,
+                       "initial_delay_for_broken_alternative_service_seconds":1,
+                       "exponential_backoff_on_initial_delay":false
                     }}
                 """.trimIndent()
 
@@ -905,17 +1183,1003 @@ object ExoPlayerConfig {
                 b.enableQuic(true)
                 b.enableHttp2(true)
                 b.enableBrotli(true)
-                quicHosts.forEach { b.addQuicHint(it, 443, 443) }
+                // MEASURED, NOT ASSUMED. Eight builds were shipped on the belief
+                // that these hints reach the engine; that was never once verified.
+                // A host can be in the static list, in prefs, and still not get
+                // QUIC — and without this line there is no way to tell whether the
+                // hint was missing, ignored, or applied-but-refused by the network.
+                // HINTS STAY ON. The 2026-08-29 experiment emptied them at the
+                // same moment it enabled SVCB, so its failure could not
+                // distinguish "SVCB does not work" from "nothing was left to
+                // fall back on". ECH and QUIC hints solve different halves:
+                // the hint decides QUIC is tried, ECH decides the name is
+                // concealed once it is. Both are needed.
+                val hints = (quicHosts + learnedQuicHosts(context)).distinct()
+                hints.forEach { b.addQuicHint(it, 443, 443) }
+                Log.e("scraper-vidapi",
+                    "🔬 QUIC HINTS applied=${hints.size} " +
+                    "(static=${quicHosts.size} learned=${learnedQuicHosts(context).size}) " +
+                    "peakstorm=${hints.any { it.contains("peakstorm") }}")
                 b.setExperimentalOptions(opts)
                 b.build()
             }.onFailure {
-                Log.w("scraper-vidapi", "🚀 Cronet unavailable (${it.message}) — using OkHttp")
+                // Log.e, NOT Log.w: release builds strip w, and this is the single
+                // most consequential thing that can go wrong in this file — no
+                // Cronet means no QUIC means every filtered CDN fails.
+                Log.e("scraper-vidapi",
+                    "🚨 Cronet unavailable (${it.message}) — falling back to OkHttp, " +
+                    "which has NO QUIC. Filtered hosts will fail from here.")
             }.getOrNull()
             cronetEngine?.let {
+                cronetEverBuilt = true
                 Log.d("scraper-vidapi", "🚀 Cronet ready (QUIC on) — ${it.versionString}")
+                attachTransportLog(it)
+                startNetLog(it, context)
             }
             return cronetEngine
         }
+    }
+
+    // ── Transport instrumentation ────────────────────────────────────────────
+    //
+    // WHY THIS EXISTS: three days were spent arguing about whether ECH was
+    // active, on evidence that could not distinguish it from HTTP/3 evading a
+    // TCP-only filter. Enabling AsyncDNS turned BOTH on at once — the same DNS
+    // record carries `ech=` and `alpn=h3` — so every subsequent success or
+    // failure had two candidate explanations and no way to separate them.
+    // Guessing produced four builds on three wrong theories. These two numbers
+    // end that.
+    //
+    // Logged at Log.e ON PURPOSE. Release builds strip v/d/i/w, and a diagnostic
+    // that goes silent in exactly the builds users run is not a diagnostic.
+
+    /**
+     * Record Cronet's own account of every connection attempt.
+     *
+     * WHY: measurement showed 42 QUIC hints applied, moon.peakstorm.top among
+     * them, and Cronet still opening no QUIC connection to it — while an
+     * UNHINTED host negotiated h3 through alt-svc in the same session. Hinting
+     * is therefore not the variable, and no amount of reasoning from outside the
+     * stack has explained which one is. NetLog is Chromium's own record of what
+     * it decided and why: whether a QUIC job was created, whether it was raced
+     * against TCP, whether the alternative service was marked broken, and what
+     * killed it.
+     *
+     * WRITTEN TO getExternalFilesDir SO IT CAN ACTUALLY BE READ. The internal
+     * data dir needs run-as, which fails on a release build because it is not
+     * debuggable — so an internal path would produce a file nobody can retrieve.
+     *
+     * STOPPED ON A TIMER, because a NetLog is only valid once stopped: the JSON
+     * is left unterminated while recording. 90s covers a playback start and the
+     * first failures without producing an unmanageable file.
+     */
+    @Volatile private var netLogRunning = false
+
+    /** Restart capture at each playback, so the window always covers the attempt. */
+    @Synchronized
+    fun restartNetLog(context: Context) {
+        if (!NETLOG_ENABLED) return
+        val e = cronetEngine ?: return
+        if (netLogRunning) runCatching { e.stopNetLog() }
+        netLogRunning = false
+        startNetLog(e, context)
+    }
+
+    private fun startNetLog(engine: org.chromium.net.CronetEngine, context: Context) {
+        if (!NETLOG_ENABLED) return
+        runCatching {
+            val dir = context.getExternalFilesDir(null) ?: return
+            val f = java.io.File(dir, "cronet-netlog.json")
+            // ROTATE, DO NOT OVERWRITE. This capture is restarted from
+            // ensureQuicHint, which runs precisely BECAUSE a new host was met —
+            // so writing to a fixed path means a failure destroys its own
+            // evidence. MEASURED 2026-08-29: finalroom.top refused four
+            // handshakes and relayed, then the restart it triggered overwrote
+            // the only record of it; the pulled file held zero live events for
+            // that host and the cause was unrecoverable.
+            //
+            // One generation is enough for the pattern that keeps happening —
+            // failing playback, then a working one — which leaves the failure in
+            // .prev and the success in the live file. The rename is safe here
+            // because restartNetLog has already called stopNetLog, and an
+            // unstopped NetLog is invalid JSON anyway.
+            runCatching {
+                if (f.exists()) {
+                    val prev = java.io.File(dir, "cronet-netlog.prev.json")
+                    if (prev.exists()) prev.delete()
+                    f.renameTo(prev)
+                }
+            }
+            engine.startNetLogToFile(f.absolutePath, false)
+            netLogRunning = true
+            Log.e("scraper-vidapi", "🔬 NETLOG recording -> ${f.absolutePath}")
+            // 60s from the START OF A PLAYBACK, not from engine build. A capture
+            // anchored to engine build missed the 20:28 failure entirely because
+            // the engine had been up nine minutes by then — the window has to
+            // follow the thing being measured.
+            kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                kotlinx.coroutines.delay(60_000)
+                runCatching { engine.stopNetLog() }
+                netLogRunning = false
+                Log.e("scraper-vidapi", "🔬 NETLOG stopped (${f.length()} bytes) — ready to pull")
+            }
+        }.onFailure { Log.e("scraper-vidapi", "🔬 NETLOG unavailable: ${it.message}") }
+    }
+
+    /**
+     * Resolve the known CDN hosts BEFORE anything needs them, so ECH is already
+     * cached when playback starts.
+     *
+     * WHY THIS EXISTS. ECH conceals the hostname, and the filter matches on the
+     * hostname, so ECH is the whole defence. But ECH needs the HTTPS/SVCB DNS
+     * record, and Chromium only waits `insecure_extra_time` for it AFTER the
+     * address answer lands. In the playback path that wait sits ~34ms before the
+     * ClientHello goes out, and if the record loses the race the resolver caches
+     * an entry with NO ech_config_list. Every request against that cached entry
+     * then goes out in cleartext until it expires.
+     *
+     * MEASURED 2026-08-30 10:58: moon.peakstorm.top produced four handshake
+     * refusals in a capture with no fresh DNS and zero ECH events — served from
+     * exactly such an entry. The same host had worked earlier the same day.
+     *
+     * Doing it at startup removes the race instead of trying to win it: nothing
+     * is waiting on these, so the full allowance is available, and by the time a
+     * playback resolves the host the entry already carries its ECH config.
+     *
+     * ONE CHEAP REQUEST PER HOST, capped and serialised in small batches. Cronet
+     * exposes no resolve-only API, so a request is the only way to drive the
+     * resolver — but the response is irrelevant. A 403 or 404 warms the DNS entry
+     * exactly as well as a 200, so failures are ignored by design.
+     */
+    /**
+     * Warm DNS/ECH for hosts an extraction just reported, before playback starts.
+     *
+     * The startup prewarm covers hosts the backend already knew when the app
+     * launched. It cannot cover one discovered minutes later — and those are
+     * exactly the hosts that cost a relay, because they resolve inside the
+     * playback critical path where the ECH race is lost.
+     *
+     * Called from extractStreamAwait the moment a manifest comes back, which
+     * buys the player-setup window (~1s) as warm time. Fire-and-forget: if it
+     * does not finish before the first segment request, that request behaves
+     * exactly as it does today, so this can only help.
+     *
+     * Also merges them into the hint list, so the QUIC hint follows on the next
+     * engine build rather than waiting for the next app start.
+     */
+    fun warmHosts(hosts: List<String>) {
+        if (hosts.isEmpty()) return
+        val ctx = com.example.bluehive.BlueHiveApplication.appContext ?: return
+        // WARM EVERY HOST IN THIS STREAM, known or not. The first version of
+        // this filtered to hosts absent from the hint list, which conflated two
+        // unrelated things and left the commonest failure untouched: the hint
+        // list is permanent, the DNS cache is not.
+        //
+        // MEASURED 2026-08-30 on "Bring Her Back". moon.peakstorm.top — in the
+        // hint list for days, and serving h3 200 at 13:01:29 — was severed at
+        // 13:06:26. The HTTPS record's TTL is 300s and the gap was 297s: its ECH
+        // config had simply expired, so the host was re-resolved inside the
+        // playback critical path, lost the race for a fresh config, and went out
+        // in cleartext. Being "known" is exactly why it was skipped.
+        //
+        // So: merge only the new ones into the hint list, but warm them all.
+        // Two or three requests per playback against hosts we are about to use
+        // anyway, which keeps their ECH configs alive across the 5-minute TTL.
+        val all = hosts.map { it.lowercase() }.filter { it.isNotBlank() }.distinct()
+        if (all.isEmpty()) return
+        val known = learnedQuicHosts(ctx)
+        val fresh = all.filter { it !in known }
+        if (fresh.isNotEmpty()) mergeQuicHints(ctx, fresh)
+        Log.e("scraper-vidapi",
+            "🔥 warming ${all.size} CDN host(s) for this stream " +
+            "(${fresh.size} new): ${all.joinToString()}")
+        warm(ctx, all)
+    }
+
+    /**
+     * Warm this stream's hosts and WAIT for it, capped.
+     *
+     * WHY WAITING IS NECESSARY. Fire-and-forget lost a real race, twice.
+     * MEASURED 2026-08-30 on "Obsession": the warm was dispatched at
+     * 14:51:38.200 and the first request to polarcandy.top went out at
+     * 14:51:38.738 — a 538ms head start against an ECH lookup that runs
+     * median 262ms / p95 530ms / max 587ms on this line. It lost, the hostname
+     * went out in cleartext, and the ISP severed it. moon.peakstorm.top, already
+     * warm from an earlier play, reached h3 200 in the same instant.
+     *
+     * SELF-TUNING, so the cost is paid only when there is something to buy.
+     * This awaits the HEAD requests themselves, not a fixed delay: a host whose
+     * DNS and ECH config are already cached answers in tens of milliseconds over
+     * an existing QUIC session, so the wait is negligible. Only a genuinely cold
+     * host costs its lookup time. A fixed sleep would tax every playback for the
+     * benefit of the rare one.
+     *
+     * CAPPED because the alternative to waiting is a relay, not a hang. If the
+     * lookup has not landed by the cap we proceed anyway and behave exactly as
+     * before — this can delay playback slightly, never prevent it.
+     */
+    suspend fun warmHostsAwait(hosts: List<String>, capMs: Long = 1200) {
+        if (hosts.isEmpty()) return
+        val ctx = BlueHiveApplication.appContext ?: return
+        val all = hosts.map { it.lowercase() }.filter { it.isNotBlank() }.distinct()
+        if (all.isEmpty()) return
+
+        val known = learnedQuicHosts(ctx)
+        val fresh = all.filter { it !in known }
+        if (fresh.isNotEmpty()) mergeQuicHints(ctx, fresh)
+        // Snapshot for the relay report. Replaced rather than added to, so the
+        // answer is always "was this host new for THIS play" — the previous
+        // playback's newcomers are not this one's excuse.
+        freshAtLastWarm.clear()
+        freshAtLastWarm.addAll(fresh)
+        // Off the critical path: dispatched, never awaited. See the function.
+        dispatchEchConfigProbe(all)
+
+        val engine = runCatching { cronet(ctx) }.getOrNull() ?: return
+        val latch = java.util.concurrent.CountDownLatch(all.size)
+        val exec = java.util.concurrent.Executors.newSingleThreadExecutor()
+        val started = System.currentTimeMillis()
+        // PER-HOST OUTCOMES, because "all settled" was actively misleading: the
+        // latch counts down on failure too, so a host whose warm was SEVERED
+        // reported exactly like one that succeeded. MEASURED 2026-08-30 —
+        // moon.peakstorm.top logged "2 host(s) in 681ms, all settled" and was then
+        // severed four times. If a warm cannot reach a host, that is the single
+        // most useful fact available and it was being swallowed.
+        val ok  = java.util.Collections.synchronizedSet(HashSet<String>())
+        val bad = java.util.Collections.synchronizedMap(HashMap<String, String>())
+
+        for (h in all) {
+            runCatching {
+                val cb = object : org.chromium.net.UrlRequest.Callback() {
+                    override fun onRedirectReceived(
+                        r: org.chromium.net.UrlRequest,
+                        i: org.chromium.net.UrlResponseInfo, u: String
+                    ) { r.cancel() }
+                    override fun onResponseStarted(
+                        r: org.chromium.net.UrlRequest, i: org.chromium.net.UrlResponseInfo
+                    ) { r.cancel() }
+                    override fun onReadCompleted(
+                        r: org.chromium.net.UrlRequest,
+                        i: org.chromium.net.UrlResponseInfo, b: java.nio.ByteBuffer
+                    ) { r.cancel() }
+                    override fun onSucceeded(
+                        r: org.chromium.net.UrlRequest, i: org.chromium.net.UrlResponseInfo
+                    ) { ok.add(h); latch.countDown() }
+                    override fun onFailed(
+                        r: org.chromium.net.UrlRequest,
+                        i: org.chromium.net.UrlResponseInfo?, e: org.chromium.net.CronetException
+                    ) { bad[h] = e.message ?: "failed"; latch.countDown() }
+                    // Cancelled is the NORMAL path here — we cancel at headers,
+                    // because the response body is irrelevant. Counting down only
+                    // on success would wait out the full cap every single time.
+                    override fun onCanceled(
+                        r: org.chromium.net.UrlRequest, i: org.chromium.net.UrlResponseInfo?
+                    ) { ok.add(h); latch.countDown() }   // we cancel at headers: reaching them IS success
+                }
+                engine.newUrlRequestBuilder("https://$h/", cb, exec)
+                    .setHttpMethod("HEAD").build().start()
+            }.onFailure { latch.countDown() }
+        }
+
+        val settled = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            latch.await(capMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        }
+        val waited = System.currentTimeMillis() - started
+        // "settled" MEANS THE REQUESTS FINISHED, NOT THAT THEY SUCCEEDED — the
+        // latch counts down on failure and cancellation too, which it must, or a
+        // severed host would wait out the whole cap. Reporting the elapsed time
+        // is what makes this readable: a warm that returns in ~150ms did no DNS
+        // at all and served a cached entry, while a real lookup on this line
+        // costs 262-587ms. MEASURED 15:13:32 — 907ms with one new host, which
+        // resolved and reached h3 200, while the cached one returned instantly
+        // and was severed.
+        Log.e("scraper-vidapi",
+            "🔥 warmed ${ok.size}/${all.size} host(s) in ${waited}ms " +
+            "(${fresh.size} new${if (settled) "" else ", cap hit"}" +
+            "${if (waited < 120) ", NO DNS — served from cache" else ""})" +
+            " ok=${ok.sorted().joinToString()}" +
+            "${if (bad.isEmpty()) "" else " UNREACHABLE=" + bad.entries.joinToString { "${it.key} (${it.value})" }}")
+        runCatching { exec.shutdown() }
+    }
+
+    /** Has Cronet EVER built here? Separates our bug from a device limitation. */
+    @Volatile private var cronetEverBuilt = false
+
+    /** Last bulk prewarm, so an engine rebuild cannot trigger one per playback. */
+    @Volatile private var lastBulkPrewarmMs = 0L
+    private const val BULK_PREWARM_MIN_INTERVAL_MS = 5 * 60_000L
+
+    @Volatile private var prewarmed = false
+
+    fun prewarmCdnDns(context: Context) {
+        if (prewarmed) return
+        prewarmed = true
+        val engine = runCatching { cronet(context) }.getOrNull() ?: return
+        // The LEARNED list only. The static list is a compiled-in fallback whose
+        // hosts rarely rotate; the backend-published set is the one that churns
+        // (moon.peakstorm.top, finalroom.top, orbitpanda.top, impactdrivenbrands
+        // .site ...) and therefore the one whose ECH configs are worth fetching
+        // ahead of time. quicHosts is also a local inside the engine builder and
+        // deliberately not hoisted for this.
+        val hosts = learnedQuicHosts(context).toList()
+        if (hosts.isEmpty()) return
+
+        warm(context, hosts)
+    }
+
+    /** Drive the resolver for [hosts]. Responses are irrelevant and discarded. */
+    private fun warm(context: Context, hosts: List<String>) {
+        val engine = runCatching { cronet(context) }.getOrNull() ?: return
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+            val exec = java.util.concurrent.Executors.newSingleThreadExecutor()
+            var done = 0
+            // Small batches with a pause between them. These are third-party CDNs
+            // and 48 simultaneous connections from one address at app start looks
+            // like scanning; spread out it looks like what it is.
+            for (chunk in hosts.chunked(6)) {
+                for (h in chunk) {
+                    runCatching {
+                        val cb = object : org.chromium.net.UrlRequest.Callback() {
+                            override fun onRedirectReceived(
+                                r: org.chromium.net.UrlRequest,
+                                i: org.chromium.net.UrlResponseInfo, u: String
+                            ) { r.cancel() }
+                            override fun onResponseStarted(
+                                r: org.chromium.net.UrlRequest,
+                                i: org.chromium.net.UrlResponseInfo
+                            ) { r.cancel() }   // headers are enough; never read a body
+                            override fun onReadCompleted(
+                                r: org.chromium.net.UrlRequest,
+                                i: org.chromium.net.UrlResponseInfo,
+                                b: java.nio.ByteBuffer
+                            ) { r.cancel() }
+                            override fun onSucceeded(
+                                r: org.chromium.net.UrlRequest,
+                                i: org.chromium.net.UrlResponseInfo
+                            ) {}
+                            override fun onFailed(
+                                r: org.chromium.net.UrlRequest,
+                                i: org.chromium.net.UrlResponseInfo?,
+                                e: org.chromium.net.CronetException
+                            ) {}
+                            override fun onCanceled(
+                                r: org.chromium.net.UrlRequest,
+                                i: org.chromium.net.UrlResponseInfo?
+                            ) {}
+                        }
+                        engine.newUrlRequestBuilder("https://$h/", cb, exec)
+                            .setHttpMethod("HEAD")
+                            .build().start()
+                        done++
+                    }
+                }
+                kotlinx.coroutines.delay(400)
+            }
+            // Log.e because release builds strip everything below it, and a warm
+            // that silently stopped running would be invisible exactly where it
+            // matters.
+            Log.e("scraper-vidapi",
+                "🔥 DNS/ECH prewarm dispatched for $done CDN host(s) — " +
+                "playback should now find ECH already cached")
+            kotlinx.coroutines.delay(15_000)
+            exec.shutdown()
+        }
+    }
+
+    /**
+     * When the ECH probe last ran, so it can be re-armed per playback.
+     *
+     * WAS ONCE PER PROCESS, AT ENGINE BUILD, AND THAT MADE IT LIE. MEASURED
+     * 2026-09-12: the probe fired at 13:28:10 and reported plaintext over h2,
+     * nine seconds BEFORE the DNS/ECH prewarm was dispatched — so it measured a
+     * completely cold engine, which is the one moment guaranteed not to
+     * represent playback. Two relays at 13:35 then reported that same seven
+     * minute old verdict. A field that reads "plaintext" on every device forever
+     * is worse than no field, because it looks like a finding.
+     *
+     * Now re-armed at the start of each playback, after the warm, so the verdict
+     * describes the conditions the stream is actually about to meet.
+     */
+    @Volatile private var lastEchProbeMs = 0L
+
+    /**
+     * Floor between probes. Playbacks are minutes apart, so this changes nothing
+     * for real viewing and only stops a burst when somebody flips between
+     * sources on one title.
+     */
+    private const val ECH_PROBE_MIN_INTERVAL_MS = 30_000L
+
+    /**
+     * What the probe concluded, KEPT rather than only printed.
+     *
+     * The verdict existed already and went straight into a log line. That made
+     * the one thing the whole transport defence rests on the one thing no relay
+     * row could report: a host that connected over QUIC with its name in the
+     * clear looked identical to one that was properly concealed, because h3
+     * describes the road and says nothing about the envelope.
+     *
+     * "encrypted" | "plaintext" | "inconclusive", or null until the probe runs.
+     */
+    @Volatile private var echVerdict: String? = null
+
+    /**
+     * DEVICE LEVEL, NOT HOST LEVEL. This says whether ECH negotiates at all on
+     * this network, which is the failure mode that takes everything down at
+     * once. Whether a PARTICULAR CDN was concealed additionally needs that host
+     * to publish an ECH config — see [hostPublishesEch].
+     */
+    fun echState(): String = echVerdict ?: "unknown"
+
+    /**
+     * Does this host publish an ECH config? null until looked up.
+     *
+     * Cached across playbacks on purpose: an ECH config is a DNS record, not a
+     * per-connection fact, and it changes on the order of days.
+     */
+    private val hostEchConfig =
+        java.util.Collections.synchronizedMap(HashMap<String, Boolean>())
+
+    /** true = publishes ECH, false = does not, null = never looked up. */
+    fun hostPublishesEch(url: String): Boolean? = runCatching {
+        java.net.URI(url).host?.lowercase()?.let { hostEchConfig[it] }
+    }.getOrNull()
+
+    /**
+     * Ask DoH whether each host publishes an ECH config. Fire and forget.
+     *
+     * WHY TYPE 65 AND NOT THE EXISTING RESOLVER. dohResolver answers A/AAAA
+     * only; ECH configs live in the HTTPS record, which needs the JSON query
+     * form. Chromium asks for exactly this record itself and will not attempt
+     * ECH without it, so its presence is the difference between "ECH failed for
+     * this host" and "this host was never eligible" — two findings that look
+     * identical in a relay row and have completely different fixes.
+     *
+     * NOT AWAITED, AND DELIBERATELY OFF THE FAILURE PATH. Dispatched during the
+     * warm so the answer is already cached seconds before any failure could ask
+     * for it. Doing it inside switchToRelay would add a DNS round trip to the
+     * one path where the viewer is already staring at a black screen.
+     */
+    private fun dispatchEchConfigProbe(hosts: List<String>) {
+        val todo = hosts.filter { it.isNotBlank() && it !in hostEchConfig }
+        if (todo.isEmpty()) return
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+            val client = okHttpClient()
+            for (h in todo) {
+                runCatching {
+                    val req = okhttp3.Request.Builder()
+                        .url("https://cloudflare-dns.com/dns-query?name=$h&type=HTTPS")
+                        .header("Accept", "application/dns-json")
+                        .build()
+                    client.newCall(req).execute().use { r ->
+                        val txt = r.body?.string().orEmpty()
+                        // Cloudflare renders the HTTPS record's SvcParams as a
+                        // string, so the config shows up as an `ech="..."` pair.
+                        // Absent means the host published no ECH config at all.
+                        hostEchConfig[h] = txt.contains("ech=")
+                    }
+                }.onFailure {
+                    // Left ABSENT, which reads as unknown. Recording false here
+                    // would turn "the lookup failed" into "this host has no ECH",
+                    // and that is the wrong answer to act on.
+                    hostEchConfig.remove(h)
+                    Log.w("scraper-vidapi", "ech-config lookup failed for $h (${it.message})")
+                }
+            }
+        }
+    }
+
+    private fun probeEch(engine: org.chromium.net.CronetEngine) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (lastEchProbeMs != 0L && now - lastEchProbeMs < ECH_PROBE_MIN_INTERVAL_MS) return
+        lastEchProbeMs = now
+        // CLOUDFLARE'S OWN SELF-TEST, deliberately not a streaming host. It
+        // answers `sni=encrypted` when the ClientHello concealed the hostname and
+        // `sni=plaintext` when it did not — a direct read of the one thing under
+        // investigation, costing one small request and touching no CDN we stream
+        // from (which matters while the hosting account is under review).
+        val exec = java.util.concurrent.Executors.newSingleThreadExecutor()
+        val body = StringBuilder()
+        val cb = object : org.chromium.net.UrlRequest.Callback() {
+            override fun onRedirectReceived(
+                r: org.chromium.net.UrlRequest, i: org.chromium.net.UrlResponseInfo, u: String
+            ) { r.followRedirect() }
+
+            override fun onResponseStarted(
+                r: org.chromium.net.UrlRequest, i: org.chromium.net.UrlResponseInfo
+            ) { r.read(java.nio.ByteBuffer.allocateDirect(16384)) }
+
+            override fun onReadCompleted(
+                r: org.chromium.net.UrlRequest,
+                i: org.chromium.net.UrlResponseInfo,
+                bb: java.nio.ByteBuffer
+            ) {
+                bb.flip()
+                val arr = ByteArray(bb.remaining()); bb.get(arr)
+                body.append(String(arr))
+                bb.clear(); r.read(bb)
+            }
+
+            override fun onSucceeded(
+                r: org.chromium.net.UrlRequest, i: org.chromium.net.UrlResponseInfo
+            ) {
+                val sni = body.lines().firstOrNull { it.startsWith("sni=") } ?: "sni=(absent)"
+                echVerdict = if (sni.contains("encrypted")) "encrypted" else "plaintext"
+                Log.e("scraper-vidapi",
+                    "🔬 ECH PROBE: $sni | protocol=${i.negotiatedProtocol} | " +
+                    "verdict=" + if (sni.contains("encrypted"))
+                        "ECH IS ACTIVE — the hostname is concealed"
+                    else
+                        "ECH IS NOT ACTIVE — the hostname is going out in the clear")
+                exec.shutdown()
+            }
+
+            override fun onFailed(
+                r: org.chromium.net.UrlRequest,
+                i: org.chromium.net.UrlResponseInfo?,
+                e: org.chromium.net.CronetException
+            ) {
+                echVerdict = "inconclusive"
+                Log.e("scraper-vidapi", "🔬 ECH PROBE failed (inconclusive): ${e.message}")
+                exec.shutdown()
+            }
+        }
+        runCatching {
+            engine.newUrlRequestBuilder(
+                "https://crypto.cloudflare.com/cdn-cgi/trace", cb, exec
+            ).build().start()
+        }.onFailure {
+            echVerdict = "inconclusive"
+            Log.e("scraper-vidapi", "🔬 ECH PROBE could not start: ${it.message}")
+        }
+    }
+
+    /** First few requests per host: which protocol actually carried them. */
+    /** What a host's last request actually negotiated, and what it answered. */
+    data class HostTransport(val protocol: String, val httpStatus: Int)
+
+    /**
+     * Last transport outcome per host, for THIS playback.
+     *
+     * WAS A SET USED ONLY TO DEDUPE LOG LINES. The two facts that decide whether
+     * a relay was the ISP filter or the CDN itself — the negotiated protocol and
+     * the HTTP status — were formatted into a string and dropped on the floor,
+     * so relay_sessions recorded ERROR_CODE_IO_BAD_HTTP_STATUS with no way to
+     * tell a 404 from a 403, and no way to tell a severed handshake
+     * (protocol=(none) http=-1) from a CDN that answered.
+     *
+     * Holding the values costs one small map and makes both reportable. The map
+     * keeps the LATEST outcome per host while the log still prints once, which
+     * is what [switchToRelay] needs: by the time it runs, the entry for the
+     * failing host is the failure.
+     */
+    private val hostTransport =
+        java.util.Collections.synchronizedMap(HashMap<String, HostTransport>())
+
+    /** The last transport outcome for [url]'s host this playback, if any. */
+    fun transportFor(url: String): HostTransport? = runCatching {
+        java.net.URI(url).host?.lowercase()?.let { hostTransport[it] }
+    }.getOrNull()
+
+    /**
+     * Hosts this playback's warm had never seen before.
+     *
+     * A host learned for the first time is one that could not have been
+     * QUIC-hinted at engine build, so its first connection is the one least
+     * likely to survive a filtered line. Recording it separates "the defence was
+     * armed and still lost" from "this host was brand new", which read
+     * identically in relay_sessions.
+     */
+    private val freshAtLastWarm = java.util.Collections.synchronizedSet(HashSet<String>())
+
+    /** Was [url]'s host newly learned by the most recent warm? */
+    fun wasNewlyLearned(url: String): Boolean = runCatching {
+        java.net.URI(url).host?.lowercase()?.let { it in freshAtLastWarm }
+    }.getOrDefault(false) ?: false
+
+    private fun attachTransportLog(engine: org.chromium.net.CronetEngine) {
+        val ex = engine as? org.chromium.net.ExperimentalCronetEngine ?: return
+        val exec = java.util.concurrent.Executors.newSingleThreadExecutor()
+        runCatching {
+            ex.addRequestFinishedListener(
+                object : org.chromium.net.RequestFinishedInfo.Listener(exec) {
+                    override fun onRequestFinished(info: org.chromium.net.RequestFinishedInfo) {
+                        val host = runCatching {
+                            java.net.URI(info.url).host ?: return
+                        }.getOrNull() ?: return
+                        val proto = info.responseInfo?.negotiatedProtocol ?: "(none)"
+                        val code = info.responseInfo?.httpStatusCode ?: -1
+                        // RECORD EVERY REQUEST, LOG ONLY THE FIRST. An episode is
+                        // hundreds of requests and the protocol does not change
+                        // between them; logging each would bury the answer. But
+                        // the VALUES have to keep updating, because the request
+                        // that matters to a relay report is the one that failed,
+                        // and that is rarely the first one this host served.
+                        val first = hostTransport.put(
+                            host.lowercase(), HostTransport(proto, code)
+                        ) == null
+                        if (!first) return
+                        Log.e("scraper-vidapi",
+                            "🔬 TRANSPORT $host -> protocol=$proto http=$code " +
+                            "(h3 = QUIC/UDP, h2 or http/1.1 = TCP)")
+                    }
+                }
+            )
+        }.onFailure {
+            Log.e("scraper-vidapi", "🔬 transport listener unavailable: ${it.message}")
+        }
+    }
+
+    // ── QUIC hints, learned instead of hardcoded ─────────────────────────────
+    //
+    // THE STATIC LIST CANNOT WORK, and one session's transport log shows exactly
+    // why. vidfast does not have a CDN hostname — it has a rotating pool:
+    //
+    //   moon.peakstorm.top  -> h3   200   (hinted in build 82, so QUIC first)
+    //   polarsable.top      -> h3   200   (not filtered, upgraded via alt-svc)
+    //   boldapple.top       -> none -1    (not hinted, filtered, severed)
+    //
+    // Whether an episode plays is therefore decided by which hostname the
+    // extractor happened to draw — a coin flip, which is precisely how this
+    // looked like an intermittent, unexplainable fault for three days.
+    //
+    // WHY A HINT IS NEEDED AT ALL. Cronet normally discovers HTTP/3 from an
+    // alt-svc header on an HTTP/2 response. A filtered host never sends one,
+    // because its TCP handshake is severed before any response exists. Only
+    // addQuicHint opens QUIC on the FIRST request, and that is build-time state.
+    //
+    // So: remember every CDN host we are asked to play, and rebuild the engine
+    // when we meet a new one. The set persists, so a host costs one rebuild ever,
+    // and the common case reuses the existing engine untouched.
+    private const val QUIC_PREFS = "bh_quic_hints"
+    /** Diagnostic only. Off by default — a NetLog records URLs and timings. */
+    // OFF as of 2026-08-30, and it had stopped being merely expensive.
+    //
+    // MEASURED on the "Everest" failure: 48,229,470 bytes written in ~60s of
+    // playback, with 50,518,626 more retained in the rotation — 98MB on a box
+    // with 1.0GB free of 4.7GB (77% used). Those writes are sustained and
+    // concurrent with video buffering, so on a low-end TV box the diagnostic is
+    // a plausible contributor to the very stalls it was capturing. A measuring
+    // instrument that loads the thing it measures has to come off before the
+    // measurement means anything.
+    //
+    // It earned its keep first: rotation to .prev caught the finalroom.top
+    // failure that overwrote itself, and these captures are what proved the
+    // injected-packet, ECH and 300s-TTL findings. All of that is now settled.
+    //
+    // Flip to true to capture again; everything else is intact and per-playback
+    // rotation still works.
+    // BACK ON 2026-08-30, narrowly. Turning it off was premature: the I/O
+    // suspicion that justified it was refuted by the very capture it was
+    // suspected of spoiling, and an open question remains that only NetLog can
+    // answer — whether moon.peakstorm.top is being served from a HostCache entry
+    // that carries no ECH config, which would make the warm a no-op for exactly
+    // the hosts that need it.
+    //
+    // The event cap that made these captures useless for LATE failures is
+    // harmless here: it fills after ~23s because QUIC packet logging burns
+    // ~12,700 events/sec, and the DNS phase this question needs is in the first
+    // seconds. A short capture is sufficient and, at ~50MB, still costs real
+    // disk — so this comes off again the moment the question is settled.
+    // OFF. It has now answered every question it was turned on for, and each of
+    // those answers is recorded in the comments around this file:
+    //   - the injected QUIC INITIAL (packet_number 0x80000000, sub-RTT arrival)
+    //   - ECH confirmed active, and the 300s HTTPS-record TTL behind the
+    //     five-minute pattern of a host working and then not
+    //   - the silent OkHttp fallback, proved by a capture with ZERO
+    //     SSL_HANDSHAKE_ERROR events during four logged handshake refusals
+    //
+    // It is not free: ~50MB per playback, two generations retained, on a box with
+    // ~1GB spare — and it records URLs, which has no place in a build customers
+    // run. Flip to true to capture again; rotation to .prev still works, and the
+    // 300,000-event cap means a capture covers roughly the first 23 seconds, so
+    // it is only useful for questions about the START of a playback.
+    private const val NETLOG_ENABLED = false
+
+    /**
+     * EXPERIMENT — can DNS replace the whole QUIC-hint apparatus?
+     *
+     * Cronet can learn "this host speaks QUIC" straight from the HTTPS (SVCB) DNS
+     * record; that is the dns_alpn_h3 job visible in NetLog. If it does, a brand
+     * new CDN gets QUIC on its first request with no hint, no list, no backend
+     * endpoint and no engine rebuild — and every one of those pieces becomes dead
+     * weight, including the two that caused outages today.
+     *
+     * It is not working right now: NetLog shows endpoint_metadatas:[] even though
+     * 30 of 32 CDNs publish alpn=h3. UseDnsHttpsSvcb/use_alpn is the documented
+     * switch and has never been tried here.
+     *
+     * TRUE ALSO EMPTIES THE HINT LIST, deliberately. Leaving hints on would make
+     * the result unreadable — QUIC would work either way and prove nothing. The
+     * only honest test is to remove the crutch and see whether DNS carries it.
+     *
+     * REVERT: set this to false, rebuild, install. Nothing else changes — the
+     * list, endpoint and merge logic are all still present and simply resume.
+     */
+    // RESULT, 2026-08-29, and the reason it failed was NOT what this file said.
+    //
+    // The experiment reported FAILED: hints emptied + use_alpn on, three films,
+    // protocol=(none) every time. I concluded Cronet ignores the DNS record and
+    // that ECH was gated behind secure DNS "which Cronet exposes no way to
+    // satisfy". BOTH CONCLUSIONS WERE WRONG, and NetLog says so:
+    //
+    //   - ECH HAS ALREADY WORKED ON THIS DEVICE over ordinary insecure AsyncDNS
+    //     against Charter's own resolver (secure:false in the resolver dump).
+    //     orbitpanda.top resolved its HTTPS record, sent a real inner
+    //     ClientHello (SSL_ENCRYPTED_CLIENT_HELLO, outer SNI cloudflare-ech.com)
+    //     and moved 32,854 QUIC packets untouched. There is no secure-DNS gate.
+    //   - The record is not missing, it is CANCELLED — Chromium's 5 ms floor for
+    //     the supplemental type-65 query expires before the answer arrives. See
+    //     the timeline in the options block above.
+    //   - The experiment ALSO emptied the hint list, so its negative result
+    //     could not separate "SVCB does nothing" from "nothing was left to fall
+    //     back on". Two changes, one observation: unreadable either way.
+    //
+    // The flag is deleted rather than kept, because the thing it tested is now
+    // shipping unconditionally with the timing it actually needed.
+    @Volatile private var pendingHintRebuild = false
+
+    @Synchronized
+    fun ensureQuicHint(context: Context, url: String) {
+        val host = runCatching { java.net.URI(url).host }.getOrNull() ?: return
+        if (host.isBlank()) return
+
+        // NEVER HINT OUR OWN RELAY, and never rebuild the engine because of it.
+        // MEASURED 2026-08-29: a relay fallback swaps the player's url to
+        // api.<domain>, which looked like a brand-new CDN to this function — so
+        // it tore down and rebuilt the transport IN THE MIDDLE of a recovery,
+        // exactly when playback was least able to absorb it. Our own origin is
+        // never ISP-filtered and never needs a QUIC hint to be reachable.
+        val ownHost = runCatching {
+            java.net.URI(com.example.bluehive.BuildConfig.API_BASE_URL).host
+        }.getOrNull()
+        if (ownHost != null && host.equals(ownHost, ignoreCase = true)) return
+
+        restartNetLog(context)
+
+        // PER-PLAYBACK, NOT PER-PROCESS. hostTransport suppresses duplicate
+        // transport lines, which is right within one playback and wrong across
+        // several: the second play of a host that has since REGRESSED to TCP
+        // would print nothing, and silence reads as success. Cleared here
+        // because this runs once, at the start of each playback.
+        hostTransport.clear()
+
+        // AFTER THE WARM, WHICH IS THE WHOLE POINT. warmHostsAwait has already
+        // run by the time a playback reaches here, so the probe now measures an
+        // engine that holds the ECH configs it is supposed to use. Dispatched,
+        // never awaited: it is one small request and the answer is wanted three
+        // seconds from now at the earliest, not before the first byte.
+        runCatching { cronet(context) }.getOrNull()?.let { probeEch(it) }
+        val prefs = context.getSharedPreferences(QUIC_PREFS, Context.MODE_PRIVATE)
+        val known = prefs.getStringSet("hosts", emptySet()) ?: emptySet()
+        if (host in known) return
+        prefs.edit().putStringSet("hosts", known + host).apply()
+        // REMEMBERED, NOT REBUILT. The engine is deliberately left alone.
+        //
+        // MEASURED 2026-08-29 and this cost a working setup: dropping the engine
+        // reference per new host leaks it — shutdown() cannot be called safely
+        // while requests may be in flight — and after a few rebuilds Cronet
+        // failed to construct at all. cronet() then returned null,
+        // dataSourceFactory silently fell back to OkHttp, and OkHttp has no QUIC,
+        // so every stream went back over filtered TCP. The tell was the exception
+        // TYPE flipping to javax.net.ssl.SSLException, which Cronet never throws.
+        //
+        // Worse, that failure logged at Log.w — stripped from release builds — so
+        // the transport degraded invisibly and looked like the ISP getting
+        // stricter rather than the app quietly losing its network stack.
+        //
+        // So the hint lands on the NEXT app start. The cost is that the very
+        // first playback from an unseen CDN host may fall back to the relay once;
+        // every play after that uses QUIC. That is a far better trade than
+        // risking the transport for everything.
+        pendingHintRebuild = true
+        Log.e("scraper-vidapi",
+            "🔀 learned new CDN host $host — QUIC hint applies when the player " +
+            "closes (see applyPendingQuicHints)")
+    }
+
+    /**
+     * Rebuild the transport if new CDN hosts were learned — called when a player
+     * is torn down, which is the only moment this is safe.
+     *
+     * WHY NOT IMMEDIATELY. addQuicHint is build-time state, so a newly learned
+     * host cannot take effect without a new engine. Doing that mid-playback cost
+     * a working setup on 2026-08-29: the reference was dropped while requests
+     * were still in flight (shutdown() throws in that state), the engines leaked,
+     * and after a few rebuilds Cronet stopped constructing entirely. cronet()
+     * then returned null and dataSourceFactory fell back to OkHttp, which has no
+     * QUIC — so every filtered CDN failed, and the giveaway was the exception
+     * type flipping to javax.net.ssl.SSLException.
+     *
+     * WHY NOT ONLY AT APP START. That was the safe overcorrection, and it made
+     * the behaviour surprising: a viewer whose stream relayed would back out,
+     * replay, and get relayed again, because ExoPlayerConfig is an object and the
+     * engine outlives the Activity. "Close it and try again" is what anyone would
+     * expect to work, so that is where the rebuild belongs.
+     *
+     * onDestroy is safe because the player has already been released, so no
+     * request is in flight and shutdown() can be called properly rather than the
+     * reference being abandoned.
+     */
+    @Synchronized
+    fun applyPendingQuicHints() {
+        if (!pendingHintRebuild) return
+        pendingHintRebuild = false
+        val old = cronetEngine ?: return
+        // SHUT DOWN FIRST, AND ONLY DROP THE REFERENCE IF IT SUCCEEDS.
+        //
+        // The earlier version dropped it either way, on the reasoning that a
+        // leaked engine beats an unapplied hint. That was wrong and it cost a
+        // working session on 2026-08-29:
+        //
+        //   19:47:12  moon.peakstorm.top -> h3 200          (working)
+        //   19:47:17  engine still busy — dropped without shutdown
+        //   19:47:35  TLS handshake refused for moon.peakstorm.top
+        //   19:47:38  relay granted
+        //
+        // Cronet is a process-wide singleton shared across activities, so a
+        // player reaching onDestroy does NOT mean nothing is using it —
+        // shutdown() throws IllegalStateException while any request lives. Drop
+        // it then and two engines exist at once; do that a few times and Cronet
+        // stops constructing altogether, cronet() returns null, and every stream
+        // silently falls to OkHttp, which has no QUIC.
+        //
+        // So a busy engine is simply KEPT. pendingHintRebuild stays true and the
+        // next teardown tries again; one of them eventually lands while the
+        // engine is genuinely idle. The cost of waiting is at most one more
+        // relayed playback. The cost of leaking is the transport itself.
+        val shutdownOk = runCatching { old.shutdown() }.isSuccess
+        if (!shutdownOk) {
+            pendingHintRebuild = true      // try again at the next teardown
+            Log.e("scraper-vidapi",
+                "🔀 engine still busy — KEEPING it (dropping would leak and has " +
+                "previously broken QUIC entirely); hints retry on next close")
+            return
+        }
+        cronetEngine = null
+        // RELEASE THE ONE-SHOT LATCH, or this is not a rebuild — it is a
+        // permanent teardown.
+        //
+        // cronet() opens with `if (cronetTried) return cronetEngine`, and
+        // cronetTried was set true by the FIRST construction and never reset.
+        // Nulling the engine without clearing it therefore made every later
+        // cronet() call return null forever: the prewarm below got null and
+        // silently did nothing, dataSourceFactory got null and fell through to
+        // OkHttp, and the app lost QUIC and ECH for the rest of the process.
+        //
+        // MEASURED 2026-08-31: merges at 15:16 and 15:28 each armed a rebuild;
+        // by 15:32 the app was logging "CRONET LOST after having worked" and
+        // extraction was timing out. The three retries added in build 112 could
+        // not help — all three hit the same latch. Only a force-stop recovered
+        // it, because a new process starts with cronetTried = false.
+        //
+        // This one line is what makes "rebuild" mean rebuild.
+        cronetTried = false
+        Log.e("scraper-vidapi", "🔀 transport rebuilt with newly learned QUIC hints")
+
+        // A REBUILT ENGINE STARTS WITH AN EMPTY HOST CACHE, AND ECH LIVES ONLY
+        // THERE. Confirmed from the NetLog's own config:
+        // quicInfo.max_server_configs_stored_in_properties = 0 — Chromium keeps
+        // no persistent ECH store, so every config the prewarm fetched dies with
+        // the old engine. The next request then resolves cold, inside the
+        // playback critical path, and can lose the race for a fresh config —
+        // which puts the hostname back on the wire in cleartext.
+        //
+        // MEASURED 2026-08-30 on "Everest": moon.peakstorm.top served h3 200 at
+        // 13:55:43, the transport was rebuilt at 13:58:59, and at 13:59:10 the
+        // same host produced four TLS handshake refusals ~600ms after its warm
+        // was dispatched — an ECH lookup here needs up to 587ms, so it lost.
+        //
+        // Re-arm the whole prewarm, not just the current stream's hosts: the
+        // cache that was just discarded held all of them.
+        // THROTTLED, not unconditional. A rebuild does lose every cached ECH
+        // config, so re-warming is right in principle — but this fires ~123 HEAD
+        // requests, and rebuilds are armed by ANY newly learned host, which now
+        // means roughly one per playback. MEASURED 2026-08-31: merges at 15:16
+        // and 15:28 each armed one, and shortly after the engine stopped
+        // constructing altogether ("CRONET LOST after having worked"), dropping
+        // the app to OkHttp with no QUIC and no ECH until it was force-stopped.
+        //
+        // The stream's OWN hosts are warmed per-play by warmHostsAwait, which is
+        // the warm that actually decides whether the next playback is protected.
+        // This bulk pass is a background nicety and can wait.
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastBulkPrewarmMs >= BULK_PREWARM_MIN_INTERVAL_MS) {
+            lastBulkPrewarmMs = now
+            prewarmed = false
+            BlueHiveApplication.appContext?.let { prewarmCdnDns(it) }
+        } else {
+            Log.e("scraper-vidapi",
+                "🔀 transport rebuilt — skipping bulk prewarm " +
+                "(${(now - lastBulkPrewarmMs) / 1000}s since the last one); " +
+                "this stream's hosts are warmed per-play")
+        }
+    }
+
+    /**
+     * Merge a backend-supplied host list into what this device already knows.
+     *
+     * MERGED, NEVER REPLACED. A device may have discovered a host the backend has
+     * not recorded yet — a rotation it met first, or an extraction that happened
+     * on another client — and overwriting would throw that away and make it pay
+     * discovery a second time.
+     *
+     * Does not rebuild the transport itself: this runs at app start, before any
+     * engine exists, so the hints are simply present when one is first built. The
+     * flag is set anyway so that if an engine somehow already exists, the next
+     * player teardown picks the new hosts up.
+     */
+    @Synchronized
+    fun mergeQuicHints(
+        context: Context,
+        hosts: Collection<String>,
+        withdraw: Collection<String> = emptyList(),
+    ) {
+        if (hosts.isEmpty() && withdraw.isEmpty()) return
+        val prefs = context.getSharedPreferences(QUIC_PREFS, Context.MODE_PRIVATE)
+        val known = prefs.getStringSet("hosts", emptySet()) ?: emptySet()
+        val clean = hosts.mapNotNull { it.trim().lowercase().ifBlank { null } }.toSet()
+
+        // WITHDRAWAL, because merging alone cannot fix a bad entry. Merge is
+        // additive on purpose — a device may know a host the backend has not met
+        // — but that also means a host once learned is kept forever, including
+        // one that CANNOT speak h3 and must never be hinted.
+        //
+        // MEASURED 2026-08-31: s1.piltover.li and s1.watami.win (Miruro) sat in
+        // this set from earlier merges. Every connection to them opened with a
+        // doomed QUIC handshake, and with the 1s broken-service delay Cronet
+        // retried it endlessly — segment reads timing out inside TsExtractor
+        // while curl pulled the same bytes at 3-9 MB/s. Filtering them out of the
+        // backend's list fixed nothing on a device that had already stored them.
+        //
+        // Only the backend withdraws, and only on positive evidence (a DNS answer
+        // with no h3). Absence from `hosts` is NOT a withdrawal.
+        val drop = withdraw.mapNotNull { it.trim().lowercase().ifBlank { null } }.toSet()
+        if (drop.isNotEmpty()) {
+            // Remembered, not just subtracted once. Any later path may re-add the
+            // host; learnedQuicHosts() filters against this on every read.
+            val blocked = prefs.getStringSet(NO_QUIC_KEY, emptySet()) ?: emptySet()
+            if (!blocked.containsAll(drop)) {
+                prefs.edit().putStringSet(NO_QUIC_KEY, blocked + drop).apply()
+            }
+        }
+        val merged = (known + clean) - drop
+        if (merged == known) return
+        prefs.edit().putStringSet("hosts", merged).apply()
+        pendingHintRebuild = true
+        val added = (clean - known).size
+        val removed = (known intersect drop).size
+        Log.e("scraper-vidapi",
+            "🔀 CDN hints: +$added, -$removed (${merged.size} known)" +
+            if (removed > 0) " — withdrew h2-only: ${(known intersect drop).joinToString()}" else "")
+    }
+
+    /** Hosts the backend has PROVEN cannot speak h3. Never hinted, never warmed. */
+    private const val NO_QUIC_KEY = "h2_only"
+
+    private fun noQuicHosts(context: Context): Set<String> =
+        context.getSharedPreferences(QUIC_PREFS, Context.MODE_PRIVATE)
+            .getStringSet(NO_QUIC_KEY, emptySet()) ?: emptySet()
+
+    /**
+     * Hosts learned so far, fed into the builder alongside the static seeds.
+     *
+     * FILTERED ON READ, which is the whole guarantee. THREE separate paths add
+     * hosts — the backend merge, ensureQuicHint on a newly met host, and
+     * warmHosts on an extraction's reported list — and subtracting only in the
+     * first was not enough. MEASURED 2026-08-31: the backend withdrew
+     * s1.watami.win at 14:57, and the next anime play put it straight back
+     * ("warmed 1/1 host(s) (1 new) ok=s1.watami.win") because warmHosts merges
+     * without a withdrawal list.
+     *
+     * Filtering here means it does not matter which path re-adds it: a host on
+     * the no-QUIC list can never reach addQuicHint. Storage may still carry the
+     * name; nothing reads it back.
+     */
+    private fun learnedQuicHosts(context: Context): Set<String> {
+        val prefs = context.getSharedPreferences(QUIC_PREFS, Context.MODE_PRIVATE)
+        val known = prefs.getStringSet("hosts", emptySet()) ?: emptySet()
+        val blocked = prefs.getStringSet(NO_QUIC_KEY, emptySet()) ?: emptySet()
+        return if (blocked.isEmpty()) known else known - blocked
     }
 
     /**
@@ -931,20 +2195,71 @@ object ExoPlayerConfig {
         client: OkHttpClient = okHttpClient(),
         context: Context? = null,
     ): DataSource.Factory {
-        val engine = context?.let { cronet(it) }
+        // ── OKHTTP CANNOT PLAY ON THIS LINE, SO NEVER REACH FOR IT QUIETLY ──
+        //
+        // MEASURED 2026-08-30 on "Bird Box". The manifest loaded over h3 at
+        // 15:22:56 with ECH; 43 seconds later the SAME host was severed four
+        // times, and the NetLog covering that exact window contains ZERO
+        // SSL_HANDSHAKE_ERROR events (31,377 of a 300,000 cap, so nothing was
+        // truncated). The stack trace says why:
+        //
+        //     androidx.media3.datasource.okhttp.OkHttpDataSource.open(...)
+        //     javax.net.ssl.SSLException: Unable to parse TLS packet header
+        //
+        // Those requests never went through Cronet at all. OkHttp has no QUIC and
+        // no ECH, so it puts the hostname on the wire in cleartext and the ISP
+        // filter severs it EVERY time. That is the whole of the "intermittency":
+        // on Cronet it works, on OkHttp it cannot.
+        //
+        // So a null engine is not a benign degradation here, it is a guaranteed
+        // relay. Retry once — engine construction has failed transiently before,
+        // notably after the leak that made cronet() return null for the rest of
+        // the process — and if it still fails, say so at Log.e, which is the one
+        // level release builds keep. Silence is what let this hide all day behind
+        // four different theories.
+        var engine = context?.let { cronet(it) }
+        if (engine == null && context != null) {
+            // TWO DIFFERENT SITUATIONS, and only one is survivable.
+            //
+            // Cronet has built before in this process -> a null engine is OUR bug
+            // (a teardown racing a rebuild, or the leak that once made cronet()
+            // return null for the rest of the process). Handing back OkHttp there
+            // is not graceful degradation, it is a guaranteed relay, because
+            // OkHttp cannot conceal a hostname. So retry rather than accept it.
+            //
+            // Cronet has NEVER built -> this device lacks a usable provider.
+            // OkHttp is then the only thing that plays at all, and a customer with
+            // extra relays beats a customer with a black screen.
+            repeat(3) { if (engine == null) engine = cronet(context) }
+            Log.e("scraper-vidapi", when {
+                engine != null ->
+                    "⚠️ Cronet was null — rebuilt on retry; QUIC/ECH intact"
+                cronetEverBuilt ->
+                    "⚠️ CRONET LOST after having worked — this is a bug, not a device " +
+                    "limit. Using OkHttp, which has no QUIC and no ECH: every filtered " +
+                    "host WILL be severed and relayed until the engine returns."
+                else ->
+                    "⚠️ CRONET NEVER AVAILABLE on this device — using OkHttp. Expect " +
+                    "relays on any ISP-filtered host; there is no client-side escape."
+            })
+        }
         val http: DataSource.Factory = if (engine != null) {
             androidx.media3.datasource.cronet.CronetDataSource.Factory(
                 engine, java.util.concurrent.Executors.newSingleThreadExecutor()
             )
                 .setUserAgent(userAgent)
                 .setDefaultRequestProperties(headers)
-                // A QUIC path that fails must not kill playback outright: fall
-                // back to the TCP stack for that request rather than erroring.
-                .setFallbackFactory(
-                    OkHttpDataSource.Factory(client)
-                        .setUserAgent(userAgent)
-                        .setDefaultRequestProperties(headers)
-                )
+                // NO setFallbackFactory HERE, DELIBERATELY — it was dead code.
+                // Media3's own source settles it: Factory(CronetEngine, Executor)
+                // does checkNotNull(cronetEngine), and createDataSource() consults
+                // a fallback ONLY when cronetEngine == null. With a live engine
+                // that branch is unreachable, so the call we used to make here had
+                // never once run.
+                //
+                // It still cost hours on 2026-08-30: it made the OkHttp requests in
+                // the logs look like a designed per-request retry, when the real
+                // OkHttp path is the `else` below — taken when cronet() returns
+                // null. Removing it so the next reader is not misled the same way.
         } else {
             OkHttpDataSource.Factory(client)
                 .setUserAgent(userAgent)
@@ -957,8 +2272,57 @@ object ExoPlayerConfig {
     }
 
     /** HLS media source from an m3u8 URL. */
+    /**
+     * Load-error policy that REFUSES TO FALL BACK ONTO A DIFFERENT RENDITION when
+     * the server refuses a request.
+     *
+     * WHY, MEASURED 2026-08-28 on Mushoku Tensei s1e6 while the freeze was live.
+     * Sampling four segments from each rung of the same master playlist:
+     *
+     *   640x360    800 kbps   200 403 403 403
+     *   1280x720  2800 kbps   200 403 200 200
+     *   1920x1080 5500 kbps   200 200 200 200
+     *
+     * The CDN serves the top rung correctly and the lower ones barely at all.
+     * Playback therefore starts fine on 1080p — FORCE_HIGHEST_BITRATE picks it —
+     * and dies later for a reason that looks like nothing to do with quality.
+     *
+     * THE TRAP IS THAT FORCING THE BITRATE DOES NOT PREVENT THIS. That is a
+     * PREFERENCE, applied when choosing among healthy tracks. The fallback that
+     * actually bites is error-driven: one transient failure on a 1080p segment
+     * makes the default policy blacklist that variant and switch to 720p, which
+     * is broken, which blacklists in turn and drops to 360p, which is worse. A
+     * single hiccup cascades into every rung exhausted and a fatal error, and the
+     * user sees a freeze minutes after the hiccup that caused it.
+     *
+     * Returning null from getFallbackSelectionFor says "do not exclude this
+     * track, do not switch" — so a refusal is retried on the rung that works
+     * instead of being escaped onto rungs that do not. Retry timing is left to
+     * the default policy, and MiruroPlayerActivity's cooldown still owns what
+     * happens once the retries are exhausted.
+     *
+     * NOT APPLIED TO progressiveMediaSource: a single-file source has no
+     * renditions to fall back between, so there is nothing for this to change.
+     */
+    private val noRenditionFallback = object : DefaultLoadErrorHandlingPolicy() {
+        override fun getFallbackSelectionFor(
+            fallbackOptions: LoadErrorHandlingPolicy.FallbackOptions,
+            loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo,
+        ): LoadErrorHandlingPolicy.FallbackSelection? {
+            val cause = loadErrorInfo.exception
+            if (cause is HttpDataSource.InvalidResponseCodeException &&
+                (cause.responseCode == 403 || cause.responseCode == 429 ||
+                 cause.responseCode == 401)) {
+                return null
+            }
+            return super.getFallbackSelectionFor(fallbackOptions, loadErrorInfo)
+        }
+    }
+
     fun hlsMediaSource(url: String, factory: DataSource.Factory): HlsMediaSource =
-        HlsMediaSource.Factory(factory).createMediaSource(MediaItem.fromUri(url))
+        HlsMediaSource.Factory(factory)
+            .setLoadErrorHandlingPolicy(noRenditionFallback)
+            .createMediaSource(MediaItem.fromUri(url))
 
     /**
      * Whole-file (non-segmented) source, for sources that hand back a video file
@@ -1007,9 +2371,32 @@ object ExoPlayerConfig {
         origin: String,
         extra: Map<String, String> = emptyMap(),
     ): Map<String, String> = buildMap {
+        // REFERER: SENT ONLY WHEN THE BACKEND SUPPLIES ONE. ORIGIN: NEVER.
+        //
+        // MEASURED 2026-08-30, per playlist level, from an unfiltered VPS:
+        //
+        //   source      master  variant  segment(bare)  segment(+Referer)
+        //   vidfast     200     200      200            200
+        //   vidnest     200     200      200            200
+        //   moviesapi   200     200      200            403
+        //   vidapi/vidspark/vidsrc  same as moviesapi
+        //
+        // So there is no single answer: the moviesapi family 403s a segment that
+        // carries a Referer, while vidfast tolerates one everywhere. The backend
+        // knows which source produced a manifest, so it decides — it returns an
+        // EMPTY referer for the hostile sources and a real one otherwise, and this
+        // simply honours what it is given.
+        //
+        // A BLANKET REMOVAL WAS TRIED FIRST AND WAS WRONG. Build 114 dropped the
+        // Referer for everyone on a measurement that covered master manifests and
+        // segments but NOT the variant playlists between them — and a vidfast
+        // variant (index-s720p-v1-a1.m3u8) then 403'd, relaying Django Unchained.
+        // Test every level of the playlist tree, not just the ends.
+        //
+        // ORIGIN stays gone unconditionally: it 403s vidfast segments AND the
+        // whole moviesapi family, and no source requires it.
         put("User-Agent", userAgent)
-        put("Referer", referer)
-        put("Origin", origin)
+        if (referer.isNotBlank()) put("Referer", referer)
         put("Accept", "*/*")
         put("Accept-Language", "en-US,en;q=0.9")
         putAll(extra)

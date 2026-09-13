@@ -962,7 +962,18 @@ fun HistoryScreen(profileId: Int = -1, refreshTrigger: Int = 0) {
 
                     if (selectedGenre != "All Content") {
                         items = items.filter { item ->
-                            val genresJson = item.genres ?: return@derivedStateOf emptyList()
+                            // return@filter, NOT return@derivedStateOf. `filter` is
+                            // inline, so a label on the outer block returns from the
+                            // WHOLE derivedStateOf — one row with null genres made the
+                            // entire filtered list empty, not just dropped that row.
+                            //
+                            // Null is routine, not exceptional: the backend builds
+                            // genres with json_agg over a LEFT JOIN, which yields SQL
+                            // NULL for any watched title missing from media_items or
+                            // carrying no genre mappings. So picking any genre could
+                            // blank the screen while matching titles existed, with no
+                            // error and nothing in the log.
+                            val genresJson = item.genres ?: return@filter false
                             try {
                                 val arr = org.json.JSONArray(genresJson)
                                 (0 until arr.length()).any { i ->
@@ -1018,7 +1029,16 @@ fun HistoryScreen(profileId: Int = -1, refreshTrigger: Int = 0) {
                     listState.scrollToItem(0)
                 }
 
-                LaunchedEffect(listState, hasMore, isLoadingMore) {
+                // KEYED ON listState ALONE. hasMore and isLoadingMore are read
+                // INSIDE the snapshotFlow below, which is what makes this reactive to
+                // them — naming them as keys as well was not redundant, it was fatal:
+                // the collector sets isLoadingMore = true before awaiting the request,
+                // that write invalidated this scope, Compose disposed the effect and
+                // cancelled the in-flight call about a frame after it started. The
+                // finally flipped the key back, snapshotFlow re-emitted immediately,
+                // and it fired again — so History never got past the first 50 rows
+                // while the box streamed started-then-aborted HTTP calls.
+                LaunchedEffect(listState) {
                     snapshotFlow {
                         val layoutInfo = listState.layoutInfo
                         val lastVisible = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
@@ -1036,6 +1056,13 @@ fun HistoryScreen(profileId: Int = -1, refreshTrigger: Int = 0) {
                                 historyItems.addAll(next)
                                 currentOffset += next.size
                                 hasMore = next.size == pageSize
+                            } catch (e: kotlinx.coroutines.CancellationException) {
+                                // Never swallow this. A cancellation means the screen
+                                // is going away, not that the network failed — and
+                                // catching it here is what made the self-cancelling
+                                // loop above report "Failed to load more", blaming the
+                                // network for a bug in the effect's keys.
+                                throw e
                             } catch (e: Exception) {
                                 android.util.Log.e("HistoryScreen", "Failed to load more: ${e.message}")
                             } finally {

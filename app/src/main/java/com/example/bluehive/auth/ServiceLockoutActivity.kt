@@ -136,6 +136,16 @@ class ServiceLockoutActivity : ComponentActivity() {
 }
 
 
+/**
+ * How often this screen re-asks while it is open.
+ *
+ * Short because the thing being waited on is a host that may take a minute or
+ * two to re-mint after a backend outage, and the user has nothing to do but
+ * stare at the screen meanwhile. Long enough that it is one cheap local provider
+ * read per tick, not a network poll.
+ */
+private const val RECHECK_INTERVAL_MS = 20_000L
+
 @Composable
 private fun ServiceLockoutScreen(onRestored: () -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -151,12 +161,50 @@ private fun ServiceLockoutScreen(onRestored: () -> Unit) {
         if (stillDown) { delay(5_000); stillDown = false }
     }
 
-    // If the standing flips back while this screen is open — the host pushes and
-    // the relay re-reports without anyone pressing anything — leave on our own.
+    // Only ever fires on the transition INTO locked, so there is nothing to do:
+    // we are already here. Kept because the registration is what stops a second
+    // lock event stacking another screen.
+    //
+    // THIS IS NOT AN AUTOMATIC WAY OUT, and it never was. An earlier comment here
+    // claimed the screen leaves by itself once standing is restored; it cannot,
+    // because HostEntitlementRelay posts `if (locked)` and there has never been an
+    // unlock signal to listen for. The polling effect below is the real one.
     DisposableEffect(Unit) {
         val listener: () -> Unit = { /* locked again: already here, nothing to do */ }
         EntitlementLockBus.register(listener)
         onDispose { EntitlementLockBus.unregister(listener) }
+    }
+
+    // ASK AGAIN, ON OUR OWN, FOR AS LONG AS THIS SCREEN IS UP.
+    //
+    // Until this existed the button was the only way off this screen — and the
+    // button only succeeds once the HOST has re-minted its assertion, which lags
+    // the backend coming back by however long the host takes to notice. A user
+    // who pressed during that window was told the service was still down and
+    // reasonably concluded the app was broken, then had no reason to press again
+    // at the moment it would have worked.
+    //
+    // recheckNow reads the host's provider, which also WAKES the host if Android
+    // reaped it — so this poll is not merely watching, it is prodding the very
+    // component that has to act. Twenty seconds is frequent enough that recovery
+    // feels immediate and far too slow to matter as load: it is one content
+    // provider read against an app on the same device.
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(RECHECK_INTERVAL_MS)
+            // Don't race a press that is already in flight; it is the same call.
+            if (checking) continue
+            val standing = withContext(Dispatchers.IO) {
+                HostEntitlementRelay.recheckNow(context)
+            }
+            // Same rule as the button: anything short of a definite "inactive"
+            // lets them back in, INCLUDING a null. A poll that cannot reach the
+            // host must never be the reason someone stays locked out.
+            if (standing != HostEntitlementRelay.STANDING_INACTIVE) {
+                onRestored()
+                return@LaunchedEffect
+            }
+        }
     }
 
     LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }

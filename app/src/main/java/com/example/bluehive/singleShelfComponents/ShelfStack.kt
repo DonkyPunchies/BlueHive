@@ -92,8 +92,23 @@ private const val PEEK_ALPHA_BELOW = 1f
 // REAPPEAR_DELAY: gap after a shelf change before the title fades back in.
 // FADE_IN_DURATION: length of the alpha 0->1 fade once it starts.
 // Snap-out is always instant.  Spamming UP/DOWN keeps the title hidden.
-private const val HEADER_REAPPEAR_DELAY_MS   = 1_500L
-private const val HEADER_FADE_IN_DURATION_MS = 2_000
+//
+// THESE TWO ADD UP, which is what made the title feel absent rather than slow:
+// 1500ms of nothing, then a 2000ms fade, is 3.5 SECONDS before the row you are
+// already looking at tells you what it is. The fade was also slow enough to sit
+// at low alpha for most of its run, so the title read as a smudge for a second
+// before becoming legible.
+//
+// The delay still exists and still does its job -- holding UP/DOWN never flashes
+// a title -- it just settles at the speed a person changes rows rather than the
+// speed they change their mind.
+//
+// The fade sits a little above the 350ms row cross-fade below, so the title
+// arrives just after the rows settle rather than exactly with them. Landing
+// together read as abrupt; trailing slightly reads as the title following the
+// move.
+private const val HEADER_REAPPEAR_DELAY_MS   = 220L
+private const val HEADER_FADE_IN_DURATION_MS = 900
 
 
 @Composable

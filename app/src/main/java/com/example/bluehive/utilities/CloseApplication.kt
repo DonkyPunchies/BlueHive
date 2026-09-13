@@ -184,7 +184,45 @@ fun CloseApplicationHandler(
  *    re-routing back to ProfileScreenActivity (which would restart the SSE
  *    stream and re-occupy the device slot).
  */
-private fun performClose(activity: android.app.Activity) {
+/**
+ * THE ONE WAY OUT. Also called from BlueHiveApplication's idle-close handler, so
+ * a timed shutdown and a Back-button close take an identical path — the stream
+ * latch, the end-session ping and the timing notes below apply to both. A second
+ * teardown route would drift from this one, and both would be load-bearing.
+ */
+internal fun performClose(
+    /**
+     * The Activity whose task should be finished, or null when there is none.
+     *
+     * NULLABLE FOR THE BACKGROUND IDLE CLOSE, and only for it. Both user-driven
+     * callers always have an Activity — they are literally running inside one.
+     * The idle close is different: after four hours the app has almost always
+     * been backgrounded by a screensaver, every Activity is stopped, and the
+     * reference BlueHiveApplication tracks for the foreground one has been
+     * cleared on pause. Requiring an Activity there meant the close could not
+     * fire in the exact situation it exists for.
+     *
+     * With null we skip finishAffinity() and go straight to killing the process.
+     * That is safe HERE and nowhere else: the task dies with the process anyway,
+     * and the usual objection — that Android restores a task whose activities
+     * were still live, which reads as a crash-and-reopen — needs a user who is
+     * looking at the app. After four idle hours behind a screensaver there is
+     * nobody to mislead, and the next launch is a deliberate one.
+     */
+    activity: android.app.Activity?,
+    /**
+     * Also end the OS process once the task is gone.
+     *
+     * FALSE FOR THE BACK BUTTON. finishAffinity() alone leaves the process warm,
+     * and someone who just backed out may well come straight back in — killing it
+     * would buy nothing and cost them a cold start.
+     *
+     * TRUE FOR THE IDLE CLOSE, where the process living on is the actual problem:
+     * four hours of accumulated Coil caches, GeckoView helper processes and bitmap
+     * history on a 2GB box, and nothing about to reuse any of it.
+     */
+    killProcess: Boolean = false,
+) {
     // Step 1 — stop stream and block any future start() calls this process.
     DeviceEventStream.stopAndMarkExited()
 
@@ -205,8 +243,26 @@ private fun performClose(activity: android.app.Activity) {
         } catch (e: Exception) {
             Log.w("CloseApplication", "end-session ping failed (reaper backstop): ${e.message}")
         } finally {
-            withContext(Dispatchers.Main) {
-                activity.finishAffinity()
+            // Guarded rather than forced: see the parameter doc. A null Activity
+            // is the background idle close, where there is no task worth finishing
+            // because the process is about to end anyway.
+            activity?.let { act ->
+                withContext(Dispatchers.Main) {
+                    runCatching { act.finishAffinity() }
+                        .onFailure { Log.w("CloseApplication", "finishAffinity failed: ${it.message}") }
+                }
+            }
+            if (killProcess) {
+                // AFTER finishAffinity, never before. Killing with activities still
+                // in the stack lets Android restore the task on next launch, which
+                // reads to the user as a crash-and-reopen; with the stack cleared
+                // there is nothing to restore and the next launch is a clean start.
+                //
+                // Also after the end-session ping above has had its turn — this
+                // whole block is inside the finally that follows it, so the slot is
+                // already released (or its 2s timeout has expired) before we go.
+                Log.i("CloseApplication", "idle close — ending process to release memory")
+                android.os.Process.killProcess(android.os.Process.myPid())
             }
         }
     }

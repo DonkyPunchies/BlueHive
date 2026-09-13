@@ -300,10 +300,22 @@ fun HomeScreenSidebarCompose(
 
 
             // ========================================
-            // BLUE HIGHLIGHT BACKGROUNDS (hidden while searching)
+            // BLUE HIGHLIGHT BACKGROUNDS
             // ========================================
             menuItems.forEachIndexed { index, item ->
-                if (index == selectedIndex && !isSearchActive) {
+                // NOT gated on isSearchActive.
+                    //
+                    // This highlight follows selectedIndex, not focus. While the
+                    // search overlay is open the sidebar has genuinely lost focus
+                    // to the keyboard, but the user is still *in* Search Bar --
+                    // which is why the sidebar stays expanded rather than
+                    // collapsing (see the isSearchActive checks on the expand and
+                    // cover layers). Dropping the pill there contradicted every
+                    // other cue on the same row: the label stays white, bold, 13sp
+                    // and scaled up throughout, so the row went on announcing it
+                    // was selected while the one thing that made that legible
+                    // disappeared.
+                    if (index == selectedIndex) {
                     val yOffset = (index * 35).dp
 
                     Box(

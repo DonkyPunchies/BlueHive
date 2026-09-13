@@ -7,6 +7,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.lifecycle.lifecycleScope
 import com.example.bluehive.update.SelfUpdateActivity
+import com.example.bluehive.update.UpdateGate
 import com.example.bluehive.update.UpdateManager
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -155,31 +156,41 @@ class AuthActivity : ComponentActivity() {
         // broken by an explicit extra instead — without it, a device that fails
         // to install would check, route to the updater, fail, come back, and
         // check again forever.
-        val skipUpdate = intent?.getBooleanExtra(EXTRA_SKIP_UPDATE_CHECK, false) ?: false
+        // Read for its side effect on the gate, not for a branch here. When the
+        // updater hands control back it sets this, and the gate must not turn
+        // straight round and route to the updater again on the next home screen.
+        if (intent?.getBooleanExtra(EXTRA_SKIP_UPDATE_CHECK, false) == true) {
+            UpdateGate.suppressNext()
+        }
 
+        // ── NO UPDATE CHECK HERE ANY MORE ───────────────────────────────────
+        //
+        // It used to be the first thing on this path: a blocking HTTP call that
+        // had to finish before the app would route anywhere. MEASURED on real
+        // hardware, it failed in two ways at once.
+        //
+        //   * It timed out on 4 of 6 cold launches and silently left the device
+        //     on the old version. The budget had to stay small BECAUSE it blocked
+        //     the launch, and no value fixes that: larger misses fewer updates but
+        //     lengthens the wait in front of an undrawn window; smaller does the
+        //     reverse.
+        //
+        //   * It raced ProcessLifecycleOwner.onStart, which checked at the same
+        //     moment on the same cold start. Both found the update and both
+        //     launched the updater with NEW_TASK|CLEAR_TASK — flags that target
+        //     the caller's own task. The second tore down the task the first had
+        //     just rooted, so nothing drew and 163MB downloaded behind a screen
+        //     that still showed the TV launcher.
+        //
+        // UpdateGate owns this now, hooked to HomeScreenCompose.onResume the way
+        // HostEntitlementRelay is. Off the launch path nothing waits on the
+        // network, and there is exactly one checker, so neither failure is
+        // reachable.
+        //
+        // EXTRA_SKIP_UPDATE_CHECK is still read above and still honoured — it is
+        // what SelfUpdateActivity sets when handing control back, and UpdateGate
+        // reads it through rearm()/routed rather than through this intent.
         lifecycleScope.launch {
-            if (!skipUpdate) {
-                val update = try {
-                    UpdateManager.checkForUpdate()
-                } catch (e: Exception) {
-                    // Never block launch on the update channel being unreachable.
-                    Log.w(TAG, "Update check failed: ${e.message}")
-                    null
-                }
-                if (update != null) {
-                    Log.i(TAG, "Update available -> ${update.latestVersionCode}")
-                    startActivity(Intent(this@AuthActivity, SelfUpdateActivity::class.java).apply {
-                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
-                        putExtra(SelfUpdateActivity.EXTRA_VERSION_CODE, update.latestVersionCode)
-                        putExtra(SelfUpdateActivity.EXTRA_VERSION_NAME, update.latestVersionName)
-                        putExtra(SelfUpdateActivity.EXTRA_APK_URL, update.apkUrl)
-                        putExtra(SelfUpdateActivity.EXTRA_SHA256, update.sha256)
-                    })
-                    finish()
-                    return@launch
-                }
-            }
-
             // Decided BEFORE any UI is composed so a signed-in user never sees a
             // flash of the sign-in form.
             if (!session.refreshToken.isNullOrBlank()) {

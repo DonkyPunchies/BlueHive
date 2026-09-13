@@ -74,6 +74,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.wrapContentSize
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.ColorMatrix
 import androidx.compose.animation.AnimatedVisibility
@@ -89,11 +90,20 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.IntOffset
+import com.example.bluehive.utilities.PlaybackSettingsOverlay
+import com.example.bluehive.utilities.BrowserCornerButton
+import com.example.bluehive.utilities.BROWSER_BUTTON_MARGIN
+import com.example.bluehive.utilities.PlaybackPrefs
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.focus.focusProperties
 import com.example.bluehive.api.ApiClient
+import com.example.bluehive.api.ExtractOutcome
 import com.example.bluehive.api.FavoriteRequest
 import com.example.bluehive.sidebarComponents.FavoritesScreenActivity
 import com.example.bluehive.sidebarComponents.HistoryScreenActivity
@@ -118,6 +128,7 @@ import com.example.bluehive.auth.SessionManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.android.awaitFrame
 import kotlinx.coroutines.withContext
+import com.example.bluehive.api.extractStreamAwait
 
 
 // ⬅️➡️ Hold-to-repeat navigation speed for the episode LazyRow: the minimum time (ms)
@@ -529,6 +540,16 @@ internal fun extractionErrorMessage(
     reason == "timeout" ->
         "$sourceName took too long to respond.\n\nTry again, or pick another source."
 
+    // The manifest loaded and its segments are dead — the source has a broken
+    // copy. MEASURED 2026-08-30: MoviesAPI served Jeepers Creepers as a playlist
+    // whose every segment 403'd, verified dead from an unfiltered datacenter IP,
+    // while VidFast served the same title perfectly. "Couldn't load" would send
+    // someone hunting for a network problem that is not there; the title is fine
+    // and another source has it.
+    reason == "dead_segments" ->
+        "$sourceName has a broken copy of this $unit.\n\nTry another source — " +
+            "the $unit itself is fine."
+
     else ->
         "Couldn't load this $unit from $sourceName.\n\nTry another source."
 }
@@ -574,6 +595,11 @@ internal fun animeRelayUrl(
 
 internal fun usesBackendExtraction(sourceName: String): Boolean =
     sourceName.equals("VidFast", true) ||
+        // VidLove — MUST be listed, for the same reason spelled out for MoviesAPI
+        // below: without it the button falls through to the raw Gecko embed,
+        // losing the relay and keeping a browser engine resident for the whole
+        // title, which is what OOM-kills the 2 GB box.
+        sourceName.equals("VidLove", true) ||
         // VidEasy is no longer listed on EITHER screen (VidNest replaced it on TV,
         // VidSpark on movies). Kept matched so an older build's source list, or a
         // future re-listing, still routes to the backend rather than silently
@@ -614,6 +640,28 @@ private fun getStreamingSources(
                 "VidNest",
                 "https://vidnest.fun/tv/$mediaId/$seasonNumber/$episodeNumber"
             ),
+            // VidLove — added 2026-08-30 as the second source, beside VidNest. Backend-extracted:
+            // "VidLove" is listed in usesBackendExtraction and keyed as "vidlove"
+            // in the backend's _SOURCES, and the URL shape here MUST match that
+            // template exactly or the two request different pages.
+            //
+            // PLACED BESIDE VIDNEST DELIBERATELY. Both pass the ISP filter
+            // with cleartext SNI (verified 2026-08-30: a2.shows.st and
+            // tiktoks.animanga.fun return certificates, moon.peakstorm.top and
+            // finalroom.top are severed), and neither appears in
+            // relay_sessions at all — while moon.peakstorm.top alone accounts
+            // for 22 of the last 24 hours' 34 relays. Order is the cheapest
+            // lever on relay volume, so the two clean sources lead.
+            //
+            // Verified before listing: both endpoints extract (movie 27205 and
+            // tv 1396 S1E1), and its CDNs a2.shows.st / d.shows.st both publish
+            // ECH with alpn=h3 — so it is covered by the QUIC/ECH path rather
+            // than relying on the relay.
+            TVShowsDetailsScreenCompose.StreamingSource(
+                "Nectar Stream",
+                "VidLove",
+                "https://player.vidlove.cc/embed/tv/$mediaId/$seasonNumber/$episodeNumber"
+            ),
             TVShowsDetailsScreenCompose.StreamingSource(
                 "Queen Stream",
                 "VidFast",
@@ -623,17 +671,13 @@ private fun getStreamingSources(
                 "Purple Stream",
                 "MoviesAPI",
                 "https://moviesapi.to/tv/$mediaId/$seasonNumber/$episodeNumber"
-            ),
-            TVShowsDetailsScreenCompose.StreamingSource(
-                "Swarm Stream",
-                "VidSrc",
-                "https://vidsrc.mov/embed/tv/$mediaId/$seasonNumber/$episodeNumber"
-            ),
-            TVShowsDetailsScreenCompose.StreamingSource(
-                "Honeycomb",
-                "VidApi",
-                "https://vaplayer.ru/embed/tv/$mediaId/$seasonNumber/$episodeNumber"
             )
+            // VidSrc (\"Swarm Stream\") and VidApi ("Honeycomb") were removed on
+            // 2026-08-30 at the user's request. Both still work server-side — the
+            // 403s that made them look broken were our own Referer/Origin headers,
+            // fixed the same day — so this is a menu decision, not a capability
+            // one. Re-adding them is just restoring the entries; usesBackendExtraction
+            // already matches both names.
         )
         else -> emptyList()
     }
@@ -789,6 +833,11 @@ fun TVShowsDetailsScreenContent(
     val passionFont = AppTypography.passionRegular
     val dongleRegular = AppTypography.dongleRegular
     val context = LocalContext.current
+
+    // Playback settings are per profile. Re-reading on entry is how a
+    // profile switch mid-session is picked up; it no-ops when the profile
+    // has not changed, so this costs nothing on a normal navigation.
+    LaunchedEffect(Unit) { PlaybackPrefs.load(context) }
     val app = context.applicationContext as? BlueHiveApplication
     val prefetch = remember(tmdbId) { app?.consumePrefetch(tmdbId) }
 
@@ -837,6 +886,26 @@ fun TVShowsDetailsScreenContent(
 
     // ✅ Add state for extras toggle and recommendations
     var isExtrasToggled by remember(startInExtras) { mutableStateOf(startInExtras) }
+
+    // ── Back collapses Extras before it leaves the page ─────────────────────
+    //
+    // Pressing back while the recommendations row is showing returns to the
+    // normal state; a second press then leaves, which is what "back" means
+    // everywhere else — undo the last thing you did, not the whole journey.
+    //
+    // DELIBERATELY REGISTERED HERE, above the overlay handlers further down.
+    // OnBackPressedDispatcher runs the MOST RECENTLY added enabled callback, and
+    // Compose adds them in composition order — so anything declared below this
+    // (the server picker, the extraction guard) still wins while it is open. Put
+    // this last and back would collapse Extras out from under an open overlay.
+    //
+    // When disabled it does not intercept at all, so back falls through to the
+    // Activity's own callback and the page closes exactly as before.
+    BackHandler(enabled = isExtrasToggled) {
+        BlueHiveApplication.playBackOutSound()
+        isExtrasToggled = false
+    }
+
     var recommendations by remember { mutableStateOf<List<MediaItem>>(emptyList()) }
     val coroutineScope = rememberCoroutineScope()
     var blockHeaderInitialFocus by remember(startInExtras) {
@@ -947,11 +1016,65 @@ fun TVShowsDetailsScreenContent(
     var hasTrailerBeenPlayed by remember { mutableStateOf(false) }
     var shouldExtractTrailer by remember { mutableStateOf(false) }
 
+    /**
+     * Silence the backdrop trailer, then record the episode being watched.
+     *
+     * EVERY PLAYBACK LAUNCH ON THIS SCREEN GOES THROUGH HERE, and that is the
+     * point: the reset used to be missing entirely, so starting a trailer and
+     * then picking an episode left the trailer playing UNDERNEATH the stream for
+     * the whole episode. Nothing arbitrates audio focus anywhere in this app
+     * (no requestAudioFocus / AudioManager in the tree), so the two genuinely
+     * mix, and a second ExoPlayer stays allocated behind the stream player — on
+     * a 2GB box that is the shape of thing that has OOM-killed us before.
+     *
+     * The movies screen has always reset both flags inline at each of its five
+     * launch sites. This screen has five launch sites too and reset at none of
+     * them. Wrapping rather than copying that pattern means a sixth path cannot
+     * quietly forget: onEpisodeSelected is what a launch path must call anyway.
+     *
+     * DetailsTrailerPlayer keys its play/pause off isPlaying, so clearing the
+     * flag stops playback; hasTrailerBeenPlayed hides the player view so the
+     * backdrop image returns.
+     */
+    fun stopTrailerAndSelectEpisode(season: Int, episode: Int, epName: String?) {
+        isTrailerPlaying = false
+        hasTrailerBeenPlayed = false
+        onEpisodeSelected(season, episode, epName)
+    }
+
     // Focus requesters
     // Focus requesters
     val favoriteFocusRequester = remember { FocusRequester() }
     val extrasFocusRequester = remember { FocusRequester() }
     val trailerFocusRequester = remember { FocusRequester() }
+
+    // The bottom-right browser button. Two routes lead to it -- DOWN off an
+    // episode tile, and RIGHT off a right-column provider button -- and both
+    // were dead ends that consumed the key and went nowhere.
+    val browserFocusRequester = remember { FocusRequester() }
+
+    // The playback-settings overlay the browser button opens.
+    var showPlaybackSettings by remember { mutableStateOf(false) }
+
+    // Anime shows never get the browser button. Their DuB/SuB buttons go through
+    // the Miruro flow, which has no ExoPlayer-vs-website fork at all -- the
+    // setting the button opens would have nothing to act on, so offering it
+    // would be a control that visibly does nothing.
+    val isAnimeTitle = remember(genres, originalLanguage) {
+        isJapaneseAnimation(genres, originalLanguage)
+    }
+
+    // How to get BACK out. Set by whichever route just handed focus over, read
+    // by the button's LEFT/UP. A plain holder rather than state: nothing draws
+    // from it, so writing it must not recompose the screen.
+    val browserReturnFocus = remember { arrayOfNulls<(() -> Unit)>(1) }
+
+    /** Hand focus to the corner button, remembering the way back. */
+    fun focusBrowserButton(returnTo: () -> Unit) {
+        browserReturnFocus[0] = returnTo
+        BlueHiveApplication.playHoverSound()
+        browserFocusRequester.requestFocus()
+    }
 
     // Set true by the focused episode tile's onFocusChanged (see Edit 3).
     // Lets the initial-focus effect below confirm focus actually landed
@@ -1059,6 +1182,21 @@ fun TVShowsDetailsScreenContent(
     //  right episode itself — we just feed it the URL like the movie screen does.
     // ════════════════════════════════════════════════════════════════════════
     var isExtracting   by remember { mutableStateOf(false) }
+
+    // ── BACK during an extraction ───────────────────────────────────────
+    //
+    // Two pieces, and BOTH are needed. The job handle lets BACK stop the
+    // client's polling loop. The flag is what actually prevents the launch:
+    // the extraction is wrapped in runCatching, which CATCHES the
+    // CancellationException, so a cancelled coroutine still falls through to
+    // `body == null` and would raise the failure modal. Cancelling alone
+    // fixes the wasted requests and none of the user-visible damage.
+    //
+    // Without this, pressing BACK hid the overlay but the coroutine ran on —
+    // up to ExtractAwait.DEADLINE_MS (120s) — and then launched the player or
+    // threw a full-screen error over whatever the user had moved on to.
+    var extractJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    var extractCancelled by remember { mutableStateOf(false) }
     var extractStage   by remember { mutableIntStateOf(0) }
     var extractPending by remember { mutableStateOf(false) }
     var showNoDub      by remember { mutableStateOf(false) }
@@ -1157,6 +1295,7 @@ fun TVShowsDetailsScreenContent(
     // deduplicates concurrent requests, so a second attempt from the client would
     // just re-ask for the same cached answer.
     suspend fun extractAndPlay(src: TVShowsDetailsScreenCompose.StreamingSource) {
+        extractCancelled = false
         isExtracting     = true
         isVidFastExtract = true
         extractPending   = true
@@ -1170,7 +1309,7 @@ fun TVShowsDetailsScreenContent(
 
         val startedAt = System.currentTimeMillis()
         val result = runCatching {
-            ApiClient.bluehiveApi.extractStream(
+            ApiClient.bluehiveApi.extractStreamAwait(
                 type    = "tv",
                 tmdbId  = tmdbId,
                 season  = pendingSeason,
@@ -1191,6 +1330,13 @@ fun TVShowsDetailsScreenContent(
         isVidFastExtract = false
         extractPending   = false
         vidFastStatus    = ""
+
+        // The user left. Do not raise an error and do not start a player over
+        // whatever they are looking at now.
+        if (extractCancelled) {
+            Log.d("scraper-vidfast", "extraction finished after BACK — discarding result")
+            return
+        }
 
         val body = result.getOrNull()?.takeIf { it.isSuccessful }?.body()
         if (body == null || body.m3u8.isBlank()) {
@@ -1226,6 +1372,7 @@ fun TVShowsDetailsScreenContent(
                 // it; sending the manifest's own host 403s every segment while
                 // extraction still looks like it worked.
                 .putExtra("REFERER", body.referer)
+                .putExtra("IS_HLS", body.isHls ?: true)
                 .putExtra("UA", body.user_agent)
                 .putExtra("TMDB_ID", tmdbId)
                 // Blank ON PURPOSE: there is no on-device extractor for VidFast any
@@ -1251,6 +1398,22 @@ fun TVShowsDetailsScreenContent(
                 .putExtra("SUBTITLE_URL",   body.subtitle_url)
         )
     }
+
+    /**
+     * Start the built-in player path for a backend-extracted source.
+     *
+     * Declared once and called from BOTH the prompt's "Watch on ExoPlayer"
+     * button and the skip-the-prompt path. Turning the prompt off has to do
+     * exactly what pressing its default button did -- if these were two copies
+     * of the same five lines, the setting would slowly stop being a shortcut and
+     * start being a second, subtly different behaviour.
+     */
+    fun startBuiltInPlayer(src: TVShowsDetailsScreenCompose.StreamingSource) {
+        stopTrailerAndSelectEpisode(pendingSeason, pendingEpisode, pendingEpisodeName)
+        try { BlueHiveApplication.coilImageLoader.memoryCache?.clear() } catch (_: Exception) {}
+        extractJob = coroutineScope.launch { extractAndPlay(src) }
+    }
+
 
     // Server lists captured during a DEFAULT extraction, cached for the lifetime
     // of this detail screen. Keyed by url + audio (url carries ?ep=, so each
@@ -1316,6 +1479,9 @@ fun TVShowsDetailsScreenContent(
     // play picks it up instantly.
     BackHandler(enabled = isExtracting || extractPending) {
         Log.d("scraper-vidfast", "↩️ back during extraction — dismissing overlay")
+        extractCancelled      = true
+        extractJob?.cancel()
+        extractJob            = null
         isVidFastExtract = false
         vidFastStatus    = ""
         extractPending   = false
@@ -1419,6 +1585,15 @@ fun TVShowsDetailsScreenContent(
                     .putExtra("EPISODE_NUMBER", pendingEpisode)
                     .putExtra("EPISODE_NAME",   pendingEpisodeName)
                     .putExtra("SOURCE_NAME",    if (pendingDub) "Miruro (Dub)" else "Miruro (Sub)")
+                    // Carried so a mid-episode token expiry can re-extract the SAME
+                    // track — see MoviesDetailsScreenCompose for the measurement that
+                    // made this necessary.
+                    .putExtra("AUDIO",          if (pendingDub) "dub" else "sub")
+                    // Same provider on a refetch as this playback started on. triedName is
+                    // the manually chosen server when there was one, else the default
+                    // resolved to its real name — see MoviesDetailsScreenCompose for why
+                    // null is not good enough.
+                    .putExtra("SERVER",         triedName)
             )
             // NOTE: watch history is deliberately NOT logged here any more. It used
             // to fire the moment extraction succeeded, which marked an episode
@@ -1492,7 +1667,50 @@ fun TVShowsDetailsScreenContent(
     // Default-server extract (server == null). The 200ms delay lets the button
     // press animation finish before the loading overlay appears.
     /**
-     * Anime via the BACKEND extractor. Returns true if playback started.
+     * Make sure the provider list for this episode and TRACK is cached.
+     *
+     * TWO CALLERS, TWO REASONS.
+     *
+     * The dub failover below is only as good as the list it picks from, and on
+     * the "Default server" path there is no list: nothing has opened the picker,
+     * so serverListCache is empty and pickNextServer returns null on the first
+     * ask. That is the exact path this whole failover exists for.
+     *
+     * The play path calls it for whichever track actually played, so that
+     * backing out of the player and opening "Choose a server" finds the list
+     * already here instead of showing a spinner. It used to be dub-only, which
+     * left every sub viewer paying for an enumerate the moment they went looking
+     * for a different provider.
+     *
+     * CHEAP NOW IN A WAY IT WAS NOT BEFORE. /api/extract/servers used to mean a
+     * second browser run loading the same Miruro page just to read a listbox.
+     * The extractor now harvests that list during the extraction itself and the
+     * API caches it, so on the play path this is a cache hit — one HTTP round
+     * trip, no browser.
+     *
+     * Idempotent, and silent on failure: a missing list means no failover and a
+     * picker that fetches its own, which is where we already were.
+     */
+    suspend fun ensureServerList(url: String, dub: Boolean) {
+        if (serverListCache[serverCacheKey(url, dub)] != null) return
+        val list = runCatching {
+            ApiClient.bluehiveApi.extractServers(
+                type    = "tv",
+                tmdbId  = tmdbId,
+                season  = pendingSeason,
+                episode = pendingEpisode,
+                audio   = if (dub) "dub" else "sub",
+                device  = SessionManager.get().deviceFingerprint,
+            )
+        }.getOrNull()?.takeIf { it.isSuccessful }?.body() ?: return
+        val opts = list.servers.map { ServerOption(it.name, emptyList()) }
+        if (opts.isEmpty()) return
+        serverListCache[serverCacheKey(url, dub)] =
+            opts to list.servers.indexOfFirst { it.is_default }.coerceAtLeast(0)
+    }
+
+    /**
+     * Anime via the BACKEND extractor.
      *
      * DEFAULT PATH ONLY — sub, default server. Those are the two things the
      * backend's generic load-and-nudge run cannot express: dub needs the Language
@@ -1509,11 +1727,17 @@ fun TVShowsDetailsScreenContent(
      * tmdb -> AniList itself via /api/anime/resolve (AniBridge primary, Fribb
      * fill-in, multi-cour seasons reconstructed). Sending a URL would fork that
      * mapping into two places.
+     *
+     * @param acceptAnyTrack play whatever came back even if it is the wrong
+     *        track. Set only by the caller AFTER every dub server has been
+     *        tried, so a dub request ends in sub audio rather than a black
+     *        screen — labelled Sub, because that is what it is.
      */
     suspend fun extractAnimeViaBackend(dub: Boolean = false,
-                                       server: String? = null): Boolean {
+                                       server: String? = null,
+                                       acceptAnyTrack: Boolean = false): ExtractOutcome {
         val body = runCatching {
-            ApiClient.bluehiveApi.extractStream(
+            ApiClient.bluehiveApi.extractStreamAwait(
                 type    = "tv",
                 tmdbId  = tmdbId,
                 season  = pendingSeason,
@@ -1534,7 +1758,19 @@ fun TVShowsDetailsScreenContent(
             )
         }.getOrNull()?.takeIf { it.isSuccessful }?.body()
 
-        if (body == null || body.m3u8.isBlank()) return false
+        if (body == null || body.m3u8.isBlank()) return ExtractOutcome.MISS
+
+        // A dub request the site quietly served as sub. The manifest is real, so
+        // every other check passes — this is the only place it can be caught, and
+        // only since ExtractResponse started carrying the track it produced. A
+        // null `audio` is an older backend: unknowable, so treat it as it was.
+        val wrongTrack = dub && body.audio?.equals("dub", ignoreCase = true) == false
+        if (wrongTrack && !acceptAnyTrack) {
+            Log.e("scraper", "🎧 asked for dub, backend returned '${body.audio}'" +
+                    " (server=${server ?: "default"}) — not playing it yet")
+            return ExtractOutcome.WRONG_TRACK
+        }
+        val playingDub = dub && !wrongTrack
 
         Log.d("scraper", "M Extract (backend audio=${if (dub) "dub" else "sub"}" +
                 "${server?.let { " server=$it" } ?: ""}) → ${body.m3u8.take(60)} cached=${body.cached}")
@@ -1546,6 +1782,7 @@ fun TVShowsDetailsScreenContent(
                 // ON-DEVICE path, where the backend never sees the playback.
                 .putExtra("M3U8_FALLBACK_URL", body.proxy_url)
                 .putExtra("REFERER", body.referer)
+                .putExtra("IS_HLS", body.isHls ?: true)
                 .putExtra("UA", body.user_agent)
                 .putExtra("PROFILE_ID",     favoriteProfileId)
                 .putExtra("MEDIA_ID",       tmdbId.toString())
@@ -1556,10 +1793,20 @@ fun TVShowsDetailsScreenContent(
                 .putExtra("EPISODE_NAME",   pendingEpisodeName)
                 // Must reflect the track actually extracted — this string is what
                 // watch history and relay_sessions record, so hardcoding "Sub"
-                // would mislabel every dub playback.
-                .putExtra("SOURCE_NAME",    if (dub) "Miruro (Dub)" else "Miruro (Sub)")
+                // would mislabel every dub playback. `playingDub`, not `dub`: a
+                // last-resort sub is recorded as the sub it is, which is the whole
+                // point of knowing the difference.
+                .putExtra("SOURCE_NAME",    if (playingDub) "Miruro (Dub)" else "Miruro (Sub)")
+                // Carried so a mid-episode token expiry can re-extract the SAME track.
+                // `playingDub`, not `dub`, for the same reason SOURCE_NAME uses it.
+                // SERVER is best-effort: null just means "no preference".
+                .putExtra("AUDIO",          if (playingDub) "dub" else "sub")
+                // Manual selection wins; otherwise resolve the default to its name so a
+                // refetch returns to the same provider rather than redrawing the site's
+                // current default. Null only when the picker never ran.
+                .putExtra("SERVER",         server ?: serverOptions.getOrNull(serverDefaultIdx)?.name)
         )
-        return true
+        return ExtractOutcome.PLAYED
     }
 
     val launchExtract: (String, Boolean, String?) -> Unit = { url, dub, server ->
@@ -1585,10 +1832,59 @@ fun TVShowsDetailsScreenContent(
                 // backend that is down, unreachable, or beaten by a site change
                 // costs a few seconds and not the episode. That fallback is the
                 // reason this is safe to route unconditionally.
-                val played = runCatching {
+                //
+                // Burn the provider here, not in extractorLauncher. That handler
+                // only ever sees ON-DEVICE results, and the backend now serves
+                // every play without leaving this coroutine — so triedServers
+                // never grew, and the dub failover below would hand back the same
+                // first server forever.
+                server?.let { triedServers.add(it) }
+
+                var outcome = runCatching {
                     extractAnimeViaBackend(dub = dub, server = server)
-                }.getOrDefault(false)
-                if (played) {
+                }.getOrDefault(ExtractOutcome.MISS)
+
+                // Dub asked for, sub delivered. Same response the on-device path
+                // has always had (RESULT_DUB_FALLBACK) and the same answer: walk
+                // the rest of the dub providers before settling.
+                if (outcome == ExtractOutcome.WRONG_TRACK) {
+                    ensureServerList(url, true)
+                    // Read the DUB list straight out of the cache rather than
+                    // going through pickNextServer: that helper falls back to
+                    // whatever `serverOptions` currently holds, which is the last
+                    // list the picker showed and can easily be the sub one. Handing
+                    // a `…-sub` provider to an audio=dub extract is how a dub
+                    // failover would quietly become another sub playback.
+                    val next = serverListCache[serverCacheKey(url, true)]?.first
+                        ?.firstOrNull { it.name !in triedServers }?.name
+                    if (next != null) {
+                        Log.e("scraper", "🔁 dub came back as sub — failing over to server '$next'")
+                        triedServers.add(next)
+                        isExtracting   = false
+                        extractPending = false
+                        failoverRequest = Triple(url, true, next)
+                        return@launch
+                    }
+                    // Out of servers. Play the sub rather than nothing — but say so
+                    // at a level the release build keeps, because silence here is
+                    // exactly how Japanese audio arrived under a Dub button with no
+                    // trace anywhere.
+                    Log.e("scraper", "🔁 dub unavailable on every server — playing sub as last resort")
+                    outcome = runCatching {
+                        extractAnimeViaBackend(dub = dub, server = server, acceptAnyTrack = true)
+                    }.getOrDefault(ExtractOutcome.MISS)
+                }
+
+                if (outcome == ExtractOutcome.PLAYED) {
+                    // WARM THE PICKER FOR THE TRACK THAT JUST PLAYED. Playback
+                    // has already started, so this delays nothing the viewer is
+                    // waiting on — and the extraction it rides on has just
+                    // cached the list server-side, making it a cache hit.
+                    //
+                    // This is the "back out and choose a different server" path.
+                    // Without it that press paid for a whole browser run to
+                    // enumerate a page we had open seconds earlier.
+                    ensureServerList(url, dub)
                     isExtracting   = false
                     extractPending = false
                     return@launch
@@ -1717,21 +2013,58 @@ fun TVShowsDetailsScreenContent(
 
 
 
+    // ── Season loads are SERIALISED, and stale answers are discarded ─────────
+    //
+    // This used to fire a bare coroutineScope.launch per call with no job held
+    // and no staleness check, while nothing debounced the season buttons or
+    // disabled them during a load. Two presses in quick succession therefore left
+    // two requests in flight, and the FIRST to return cleared the spinner and
+    // painted its episodes — under the newly highlighted season heading.
+    //
+    // That is worse than a cosmetic mismatch. Opening an episode from that grid
+    // calls onEpisodeSelected(selectedSeason, episodeNumber, ...) and sets
+    // pendingSeason = selectedSeason, so extractAndPlay and the player extras get
+    // the season the user is LOOKING at paired with an episode number from a
+    // different season — the wrong episode plays, and that pair is what lands in
+    // watch history and drives the watched-corner markers.
+    //
+    // Guarded by a sequence number rather than by comparing seasonNumber, because
+    // that comparison depends on selectedSeason being assigned before the call
+    // (it is today, at the button) and would silently rot if a future caller
+    // ordered it differently. The sequence answers the only question that
+    // matters: is this still the newest request?
+    var seasonLoadSeq by remember { mutableIntStateOf(0) }
+    var seasonLoadJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+
     // 🔹 Helper to load episodes for a given season
     fun loadSeasonEpisodes(seasonNumber: Int) {
-        coroutineScope.launch {
+        seasonLoadJob?.cancel()
+        val mySeq = ++seasonLoadSeq
+        seasonLoadJob = coroutineScope.launch {
             isLoadingEpisodes = true
             try {
                 val response = episodesRepository.getSeasonEpisodes(
                     tmdbId = tmdbId,
                     seasonNumber = seasonNumber
                 )
+                if (mySeq != seasonLoadSeq) {
+                    Log.d("TVEpisodes", "S$seasonNumber arrived late — discarding")
+                    return@launch
+                }
                 episodes = response.episodes
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // Superseded by a newer season press. Not a failure, and it must
+                // not reach the catch below or it would blank the grid the newer
+                // request is about to fill.
+                throw e
             } catch (e: Exception) {
                 Log.e("TVEpisodes", "Error loading episodes for S$seasonNumber", e)
-                episodes = emptyList()
+                if (mySeq == seasonLoadSeq) episodes = emptyList()
             } finally {
-                isLoadingEpisodes = false
+                // Only the newest request owns the spinner. Clearing it from a
+                // superseded one is what let the previous season's episodes read
+                // as final while the real request was still out.
+                if (mySeq == seasonLoadSeq) isLoadingEpisodes = false
             }
         }
     }
@@ -2543,7 +2876,20 @@ fun TVShowsDetailsScreenContent(
                                                             providerFocusRequesters.firstOrNull()?.requestFocus()
                                                             true
                                                         } else {
-                                                            // still block DOWN when overlay isn't open
+                                                            // DOWN off a tile lands on the browser button in the
+                                                            // corner. It used to be swallowed with no move at all.
+                                                            // Coming back scrolls this tile in first -- the row may
+                                                            // have moved, and a requester on an unplaced tile is not
+                                                            // attached, so a bare requestFocus() would silently no-op.
+                                                            focusBrowserButton {
+                                                                coroutineScope.launch {
+                                                                    episodesRowState.scrollToItem(index)
+                                                                    awaitFrame()
+                                                                    episodeFocusRequesters
+                                                                        .getOrNull(index)
+                                                                        ?.requestFocus()
+                                                                }
+                                                            }
                                                             true
                                                         }
                                                     }
@@ -2886,7 +3232,7 @@ fun TVShowsDetailsScreenContent(
                             focusRequesters = providerFocusRequesters,
                             onDub = { url ->
                                 val epName = selectedEpisode.title
-                                onEpisodeSelected(selectedSeason, episodeNumber, epName)
+                                stopTrailerAndSelectEpisode(selectedSeason, episodeNumber, epName)
                                 // NOT marked watched here. Picking DuB only opens the
                                 // server prompt — extraction can still fail, find no
                                 // servers, or be cancelled. The mark happens where the
@@ -2902,7 +3248,7 @@ fun TVShowsDetailsScreenContent(
                             },
                             onSub = { url ->
                                 val epName = selectedEpisode.title
-                                onEpisodeSelected(selectedSeason, episodeNumber, epName)
+                                stopTrailerAndSelectEpisode(selectedSeason, episodeNumber, epName)
                                 // NOT marked watched here — same reason as onDub above.
                                 lastStreamFocusRequester = providerFocusRequesters.getOrNull(1)
                                 pendingUrl         = url
@@ -2946,10 +3292,16 @@ fun TVShowsDetailsScreenContent(
                                     pendingSeason      = selectedSeason
                                     pendingEpisode     = episodeNumber
                                     pendingEpisodeName = epName
-                                    vidFastChoiceFor   = source
+                                    if (PlaybackPrefs.askPlayerEachTime) {
+                                        vidFastChoiceFor = source
+                                    } else {
+                                        // Prompt turned off in the playback
+                                        // settings: take its default answer.
+                                        startBuiltInPlayer(source)
+                                    }
                                 } else {
                                     // Every other source behaves exactly as before.
-                                    onEpisodeSelected(selectedSeason, episodeNumber, epName)
+                                    stopTrailerAndSelectEpisode(selectedSeason, episodeNumber, epName)
                                     watchedEpisodes = watchedEpisodes + (selectedSeason to episodeNumber)
                                     onStreamingSourceSelected(source)
                                 }
@@ -2961,6 +3313,11 @@ fun TVShowsDetailsScreenContent(
                                     .coerceIn(0, episodeFocusRequesters.lastIndex)
 
                                 episodeFocusRequesters[targetIndex].requestFocus()
+                            },
+                            onExitToCorner = { fromIndex ->
+                                focusBrowserButton {
+                                    providerFocusRequesters.getOrNull(fromIndex)?.requestFocus()
+                                }
                             }
                         )
                     }
@@ -3119,7 +3476,7 @@ fun TVShowsDetailsScreenContent(
             DefaultServerPrompt(
                 message     = "Watch with our player,\nor open the site directly?",
                 defaultText = "Watch on ExoPlayer",
-                chooseText  = "Watch on Gecko",
+                chooseText  = "Watch on website",
                 onDefault   = {
                     vidFastChoiceFor = null
                     // The episode overlay deliberately STAYS open (it used to be
@@ -3128,19 +3485,14 @@ fun TVShowsDetailsScreenContent(
                     // — but keeping it composed keeps the VidFast button attached,
                     // which is what lets focus return to it on the way back. Every
                     // other source already behaves this way.
-                    onEpisodeSelected(pendingSeason, pendingEpisode, pendingEpisodeName)
-                    try { BlueHiveApplication.coilImageLoader.memoryCache?.clear() } catch (_: Exception) {}
-                    // Extraction is an HTTP call now, not an activity-for-result,
-                    // so it runs on this screen's scope. extractAndPlay owns the
-                    // overlay state and starts the player itself.
-                    coroutineScope.launch { extractAndPlay(choiceSrc) }
+                    startBuiltInPlayer(choiceSrc)
                 },
                 onChoose    = {
                     vidFastChoiceFor = null
                     // Same as onDefault: leave the overlay composed so focus has
                     // somewhere to come back to (and so the Gecko path matches the
                     // other embed sources, which never dismissed it either).
-                    onEpisodeSelected(pendingSeason, pendingEpisode, pendingEpisodeName)
+                    stopTrailerAndSelectEpisode(pendingSeason, pendingEpisode, pendingEpisodeName)
                     watchedEpisodes = watchedEpisodes + (pendingSeason to pendingEpisode)
                     onStreamingSourceSelected(choiceSrc)
                 }
@@ -3232,6 +3584,56 @@ fun TVShowsDetailsScreenContent(
             )
         }
 
+
+        // Bottom-right corner. Declared last so it draws above everything
+        // else on the page.
+        // Hidden while Extras is showing the recommended row. That row occupies
+        // the lower half of the page, so the button would sit on top of it, and
+        // the two routes INTO the button -- the episode tiles and the provider
+        // grid -- are themselves inside the !isExtrasToggled branch and gone.
+        // Leaving it visible would mean a control that can be seen and not
+        // reached.
+        //
+        // Nothing can be stranded by this: toggling Extras requires focus on the
+        // Extras button, so the browser button is never focused at the moment it
+        // disappears.
+        if (!isExtrasToggled && !isAnimeTitle) {
+            BrowserCornerButton(
+                focusRequester = browserFocusRequester,
+                onExit = { browserReturnFocus[0]?.invoke() },
+                onClick = { showPlaybackSettings = true },
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = BROWSER_BUTTON_MARGIN, bottom = BROWSER_BUTTON_MARGIN)
+            )
+        }
+
+        // Declared LAST so its BackHandler is the most recently added enabled
+        // one and therefore wins over the Extras collapse and the overlay
+        // handlers above it, which is what makes Back close this first.
+        if (showPlaybackSettings) {
+            PlaybackSettingsOverlay(
+                askEachTime = PlaybackPrefs.askPlayerEachTime,
+                onChoose = { ask ->
+                    PlaybackPrefs.setAskPlayerEachTime(context, ask)
+                    showPlaybackSettings = false
+                    // Focus has to be put back by hand: the overlay took it, and
+                    // the button it came from is in a corner nothing points at.
+                    coroutineScope.launch {
+                        awaitFrame()
+                        try { browserFocusRequester.requestFocus() } catch (_: Exception) {}
+                    }
+                },
+                onDismiss = {
+                    showPlaybackSettings = false
+                    coroutineScope.launch {
+                        awaitFrame()
+                        try { browserFocusRequester.requestFocus() } catch (_: Exception) {}
+                    }
+                },
+            )
+        }
+
     }
 }
 
@@ -3287,15 +3689,8 @@ fun TVShowsFavoriteButton(
             mainCornerRadius = 7f,
             secondCornerRadius = 8f,
         ),
-        colors = ModularButtonColors(
-            mainDefault = Color(0xFF6C6C6C),
-            mainToggled = Color(0xFF535C67),
-            secondDefault = Color(0xFF2E2C37),
-            secondFocused = Color(0xFF52505A),
-            shadowColor = Color(0x50000000),
-            textFocused = Color.White,
-            textUnfocused = Color(0xFFBEBEBE)
-        ),
+        // Shared — see FavoriteButtonColors in utilities/ModularButton.kt.
+        colors = FavoriteButtonColors,
         glowConfig = ModularButtonGlowConfig(
             enabled = true,
             defaultRes = R.drawable.button_focus_wide_glow,
@@ -3334,10 +3729,16 @@ fun TVShowsExtrasButton(
 ) {
     ModularButton(
         textConfig = ModularButtonTextConfig(
-            text = "Extras",
-            toggledText = "Providers"
+            // NOT a toggle any more — the label is driven from outside, exactly
+            // like the trailer button's "Play/Pause Trailer". ModularButton only
+            // consults toggledText when isToggleable is true, so setting one here
+            // would be dead config; the state has to arrive through `text`.
+            text = if (isToggled) "Providers" else "Extras"
         ),
-        isToggleable = true,
+        // false, so this behaves as a plain button: press animation, a brief
+        // pressed flash, then back to rest. Previously true, which parked it in a
+        // permanently "held down" visual state whenever providers were showing.
+        isToggleable = false,
         fontFamily = fontFamily,
         focusRequester = focusRequester,
         modifier = Modifier
@@ -3366,15 +3767,8 @@ fun TVShowsExtrasButton(
             mainCornerRadius = 7f,
             secondCornerRadius = 6f,
         ),
-        colors = ModularButtonColors(
-            mainDefault = Color(0xFF6C6C6C),
-            mainToggled = Color(0xFF535C67),
-            secondDefault = Color(0xFF2E2C37),
-            secondFocused = Color(0xFF52505A),
-            shadowColor = Color(0x50000000),
-            textFocused = Color.White,
-            textUnfocused = Color(0xFFBEBEBE)
-        ),
+        // Shared — see ExtrasButtonColors in utilities/ModularButton.kt.
+        colors = ExtrasButtonColors,
         glowConfig = ModularButtonGlowConfig(
             enabled = true,
             defaultRes = R.drawable.button_focus_narrow_glow,
@@ -3389,7 +3783,6 @@ fun TVShowsExtrasButton(
             durationMillis = 110,
             bounceBackDelayMillis = 80
         ),
-        externalToggled = isToggled,     // 🔹 NEW: hook into shared state
         onClick = {
             BlueHiveApplication.playClickSound()
             onClick()
@@ -3446,15 +3839,8 @@ fun TVShowsTrailerButton(
             mainCornerRadius = 7f,
             secondCornerRadius = 6f,
         ),
-        colors = ModularButtonColors(
-            mainDefault = Color(0xFF6C6C6C),
-            mainToggled = Color(0xFF535C67),
-            secondDefault = Color(0xFF2E2C37),
-            secondFocused = Color(0xFF52505A),
-            shadowColor = Color(0x50000000),
-            textFocused = Color.White,
-            textUnfocused = Color(0xFFBEBEBE)
-        ),
+        // Shared — see TrailerControlButtonColors in utilities/ModularButton.kt.
+        colors = TrailerControlButtonColors,
         glowConfig = ModularButtonGlowConfig(
             enabled = true,
             defaultRes = R.drawable.button_focus_wide_glow,
@@ -3519,15 +3905,8 @@ fun TVShowsRewindButton(
             mainCornerRadius = 7f,
             secondCornerRadius = 6f,
         ),
-        colors = ModularButtonColors(
-            mainDefault = Color(0xFF6C6C6C),
-            mainToggled = Color(0xFF535C67),
-            secondDefault = Color(0xFF2E2C37),
-            secondFocused = Color(0xFF52505A),
-            shadowColor = Color(0x50000000),
-            textFocused = Color.White,
-            textUnfocused = Color(0xFFBEBEBE)
-        ),
+        // Shared — see TrailerControlButtonColors in utilities/ModularButton.kt.
+        colors = TrailerControlButtonColors,
         glowConfig = ModularButtonGlowConfig(
             enabled = true,
             defaultRes = R.drawable.button_focus_narrow_glow,
@@ -3595,15 +3974,8 @@ fun TVShowsFastForwardButton(
             mainCornerRadius = 7f,
             secondCornerRadius = 6f,
         ),
-        colors = ModularButtonColors(
-            mainDefault = Color(0xFF6C6C6C),
-            mainToggled = Color(0xFF535C67),
-            secondDefault = Color(0xFF2E2C37),
-            secondFocused = Color(0xFF52505A),
-            shadowColor = Color(0x50000000),
-            textFocused = Color.White,
-            textUnfocused = Color(0xFFBEBEBE)
-        ),
+        // Shared — see TrailerControlButtonColors in utilities/ModularButton.kt.
+        colors = TrailerControlButtonColors,
         glowConfig = ModularButtonGlowConfig(
             enabled = true,
             defaultRes = R.drawable.button_focus_narrow_glow,
@@ -3636,6 +4008,7 @@ private fun EpisodeProviderInlineButtons(
     focusRequesters: List<FocusRequester>,
     onSourceSelected: (TVShowsDetailsScreenCompose.StreamingSource) -> Unit,
     onBack: () -> Unit,   // ✅ NEW
+    onExitToCorner: (Int) -> Unit,
 ) {
     val safeSources = remember {
         mutableStateListOf<TVShowsDetailsScreenCompose.StreamingSource>()
@@ -3688,6 +4061,7 @@ private fun EpisodeProviderInlineButtons(
                         focusRequesters = focusRequesters,
                         onClick = { onSourceSelected(source) },
                         onBack = onBack,
+                        onExitToCorner = onExitToCorner,
                     )
                 }
             }
@@ -3708,6 +4082,12 @@ private fun EpisodeOverlayStreamerButton(
     focusRequesters: List<FocusRequester>,
     onClick: () -> Unit,
     onBack: () -> Unit,
+    /**
+     * Leaving the grid for the browser button in the corner: RIGHT off the right
+     * column, or DOWN off the bottom row. Receives this button's index so the
+     * corner button knows where to send focus back to.
+     */
+    onExitToCorner: (Int) -> Unit,
 ) {
     // 🔹 manual x tweak just for certain names
     val labelOffsetX = when (source.name) {
@@ -3756,6 +4136,10 @@ private fun EpisodeOverlayStreamerButton(
                         if (target >= 0) {
                             focusRequesters.getOrNull(target)?.requestFocus()
                             BlueHiveApplication.playHoverSound()
+                        } else {
+                            // Right column (and a lone trailing button): RIGHT was a
+                            // dead end. Leave the grid for the corner button instead.
+                            onExitToCorner(index)
                         }
                         true
                     }
@@ -3781,6 +4165,11 @@ private fun EpisodeOverlayStreamerButton(
                         if (target < total) {
                             focusRequesters.getOrNull(target)?.requestFocus()
                             BlueHiveApplication.playHoverSound()
+                        } else {
+                            // Bottom row: nothing below it inside the grid, so DOWN
+                            // was consumed with no move. Hand off to the corner
+                            // button, same as RIGHT does off the right column.
+                            onExitToCorner(index)
                         }
                         true
                     }
@@ -3807,15 +4196,9 @@ private fun EpisodeOverlayStreamerButton(
             mainCornerRadius = 7f,
             secondCornerRadius = 8f,
         ),
-        colors = ModularButtonColors(
-            mainDefault = Color(0xFF0004FF),
-            mainToggled = Color(0xFF07052F),
-            secondDefault = Color(0xFF471C98),
-            secondFocused = Color(0xFF342180),
-            shadowColor = Color(0x60000000),
-            textFocused = Color.White,
-            textUnfocused = Color(0xFFD6D6D6)
-        ),
+        // Shared with the movie screen — see StreamSourceButtonColors in
+        // utilities/ModularButton.kt. Change the blues there, not here.
+        colors = StreamSourceButtonColors,
         glowConfig = ModularButtonGlowConfig(
             enabled = true,
             // keep using your narrow glow asset
@@ -3824,17 +4207,19 @@ private fun EpisodeOverlayStreamerButton(
             offsetX = (-6.5).dp,
             offsetY = (-2.5).dp
         ),
-        animationConfig = ModularButtonAnimationConfig(
-            pressOffset = 2.0.dp,        // was 2.0.dp
-            textOffsetDefault = 0.6.dp,    // was 0.6.dp
-            textOffsetPressed = 1.6.dp,  // was 1.6.dp
-            durationMillis = 110,
-            bounceBackDelayMillis = 80
+        // Timing shared with the movie screen — see WatchButtonAnimation
+        // in utilities/ModularButton.kt. Only the offsets are per-screen, being
+        // tuned to this button's smaller size.
+        animationConfig = WatchButtonAnimation.copy(
+            pressOffset = 2.0.dp,
+            textOffsetDefault = 0.6.dp,
+            textOffsetPressed = 1.6.dp,
         ),
-        onClick = {
-            BlueHiveApplication.playClickSound()
-            onClick()
-        }
+        // No playClickSound() here: ModularButton already plays it, immediately,
+        // and this second call fired a duplicate. Harmless while the two landed
+        // on the same frame — audible as a real double-click once onClick became
+        // deferred by clickDelayMillis.
+        onClick = onClick
     )
 }
 // =====================================================================================================================> Episode overlay section
@@ -3873,17 +4258,10 @@ fun SeasonButton(
             mainCornerRadius = 7f,
             secondCornerRadius = 8f,
         ),
-        colors = ModularButtonColors(
-            mainDefault = Color(0xFF0004FF),
-            mainToggled = Color(0xFF07052F),
-            secondDefault = Color(0xFF471C98),
-            secondFocused = Color(0xFF342180),
-            shadowColor = Color(0x60000000),
-            textFocused = Color.White,
-            textUnfocused = Color(0xFFD6D6D6),
-            textToggled = Color(0xFF5D5B6A),
-            textToggledFocus = Color(0xFFCDCDCD)
-        ),
+        // Shared — see SeasonButtonColors in utilities/ModularButton.kt. It is
+        // derived from StreamSourceButtonColors, so these chips and the watch
+        // buttons brighten identically on focus.
+        colors = SeasonButtonColors,
         glowConfig = ModularButtonGlowConfig(
             enabled = true,
             defaultRes = R.drawable.button_focus_wide_glow,
@@ -3942,8 +4320,7 @@ private fun AnimeEpisodeProviderButtons(
                 text = "Watch in DuB",
                 passionFont = passionFont,
                 focusRequester = focusRequesters[0],
-                mainDefault = Color(0xFFCC0000), mainToggled = Color(0xFF7A0000),
-                secondDefault = Color(0xFF7A0000), secondFocused = Color(0xFF8B1400),
+                buttonColors = AnimeDubButtonColors,
                 modifier = Modifier.onPreviewKeyEvent { e ->
                     if (e.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                     when (e.key) {
@@ -3961,8 +4338,7 @@ private fun AnimeEpisodeProviderButtons(
                 text = "Watch in SuB",
                 passionFont = passionFont,
                 focusRequester = focusRequesters[1],
-                mainDefault = Color(0xFFCCA000), mainToggled = Color(0xFF6B5000),
-                secondDefault = Color(0xFF7A5500), secondFocused = Color(0xFF8B6500),
+                buttonColors = AnimeSubButtonColors,
                 modifier = Modifier.onPreviewKeyEvent { e ->
                     if (e.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                     when (e.key) {
@@ -3985,10 +4361,11 @@ private fun AnimeOverlayButton(
     text: String,
     passionFont: FontFamily,
     focusRequester: FocusRequester,
-    mainDefault: Color,
-    mainToggled: Color,
-    secondDefault: Color,
-    secondFocused: Color,
+    // ONE PALETTE, not four loose colours. Passing the parts individually is how
+    // mainFocused went missing here: there was no parameter for it, so no call
+    // site could have supplied one, and every focused anime button fell back to
+    // the neutral grey default.
+    buttonColors: ModularButtonColors,
     modifier: Modifier = Modifier,
     onClick: () -> Unit,
 ) {
@@ -4011,15 +4388,7 @@ private fun AnimeOverlayButton(
             mainCornerRadius = 7f,
             secondCornerRadius = 8f,
         ),
-        colors = ModularButtonColors(
-            mainDefault = mainDefault,
-            mainToggled = mainToggled,
-            secondDefault = secondDefault,
-            secondFocused = secondFocused,
-            shadowColor = Color(0x60000000),
-            textFocused = Color.White,
-            textUnfocused = Color(0xFFD6D6D6)
-        ),
+        colors = buttonColors,
         glowConfig = ModularButtonGlowConfig(
             enabled = true,
             defaultRes = R.drawable.button_focus_wide_glow,
@@ -4027,17 +4396,16 @@ private fun AnimeOverlayButton(
             offsetX = (-6.5).dp,
             offsetY = (-2.5).dp
         ),
-        animationConfig = ModularButtonAnimationConfig(
+        // Timing shared with the movie screen; only the offsets are per-screen,
+        // being tuned to this button's smaller size.
+        animationConfig = WatchButtonAnimation.copy(
             pressOffset = 2.0.dp,
             textOffsetDefault = 0.6.dp,
             textOffsetPressed = 1.6.dp,
-            durationMillis = 110,
-            bounceBackDelayMillis = 80
         ),
-        onClick = {
-            BlueHiveApplication.playClickSound()
-            onClick()
-        }
+        // ModularButton already plays the click, immediately. This second call
+        // was a duplicate, inaudible only because both landed on one frame.
+        onClick = onClick
     )
 }
 

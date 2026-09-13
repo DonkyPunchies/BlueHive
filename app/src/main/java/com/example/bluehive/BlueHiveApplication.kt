@@ -33,6 +33,8 @@ import com.example.bluehive.auth.EntitlementLockBus
 import com.example.bluehive.auth.HostEntitlementRelay
 import com.example.bluehive.auth.ServiceLockoutActivity
 import com.example.bluehive.auth.SessionManager
+import com.example.bluehive.update.UpdateGate
+import com.example.bluehive.update.UpdateManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -60,8 +62,35 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
     // return to the host," not "launch LoginScreenActivity."
     private var foregroundActivity: java.lang.ref.WeakReference<android.app.Activity>? = null
 
+    /**
+     * The last Activity that was resumed, kept across pause and stop.
+     *
+     * SEPARATE FROM [foregroundActivity] BECAUSE THEY ANSWER DIFFERENT QUESTIONS.
+     * That one means "an Activity is on screen right now" and is deliberately
+     * nulled on pause, which is correct for deciding whether we may legally start
+     * another Activity. This one means "an Activity of ours still exists", which
+     * is what finishAffinity() needs, and a stopped Activity is perfectly able to
+     * finish its own task.
+     *
+     * Held weakly and dropped on destroy, so it can never keep a dead Activity
+     * alive; the idle close simply skips finishAffinity if it has gone.
+     */
+    private var lastKnownActivity: java.lang.ref.WeakReference<android.app.Activity>? = null
+
     companion object {
         private const val TAG = "BlueHiveApplication"
+
+        /**
+         * Application context, for code that runs between extraction and
+         * playback and has no Context of its own — see
+         * ExtractAwait.extractStreamAwait, which pre-warms the CDN hosts an
+         * extraction just reported. Application context only: it outlives every
+         * Activity, so holding it leaks nothing.
+         */
+        @Volatile
+        @JvmStatic
+        var appContext: android.content.Context? = null
+            private set
 
         // Image cache configuration
         private const val DISK_CACHE_SIZE_MB     = 300L
@@ -76,14 +105,55 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
 
         lateinit var coilImageLoader: ImageLoader
         private var soundPool: SoundPool? = null
-        private var navSoundId: Int = 0
-        private var hoverSoundId: Int = 0
-        private var popSoundId: Int = 0
+        private var titleCardNavigationSoundId: Int = 0
+        private var buttonNavigationSoundId: Int = 0
+        private var buttonClickSoundId: Int = 0
         private var backOutSoundId: Int = 0
-        private var lastPopPlayTime: Long = 0L
+        private var lastButtonClickPlayTime: Long = 0L
         private var webViewerClickSoundId: Int = 0
+        private var profileSwapSoundId: Int = 0
+        private var lastProfileSwapPlayTime: Long = 0L
+        // No sample id of its own: the nav sound shares
+        // buttonNavigationSoundId (button_navigation.mp3) with playHoverSound.
+        // Only the clock is separate — see playNavClickSound.
+        private var lastNavClickPlayTime: Long = 0L
 
-        private const val POP_DEBOUNCE_MS = 120L
+        // ── SOUND VOLUMES ────────────────────────────────────────────────
+        //
+        // Every level in one place. These were inline literals scattered across
+        // six play* functions, which meant a sample used by two of them could
+        // drift to two different volumes without anyone noticing — and one had.
+        //
+        // ONE CONSTANT PER SAMPLE, NOT PER FUNCTION. button_navigation.mp3 is
+        // played by both playHoverSound and playNavClickSound; they now read the
+        // same constant, so the file sounds identical wherever it is used.
+        private const val TITLECARD_NAVIGATION_VOLUME = 0.7f
+        private const val BUTTON_NAVIGATION_VOLUME    = 0.2f
+        private const val BUTTON_CLICK_VOLUME         = 0.3f
+        private const val PROFILE_SWAP_VOLUME         = 0.45f
+        private const val BACK_OUT_VOLUME             = 0.35f
+        private const val WEBVIEWER_CLICK_VOLUME      = 0.35f
+
+        /**
+         * Play one sample at one volume — the ONLY place SoundPool.play is called.
+         *
+         * That API takes left and right volume separately; every call site passed
+         * the same value twice, which is two chances to typo one channel quieter
+         * than the other. The trailing 0, 0, 1f (priority, loop, rate) were
+         * identical everywhere too.
+         */
+        private fun play(soundId: Int, volume: Float) {
+            soundPool?.play(soundId, volume, volume, 0, 0, 1f)
+        }
+
+        private const val BUTTON_CLICK_DEBOUNCE_MS = 120L
+
+        // Shared by both focus-navigation sounds, and shorter than
+        // BUTTON_CLICK_DEBOUNCE_MS on purpose. A held D-pad repeats roughly every
+        // 100-150ms and each of those IS a real move — swallowing them would
+        // make a fast scroll go quiet exactly when the feedback is most useful.
+        // This only collapses the double-fire of one keypress.
+        private const val NAV_SOUND_DEBOUNCE_MS = 70L
 
         fun initSoundPool(context: Context) {
             if (soundPool == null) {
@@ -91,35 +161,77 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
                     .setMaxStreams(4)
                     .build()
 
-                navSoundId          = soundPool!!.load(context, R.raw.medianavigation, 1)
-                hoverSoundId        = soundPool!!.load(context, R.raw.blue_pop, 1)
-                popSoundId          = soundPool!!.load(context, R.raw.pop, 1)
-                backOutSoundId      = soundPool!!.load(context, R.raw.backedout, 1)
-                webViewerClickSoundId = soundPool!!.load(context, R.raw.webviewerclick, 1)
+                titleCardNavigationSoundId = soundPool!!.load(context, R.raw.titlecard_navigation, 1)
+                buttonNavigationSoundId    = soundPool!!.load(context, R.raw.button_navigation, 1)
+                buttonClickSoundId         = soundPool!!.load(context, R.raw.button_click, 1)
+                backOutSoundId             = soundPool!!.load(context, R.raw.backedout, 1)
+                webViewerClickSoundId      = soundPool!!.load(context, R.raw.webviewerclick, 1)
+                profileSwapSoundId         = soundPool!!.load(context, R.raw.profile_swap, 1)
             }
         }
 
         fun playWebViewerClickSound() {
-            soundPool?.play(webViewerClickSoundId, 0.35f, 0.35f, 0, 0, 1f)
+            play(webViewerClickSoundId, WEBVIEWER_CLICK_VOLUME)
         }
 
         fun playTitleCardNavigation() {
-            soundPool?.play(navSoundId, 0.7f, 0.7f, 0, 0, 1f)
+            play(titleCardNavigationSoundId, TITLECARD_NAVIGATION_VOLUME)
         }
 
         fun playHoverSound() {
-            soundPool?.play(hoverSoundId, 0.1f, 0.1f, 0, 0, 1f)
+            play(buttonNavigationSoundId, BUTTON_NAVIGATION_VOLUME)
         }
 
         fun playClickSound() {
             val now = SystemClock.uptimeMillis()
-            if (now - lastPopPlayTime < POP_DEBOUNCE_MS) return
-            lastPopPlayTime = now
-            soundPool?.play(popSoundId, 0.3f, 0.3f, 0, 0, 1f)
+            if (now - lastButtonClickPlayTime < BUTTON_CLICK_DEBOUNCE_MS) return
+            lastButtonClickPlayTime = now
+            play(buttonClickSoundId, BUTTON_CLICK_VOLUME)
         }
 
         fun playBackOutSound() {
-            soundPool?.play(backOutSoundId, 0.35f, 0.35f, 0, 0, 1f)
+            play(backOutSoundId, BACK_OUT_VOLUME)
+        }
+
+        /**
+         * Moving between profiles on the profile picker.
+         *
+         * Deliberately NOT wired to focus-gain in general: it fires only when
+         * one profile card hands focus to another, so pressing left on the
+         * leftmost profile — where focus does not move — stays silent. See
+         * ProfileScreenActivity for the arming that keeps the screen's own
+         * opening focus quiet too.
+         *
+         * PROFILE_SWAP_VOLUME is a STARTING level, not a measured one — between
+         * the click and the title-card navigation. Adjust by ear.
+         */
+        fun playProfileSwapSound() {
+            val now = SystemClock.uptimeMillis()
+            if (now - lastProfileSwapPlayTime < NAV_SOUND_DEBOUNCE_MS) return
+            lastProfileSwapPlayTime = now
+            play(profileSwapSoundId, PROFILE_SWAP_VOLUME)
+        }
+
+        /**
+         * Moving onto one of the profile screen's other controls — Create
+         * Profile, Sign Out, Manage Profiles.
+         *
+         * button_navigation.mp3 at BUTTON_NAVIGATION_VOLUME — the same sample
+         * AND the same level playHoverSound uses. Hover used to sit at 0.1f
+         * while this sat at 0.2f; one sample playing at two volumes depending on
+         * which control you moved onto is a difference the ear reads as
+         * inconsistency rather than as meaning.
+         *
+         * SHARED SAMPLE, SEPARATE CLOCK. The debounce is its own because
+         * navigating onto a button and then pressing it are two events ~100ms
+         * apart; on one clock the second would be swallowed, and the press is
+         * the one the user actually wants to hear.
+         */
+        fun playNavClickSound() {
+            val now = SystemClock.uptimeMillis()
+            if (now - lastNavClickPlayTime < NAV_SOUND_DEBOUNCE_MS) return
+            lastNavClickPlayTime = now
+            play(buttonNavigationSoundId, BUTTON_NAVIGATION_VOLUME)
         }
 
         fun releaseSoundPool() {
@@ -436,6 +548,7 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
     @OptIn(ExperimentalCoroutinesApi::class)   // Dispatchers.IO.limitedParallelism
     override fun onCreate() {
         super.onCreate()
+        appContext = applicationContext
 
         // Deliberately BEFORE the multi-process guard and before any networking.
         // Backend clients ask LanNetwork for a socket at connect time, and until
@@ -443,6 +556,74 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
         // Cheap, idempotent, and per-process, so helper processes running their
         // own ApiClient are covered too.
         com.example.bluehive.net.LanNetwork.init(this)
+
+        // ── Warm the QUIC hint list before anything plays ────────────────────
+        //
+        // An SNI-filtering ISP severs the TCP handshake before a response exists,
+        // so this client can never LEARN from an alt-svc header that a CDN also
+        // speaks QUIC — the header would arrive on the connection just killed.
+        // Chromium can only open QUIC first for hosts named at engine-build time.
+        //
+        // Discovering them locally therefore costs one relayed playback each, and
+        // these CDNs rotate constantly (moon.peakstorm.top, boldapple.top,
+        // polarsable.top, cedarorbit.top, mistynight.top on a single title), so
+        // the cost never amortises. The backend meets every host first — it is
+        // what extracts them — so it publishes the list and no device pays
+        // discovery for a host another device already found.
+        //
+        // FIRE AND FORGET, and deliberately unguarded: the transport is built
+        // lazily on first playback, so a slow or failed fetch simply means this
+        // device falls back to learning locally, exactly as it did before. It
+        // must never delay startup or fail it.
+        // RETRIED, because onCreate is too early. Measured 2026-08-29: the first
+        // attempt fails with IOException — LanNetwork.init above has only just
+        // been called and its socket-factory callback has not fired, so there is
+        // no usable network yet. The backoff costs nothing (playback builds its
+        // transport lazily, long after this) and turns a guaranteed first-launch
+        // miss into a reliable warm.
+        // MAIN PROCESS ONLY — this is a NETWORK call, and it sat above the
+        // multi-process guard below where every helper process ran it too.
+        //
+        // MEASURED 2026-08-31: MiruroExtractorActivity runs in :extractor, which
+        // deliberately never calls SessionManager.init (the guard returns first).
+        // ApiClient's auth interceptor then threw
+        //   IllegalStateException: SessionManager not initialised
+        // on an OkHttp dispatcher thread with no handler, killing the whole
+        // process. The extractor died mid-extraction, the task unwound, and the
+        // user was dumped on the home screen with no error — reproduced on an
+        // anime DuB play.
+        //
+        // LanNetwork.init above must stay before the guard. Networking must not.
+        if (isMainProcess()) {
+            kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                for (delayMs in longArrayOf(3_000, 8_000, 20_000)) {
+                    kotlinx.coroutines.delay(delayMs)
+                    val ok = runCatching {
+                        val r = com.example.bluehive.api.ApiClient.bluehiveApi.cdnHosts()
+                        val hosts = r.body()?.hosts
+                        if (r.isSuccessful && !hosts.isNullOrEmpty()) {
+                            com.example.bluehive.webview.exoplayer_resources
+                                .ExoPlayerConfig.mergeQuicHints(
+                                    this@BlueHiveApplication,
+                                    hosts,
+                                    withdraw = r.body()?.h2Only ?: emptyList(),
+                                )
+                            // Warm DNS/ECH for the freshly merged list right away.
+                            // The race that loses ECH happens ~34ms before a
+                            // playback's ClientHello; here nothing is waiting, so the
+                            // full allowance is actually available.
+                            com.example.bluehive.webview.exoplayer_resources
+                                .ExoPlayerConfig.prewarmCdnDns(this@BlueHiveApplication)
+                            true
+                        } else false
+                    }.getOrElse { false }
+                    if (ok) return@launch
+                }
+                android.util.Log.e("scraper-vidapi",
+                    "🔀 cdn-host list unavailable after 3 attempts — falling back to " +
+                    "learning hosts locally (one relayed play per new host)")
+            }
+        }
 
         // ── Multi-process guard ──────────────────────────────────────────────
         // GeckoView spawns helper processes (:tab*, :gpu, :crashhelper) that
@@ -472,7 +653,33 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
         // it needs nothing initialised.
         com.example.bluehive.diagnostics.CrashReporter.install(this)
 
+        // ── Give back the last update's download ─────────────────────────────
+        // An installed update leaves its ~170MB APK in cacheDir, because the OS
+        // kills this process the instant the replacement lands and no cleanup
+        // code of ours gets to run. Until now the only thing that swept it was
+        // the NEXT download, so the space stayed spoken for between releases —
+        // on the same partition the next install needs headroom on.
+        //
+        // Fire-and-forget on IO: nothing waits on it, and a failure just leaves
+        // the file for the platform to evict as it always did.
+        //
+        // runCatching is NOT belt-and-braces here. This is a plain CoroutineScope
+        // with no SupervisorJob and no exception handler, so anything thrown inside
+        // reaches the thread's default handler and kills the process — and this one
+        // runs on the startup path, where that reads as the app refusing to open.
+        // Reclaiming cache is never worth a launch failure.
+        CoroutineScope(Dispatchers.IO).launch {
+            runCatching { UpdateManager.pruneStaleDownloads(this@BlueHiveApplication) }
+                .onFailure { Log.e(TAG, "update-cache prune failed: ${it.message}") }
+        }
+
         SessionManager.init(this)
+
+        // Playback settings are keyed by profile, so this MUST come after
+        // SessionManager.init — before it there is no profile id to read and the
+        // first details screen of a cold start would show the default instead of
+        // the viewer's saved choice.
+        com.example.bluehive.utilities.PlaybackPrefs.load(this)
         // HostTokenProvider.init() removed 2026-08-16. It bound a service
         // connection to Off-Grid Drive at startup so tokens could be fetched over
         // AIDL. TokenProvider replaces it and needs no initialisation — it reads
@@ -492,6 +699,10 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
             override fun onActivityResumed(activity: android.app.Activity) {
                 foregroundActivity = java.lang.ref.WeakReference(activity)
+                // Tracked in parallel and NOT cleared on pause — see the field doc.
+                // This is the reference the idle close uses hours later, long after
+                // a screensaver has stopped everything.
+                lastKnownActivity = java.lang.ref.WeakReference(activity)
                 // Arriving on a new screen is interaction — the user pressed
                 // something to get here. Without this, a navigation that happens to
                 // straddle a tick could be judged against the previous screen's
@@ -521,7 +732,12 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
             override fun onActivityStarted(activity: android.app.Activity) {}
             override fun onActivityStopped(activity: android.app.Activity) {}
             override fun onActivitySaveInstanceState(activity: android.app.Activity, outState: android.os.Bundle) {}
-            override fun onActivityDestroyed(activity: android.app.Activity) {}
+            override fun onActivityDestroyed(activity: android.app.Activity) {
+                // Drop our own reference so a destroyed Activity is never handed to
+                // finishAffinity(). Identity-checked, so a newer Activity's entry is
+                // never cleared by an older one being torn down.
+                if (lastKnownActivity?.get() === activity) lastKnownActivity = null
+            }
         })
 
         if (SessionManager.get().isAuthenticated) {
@@ -546,6 +762,12 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
 
                 override fun onStop(owner: LifecycleOwner) {
                     Log.d(TAG, "🌙 ProcessLifecycleOwner.onStop fired — app is fully backgrounded")
+                    // FIRST, before anything that can block or throw. Stopping the
+                    // heartbeat is itself the signal that the slot should start
+                    // counting down — /background says the same thing explicitly,
+                    // but that POST can be lost and this cannot: Android is about
+                    // to freeze this process, and a frozen process sends nothing.
+                    SessionHeartbeat.stop()
                     InactivityWatcher.onAppBackgrounded()
                     // Hand the slot back to InactivityWatcher's Redis grace. Two
                     // mechanisms counting down on one slot with no coordination is
@@ -558,10 +780,24 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
                     Log.d(TAG, "☀️ ProcessLifecycleOwner.onStart fired — app is foreground")
                     InactivityWatcher.onAppForegrounded()
                     IdleWatcher.setForeground(true)
+                    // Resume proving we are alive. Idempotent, so the repeated
+                    // onStart Android fires for one user-visible return does not
+                    // start a second loop.
+                    SessionHeartbeat.start()
                     // Resume the SSE stream. startAfterUserReturn() clears the
                     // intentionally-exited flag so a previous back-button close
                     // can't block this reconnection in a still-alive process.
                     DeviceEventStream.startAfterUserReturn()
+                    // NO UPDATE CHECK HERE ANY MORE. This used to run on every
+                    // foreground transition, which on a cold start meant a SECOND
+                    // checker racing AuthActivity's: both found the update, both
+                    // launched the updater with NEW_TASK|CLEAR_TASK, and the second
+                    // destroyed the task the first had just rooted. The app drew
+                    // nothing and downloaded 163MB behind the TV launcher.
+                    //
+                    // UpdateGate on HomeScreenCompose.onResume is the only checker
+                    // now. Nothing is lost by dropping it here: every return to the
+                    // foreground resumes that screen anyway.
                     // Host entitlement is re-checked from HomeScreenCompose.onResume,
                     // not from a timer here. Every way back into the app lands on
                     // the home screen, so that one hook covers returning from the
@@ -570,6 +806,61 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
                 }
             }
         )
+
+        // ── Operator-triggered update re-check ─────────────────────────────────
+        // Arrives over the SSE stream when someone runs the admin endpoint. Passes
+        // immediate=true, which skips UpdateGate's settle delay deliberately — the
+        // whole point is "now", and the operator pressing it is the rate limit.
+        //
+        // Still just a CHECK. The manifest decides whether an update exists and
+        // whether it can be declined; the event only decides when to look.
+        ForceUpdateBus.register {
+            // THROUGH THE SAME GATE the home screen uses, so the operator push is
+            // not a second path with its own rules. immediate=true skips only the
+            // settle delay -- the playback guard and the single-flight latch still
+            // apply, so a push landing during a film defers instead of taking the
+            // screen away mid-scene.
+            val host = foregroundActivity?.get()
+            if (host != null) {
+                UpdateGate.checkNow(host, immediate = true)
+            } else {
+                // No window to start an activity from, and a background activity
+                // launch is exactly what Android 14 drops silently. The next home
+                // screen picks it up.
+                Log.i(TAG, "operator push with no foreground activity — next home screen catches it")
+            }
+        }
+
+        // ── Idle close ─────────────────────────────────────────────────────────
+        // IdleWatcher has seen no input for four hours with nothing playing. Runs
+        // the SAME close path as the Back button rather than a second teardown of
+        // its own — see performClose for why that matters.
+        //
+        // Needs the foreground Activity for finishAffinity(), which IdleWatcher
+        // (a process-wide object) does not have; this class already tracks it for
+        // SessionExpiredBus, so the news comes here instead.
+        IdleCloseBus.register {
+            // THIS USED TO SKIP WHEN THERE WAS NO FOREGROUND ACTIVITY, which is the
+            // state a four-hour idle close is ALWAYS in. A TV backgrounds this app
+            // via its screensaver within minutes, onActivityPaused nulls
+            // foregroundActivity, and the close then declined to run in precisely
+            // the case it was written for.
+            //
+            // The old comment refused to kill without an Activity on the grounds
+            // that the stream and slot would be left to server-side timeouts and
+            // the exit would read as "app died mysteriously". Neither survives
+            // scrutiny here. performClose stops the stream and sends the
+            // end-session ping itself, whatever the Activity is, so nothing is left
+            // to time out; and an app nobody has touched for four hours, behind a
+            // screensaver, has no viewer to mystify.
+            //
+            // lastKnownActivity is preferred when we have it, purely so the task is
+            // finished cleanly rather than dying with the process.
+            val act = foregroundActivity?.get()
+                ?: lastKnownActivity?.get()?.takeIf { !it.isDestroyed }
+            Log.e(TAG, "😴 idle close — shutting down (activity=${act != null})")
+            com.example.bluehive.utilities.performClose(act, killProcess = true)
+        }
 
         // ── Host reported this account inactive ────────────────────────────────
         // Close the app immediately and raise the lock screen. NOT a sign-out:

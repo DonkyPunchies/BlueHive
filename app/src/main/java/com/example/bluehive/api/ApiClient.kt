@@ -128,18 +128,28 @@ object ApiClient {
 
 
     /**
-     * Host-backed authenticator for bluehiveApi. On a 401, instead of self-
-     * refreshing (which would 403 — wrong device fingerprint), it asks the HOST
-     * for a fresh access token over IPC, writes it into SessionManager, and
-     * retries. If the host returns null (logout/unpair — the pull-path signal),
-     * the session is dropped.
+     * Refresh-on-401 authenticator for bluehiveApi. It calls
+     * [TokenProvider.fetchFreshToken], writes the result into SessionManager, and
+     * retries. On [TokenResult.Revoked] the session is dropped; on
+     * [TokenResult.Unavailable] it backs off without touching the session.
+     *
+     * NOT HOST-BACKED ANY MORE, DESPITE THE NAME. This used to bind Off-Grid
+     * Drive over AIDL and ask it for a token, because BlueHive held no refresh
+     * token of its own and self-refreshing would 403 on a device-fingerprint
+     * mismatch. TokenProvider replaced HostTokenProvider: BlueHive now owns a
+     * refresh token and spends it against its OWN backend over plain HTTP. There
+     * is no IPC anywhere on this path.
+     *
+     * The identifier is left as `hostTokenAuthenticator` only because renaming it
+     * touches three call sites for no behavioural gain; read "host" here as
+     * historical, not descriptive.
      */
     private val hostTokenAuthenticator = object : Authenticator {
         override fun authenticate(route: Route?, response: Response): Request? {
             Log.d(TAG, "bluehiveApi 401 on ${response.request.url.encodedPath} — asking host for fresh token")
 
             if (response.request.header("X-Host-Retry") != null) {
-                Log.w(TAG, "Already retried with host token, still 401 — giving up")
+                Log.e(TAG, "Already retried with host token, still 401 — giving up")
                 return null
             }
 
@@ -157,14 +167,14 @@ object ApiClient {
                 }
 
                 com.example.bluehive.auth.TokenResult.Revoked -> {
-                    Log.w(TAG, "Host reports revoked — dropping session")
+                    Log.e(TAG, "Host reports revoked — dropping session")
                     SessionManager.get().clearSession()
                     SessionExpiredBus.post()
                     null
                 }
 
                 com.example.bluehive.auth.TokenResult.Unavailable -> {
-                    Log.w(TAG, "Host unavailable transiently — failing this request, keeping session")
+                    Log.e(TAG, "Host unavailable transiently — failing this request, keeping session")
                     null
                 }
 
@@ -188,8 +198,9 @@ object ApiClient {
      * clearSession() + SessionExpiredBus — turning a harmless expected failure
      * into a full logout that bounced the user to the pairing screen.
      *
-     * This replacement pulls a fresh token from the HOST over IPC, exactly like
-     * bluehiveApi. The KEY difference from hostTokenAuthenticator: platformApi's
+     * This replacement refreshes through TokenProvider against BlueHive's own
+     * backend, exactly like bluehiveApi — no IPC, despite what the names suggest.
+     * The KEY difference from hostTokenAuthenticator: platformApi's
      * callers are all background/lifecycle pings (foreground/background/getMe/
      * checkSlot/endSession). A transient host failure on one of those must NOT
      * destroy the session. So on a null token we give up on THIS request only —
@@ -236,12 +247,17 @@ object ApiClient {
 
 
 
-    // PHASE 2: bluehive-api reads the device from the JWT (require_user) and
-    // IGNORES X-Refresh-Token. The platform refresh endpoint is fingerprint-bound
-    // to the HOST's device, so BlueHive must NEVER self-refresh — it would 403 on
-    // device mismatch. Instead: send only the host-supplied Bearer token (+ API
-    // key), and on 401 pull a fresh token from the HOST over IPC. No refresh token
-    // is attached, and the host-backed authenticator replaces tokenAuthenticator.
+    // bluehive-api reads the device from the JWT (require_user) and IGNORES
+    // X-Refresh-Token, so no refresh token is attached to these requests. On a
+    // 401, hostTokenAuthenticator refreshes through TokenProvider against
+    // bluehive-api's own /auth/refresh.
+    //
+    // THE PHASE 2 RULE ABOVE THIS LINE IS DEAD, and it inverted the truth. It
+    // said BlueHive must NEVER self-refresh, because the platform refresh
+    // endpoint was fingerprint-bound to the HOST's device and would 403 on a
+    // mismatch — true while tokens came from Off-Grid Drive over AIDL. BlueHive
+    // owns its own refresh token now and spends it on its own backend, so
+    // self-refresh is not merely allowed, it is the only mechanism left.
     private val bluehiveHttpClient: OkHttpClient = OkHttpClient.Builder()
         .addInterceptor { chain ->
             val session = SessionManager.get()

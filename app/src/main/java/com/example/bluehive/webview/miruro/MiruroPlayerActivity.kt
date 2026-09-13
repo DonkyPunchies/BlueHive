@@ -48,18 +48,22 @@ import com.example.bluehive.webview.exoplayer_resources.ExoPlayerConfig
 import com.example.bluehive.api.WatchHistoryRequest
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.ui.PlayerView
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import android.widget.Toast
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
+import com.example.bluehive.auth.SessionManager
 import com.example.bluehive.BuildConfig
 import com.example.bluehive.IdleWatcher
-import com.example.bluehive.StillWatchingOverlay
 import okhttp3.OkHttpClient
 import java.util.concurrent.TimeUnit
+import com.example.bluehive.api.extractStreamAwait
 
 @UnstableApi
 class MiruroPlayerActivity : ComponentActivity() {
@@ -88,6 +92,90 @@ class MiruroPlayerActivity : ComponentActivity() {
     private var fallbackUrl: String? = null
     private var usingFallback = false
 
+    // ── Second-stage recovery: re-extract when the relay fails too ──────────
+    //
+    // THE FIRST STAGE (direct -> relay, below) CANNOT FIX AN EXPIRED TOKEN.
+    // Miruro signs its segment URLs with a token that dies after roughly nine
+    // minutes. MEASURED 2026-08-27: Mushoku Tensei s1e6 played 121 segments
+    // through the relay and then every request became a 403, because the URL
+    // itself had expired — not the network, not the host, the URL. Relaying a
+    // dead URL harder cannot help; the only fix is a NEW url, which means
+    // extracting again.
+    //
+    // Until this existed the branch simply logged "nothing left to try" and the
+    // picture froze on the last decoded frame.
+    private var extractRetries = 0
+
+    // ── Cooldown, not expiry ────────────────────────────────────────────────
+    //
+    // A 403 FROM THIS CDN IS A PENALTY BOX, NOT A DEAD URL, and getting that
+    // backwards is what made the first version of this file worse than the
+    // freeze it replaced. MEASURED 2026-08-27:
+    //
+    //   - Two extractions with refresh=1, both reporting cached=false, returned
+    //     the IDENTICAL url. Miruro's path token is deterministic per
+    //     episode+audio+server, so re-extracting cannot mint a different one and
+    //     is structurally incapable of clearing a 403.
+    //   - The exact url that 403'd this device answered 200 from the SAME
+    //     household IP twenty minutes later. Nothing had expired; the client had
+    //     been let back in.
+    //   - Providers bee, pewe and hop all resolve to s1.watami.win. Switching
+    //     server changes the url but not the host the limit is counted against,
+    //     so it buys nothing here either.
+    //
+    // The 429s that preceded the 403s said all of this out loud. So the answer to
+    // a refusal is to STOP ASKING for a while — the opposite of what re-extraction
+    // does, which is to restart playback and fire a fresh burst of segment
+    // requests at a CDN that just asked for quiet.
+    // The last url EXTRACTION produced — not what the player currently holds.
+    // Those differ whenever the relay is in use (the player has an
+    // api.<domain>/api/hls/proxy url wrapping this one), and comparing against
+    // the player's would make the same-url guard below a silent no-op in exactly
+    // the case that needs it most.
+    private var lastExtractedM3u8: String? = null
+    private var cooldownRetries = 0
+
+    // ONE COOLDOWN AT A TIME. MEASURED 2026-08-28 on Mushoku Tensei: cooldowns 3
+    // and 4 fired 9.5s and 41s after the previous one instead of the 60s and 120s
+    // they had asked for, so a 225-second budget was spent in 104 seconds and the
+    // player gave up while the CDN was still only a few minutes from letting us
+    // back in. The url it abandoned answered 200 shortly afterwards.
+    //
+    // The cause is that a multi-audio manifest gives ExoPlayer TWO loaders — video
+    // and the English audio rendition — and each reports its own failure. Without
+    // this guard the audio track's error spends the video track's pending
+    // cooldown, and the budget drains at the rate errors arrive rather than the
+    // rate we chose to retry.
+    private var cooldownPending = false
+    private val MAX_COOLDOWN_RETRIES = 4
+    // 30s, 60s, 120s, 240s — 7.5 minutes of patience in total. The previous
+    // 15/30/60/120 schedule was still short: the refusal that ended the 2026-08-28
+    // session had lifted well before I checked the url again, but not within the
+    // 3m45s that schedule allowed even when honoured.
+    private val COOLDOWN_BASE_MS = 30_000L
+
+    // THE BUDGET RESETS AFTER SUSTAINED PLAYBACK, and that is the difference
+    // between this and the movie player's version. HlsPlayerActivity spends a
+    // LIFETIME budget of four, which suits "this CDN is broken, try a few
+    // servers". It does not suit a token that expires on a schedule: a
+    // 24-minute episode needs ~2 refreshes and a feature-length film ~9, so a
+    // lifetime cap would still freeze exactly the content this is meant to fix.
+    //
+    // Elapsed time since the last recovery is the signal. If the stream played
+    // for two clear minutes, whatever just happened is a NEW problem rather
+    // than a retry loop, and it gets a fresh budget. A genuine loop retries
+    // within seconds and never earns the reset.
+    private var lastRecoveryAtMs = 0L
+    private val MAX_EXTRACT_RETRIES = 4
+    private val RETRY_BUDGET_RESET_MS = 120_000L
+
+    /** Say something before the screen goes away — a silent finish reads as a crash. */
+    private fun abandonSourceWithNotice() {
+        Toast.makeText(this, "Couldn't reach this episode's server. Try another source.",
+                       Toast.LENGTH_LONG).show()
+        lifecycleScope.launch { delay(2_500); finish() }
+    }
+
     /**
      * Media3 groups IO/network failures in the 2000-2999 error range
      * (ERROR_CODE_IO_*). We fall back ONLY for those — a decoder or renderer
@@ -111,6 +199,32 @@ class MiruroPlayerActivity : ComponentActivity() {
         val title     = intent.getStringExtra("MEDIA_TITLE")
         val epName    = intent.getStringExtra("EPISODE_NAME")
         val source    = intent.getStringExtra("SOURCE_NAME") ?: "Miruro"
+
+        // ── COLLAPSE THE DETAILS BACK-STACK ─────────────────────────────────
+        //
+        // Browsing recommendation -> recommendation pushes each page onto
+        // BlueHiveApplication.detailsHistory (capped at 8, oldest evicted). Once
+        // something actually PLAYS, that trail is spent: the user's next BACK
+        // should return them to wherever they entered from — Home, History,
+        // Favorites — not walk them back through eight pages they already left.
+        //
+        // Clearing is the whole mechanism: with the stack empty,
+        // popPreviousDetails() returns null and the details screen's back handler
+        // falls through to its sourceScreen branch, which goes to the entry point.
+        //
+        // WHY IT HAD STOPPED WORKING. clearDetailsHistory() was only ever called
+        // from handleStreamingSourceSelected — the GeckoView path. Once playback
+        // moved to backend extraction + ExoPlayer, that function stopped being
+        // reached for almost every play, so the stack was never collapsed and BACK
+        // walked the whole trail again.
+        //
+        // Placed here, gated by the same guard as the history row, so "logged to
+        // watch history" and "back-stack collapsed" are always the same event —
+        // which is the rule that makes the behaviour predictable.
+        runCatching {
+            (application as? com.example.bluehive.BlueHiveApplication)?.clearDetailsHistory()
+        }
+
 
         CoroutineScope(Dispatchers.IO).launch {
             try {
@@ -172,6 +286,7 @@ class MiruroPlayerActivity : ComponentActivity() {
         // Relay URL to switch to if the direct CDN attempt fails. Absent = the
         // caller wants the given URL played as-is with no fallback.
         fallbackUrl = intent.getStringExtra("M3U8_FALLBACK_URL")?.takeIf { it.isNotBlank() }
+        lastExtractedM3u8 = url
 
         Log.d(sCRAPE, "▶️ playing extracted m3u8: $url (referer=$referer) " +
                 "fallback=${if (fallbackUrl != null) "available" else "none"}")
@@ -188,10 +303,121 @@ class MiruroPlayerActivity : ComponentActivity() {
         // Buffering / bitrate / networking come from the shared ExoPlayerConfig so
         // every site's player behaves identically. Only requestHeaders above are
         // Miruro-specific (its CDN pins Origin to miruro.tv).
+        // See HlsPlayerActivity: the hint must exist before the engine is built.
+        ExoPlayerConfig.ensureQuicHint(this, url)
         val httpFactory = ExoPlayerConfig.dataSourceFactory(ua, requestHeaders, context = this)
 
         fun buildMediaSource(playUrl: String): HlsMediaSource =
             ExoPlayerConfig.hlsMediaSource(playUrl, httpFactory)
+
+        // ── Re-extraction inputs ────────────────────────────────────────────────
+        // AUDIO is the one that must not be missing. Sub and dub are different
+        // streams behind one page, and the backend keys its cache on the track —
+        // so re-extracting without naming it hands a dub viewer Japanese audio and
+        // calls it a success. That is a worse outcome than the freeze this whole
+        // path exists to remove, because nothing about it looks wrong.
+        val reAudio   = intent.getStringExtra("AUDIO")
+        val reServer  = intent.getStringExtra("SERVER")
+        val reTmdb    = intent.getStringExtra("MEDIA_ID")?.toIntOrNull()
+        val reSeason  = intent.getIntExtra("SEASON_NUMBER", 0).takeIf { it > 0 }
+        val reEpisode = intent.getIntExtra("EPISODE_NUMBER", 0).takeIf { it > 0 }
+        val reTitle   = intent.getStringExtra("MEDIA_TITLE")
+        val reProfile = intent.getIntExtra("PROFILE_ID", -1).takeIf { it > 0 }
+
+        /**
+         * Fetch a FRESH manifest and resume where we were.
+         *
+         * The last resort, reached only once relaying has also failed. Logged at
+         * Log.e throughout on purpose: release builds strip v/d/i/w, and a recovery
+         * path that goes quiet in exactly the builds users run is a path nobody can
+         * diagnose.
+         */
+        fun reExtractAndResume(why: String) {
+            if (reTmdb == null) {
+                Log.e(sCRAPE, "[recovery] no MEDIA_ID — cannot re-extract ($why)")
+                abandonSourceWithNotice(); return
+            }
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (lastRecoveryAtMs != 0L && now - lastRecoveryAtMs > RETRY_BUDGET_RESET_MS) {
+                Log.e(sCRAPE, "[recovery] ${(now - lastRecoveryAtMs) / 1000}s of playback since " +
+                        "the last recovery — this is a new fault, resetting the budget")
+                extractRetries = 0
+            }
+            if (extractRetries >= MAX_EXTRACT_RETRIES) {
+                Log.e(sCRAPE, "[recovery] $MAX_EXTRACT_RETRIES re-extractions without lasting " +
+                        "playback — giving up on this source")
+                abandonSourceWithNotice(); return
+            }
+            extractRetries++
+            lastRecoveryAtMs = now
+            val resumeAt = player?.currentPosition?.coerceAtLeast(0L) ?: 0L
+            Log.e(sCRAPE, "[recovery] re-extracting ($why) " +
+                    "$extractRetries/$MAX_EXTRACT_RETRIES, resuming at ${resumeAt}ms")
+
+            lifecycleScope.launch {
+                val body = runCatching {
+                    ApiClient.bluehiveApi.extractStreamAwait(
+                        type    = if (reSeason != null) "tv" else "movie",
+                        tmdbId  = reTmdb,
+                        season  = reSeason,
+                        episode = reEpisode,
+                        source  = "miruro",
+                        // refresh=1 IS THE POINT. The cached entry is the very URL
+                        // that just died; serving it back would burn a retry to
+                        // reproduce the same 403.
+                        refresh = 1,
+                        mtype   = if (reSeason != null) "anime_tv" else "anime_movie",
+                        title   = reTitle,
+                        profile = reProfile,
+                        device  = SessionManager.get().deviceFingerprint,
+                        audio   = reAudio,
+                        server  = reServer,
+                    )
+                }.getOrNull()?.takeIf { it.isSuccessful }?.body()
+
+                if (body == null || body.m3u8.isBlank()) {
+                    Log.e(sCRAPE, "[recovery] re-extraction produced nothing — giving up")
+                    abandonSourceWithNotice(); return@launch
+                }
+                // THE URL DID NOT CHANGE, SO NEITHER WILL THE OUTCOME. Miruro mints
+                // deterministically, so a re-extraction can hand back the very url
+                // that just failed. Restarting into it costs a seek, a fresh burst
+                // of segment requests and one of the four retries, to reproduce the
+                // same error — so treat it as the refusal it is and cool down.
+                if (lastExtractedM3u8 == body.m3u8) {
+                    Log.e(sCRAPE, "[recovery] re-extraction returned the SAME url — " +
+                            "nothing to restart into, cooling down instead")
+                    extractRetries--   // refund: this attempt bought nothing
+                    if (cooldownRetries < MAX_COOLDOWN_RETRIES) {
+                        cooldownRetries++
+                        val waitMs = COOLDOWN_BASE_MS shl (cooldownRetries - 1)
+                        delay(waitMs)
+                        runCatching { player?.prepare() }
+                    } else {
+                        abandonSourceWithNotice()
+                    }
+                    return@launch
+                }
+                if (reAudio != null && body.audio != null && !body.audio.equals(reAudio, true)) {
+                    Log.e(sCRAPE, "[recovery] asked for '$reAudio' but the extractor " +
+                            "returned '${body.audio}' — audio will not match the label")
+                }
+                // BACK TO STAGE ONE. The fresh URL is a direct CDN link, so the
+                // relay fallback becomes available again; leaving usingFallback set
+                // would skip it and relay a stream that may not need relaying at
+                // all — every byte of it through the VPS for nothing.
+                usingFallback = false
+                fallbackUrl = body.proxy_url?.takeIf { it.isNotBlank() }
+                lastExtractedM3u8 = body.m3u8
+                Log.e(sCRAPE, "[recovery] fresh manifest, resuming at ${resumeAt}ms")
+                player?.apply {
+                    setMediaSource(buildMediaSource(body.m3u8))
+                    prepare()
+                    if (resumeAt > 0) seekTo(resumeAt)
+                    playWhenReady = true
+                }
+            }
+        }
 
         // Always grab the HIGHEST quality Miruro lists. HLS master playlists (e.g. the
         // wixmp 1080p/720p/480p one) default to ADAPTIVE selection — ExoPlayer starts
@@ -199,6 +425,31 @@ class MiruroPlayerActivity : ComponentActivity() {
         // decode instead. Single-quality media playlists have nothing to choose, so
         // they're unaffected. This is playback-side only — zero impact on extraction.
         val trackSelector = ExoPlayerConfig.trackSelector(this)
+
+        // ── Pick the audio the viewer actually asked for ─────────────────────────
+        //
+        // THE MANIFEST CONTAINS BOTH TRACKS AND MARKS THE WRONG ONE DEFAULT.
+        // MEASURED 2026-08-27 on Mushoku Tensei s1e6, the master playlist returned
+        // for a DUB request:
+        //
+        //   #EXT-X-MEDIA:TYPE=AUDIO,NAME="Japanese",DEFAULT=YES,LANGUAGE="jpn"
+        //   #EXT-X-MEDIA:TYPE=AUDIO,NAME="English",           LANGUAGE="eng"
+        //
+        // Extraction was correct — the dub url differs from the sub url and the
+        // English rendition is right there — but with no language preference set,
+        // ExoPlayer honours DEFAULT=YES and plays Japanese. The dub was being
+        // fetched and then ignored, which is why this looked like an extraction
+        // fault and is not one.
+        //
+        // setPreferredAudioLanguage is a PREFERENCE, not a filter: a single-track
+        // manifest (which is what this source used to return) still plays normally
+        // rather than failing to find a match.
+        if (intent.getStringExtra("AUDIO")?.equals("dub", ignoreCase = true) == true) {
+            trackSelector.setParameters(
+                trackSelector.buildUponParameters().setPreferredAudioLanguage("en")
+            )
+            Log.e(sCRAPE, "🔊 dub requested — preferring English audio rendition")
+        }
         // Generous buffers so 1080p (~5.5 Mbps) relayed through the HLS proxy rides out
         // proxy/CDN hiccups without stalling. Mirrors VidApiPlayerActivity:
         // min 30s, max 120s, start after 2.5s, resume 10s after a rebuffer.
@@ -239,12 +490,44 @@ class MiruroPlayerActivity : ComponentActivity() {
                         // first — see RelayGrantRequest. Async, hence the switch
                         // to the player happens in the coroutine below.
                         lifecycleScope.launch {
-                            val granted = runCatching {
+                            // Captured rather than discarded so a THROWN call is
+                            // distinguishable from a refusal. Both used to look
+                            // identical in the log, which is why "relay grant
+                            // refused" never said whether the relay had said no or
+                            // the request never arrived.
+                            val grantAttempt = runCatching {
                                 ApiClient.bluehiveApi.mintRelayGrant(
                                     RelayGrantRequest(relayUrl))
-                            }.getOrNull()?.takeIf { it.isSuccessful }?.body()?.relay_url
+                            }
+                            val granted = grantAttempt.getOrNull()
+                                ?.takeIf { it.isSuccessful }?.body()?.relay_url
                             if (granted.isNullOrBlank()) {
-                                Log.e(sCRAPE, "🛑 relay grant refused — cannot recover")
+                                // RE-EXTRACT, DO NOT PARK.
+                                //
+                                // This used to log one line and return, which left the
+                                // player in STATE_IDLE forever: usingFallback was
+                                // already true, so no later error could route to stage
+                                // two — and no later error ever arrived, because
+                                // attachStallWatchdog deliberately skips IDLE. The
+                                // result was a black screen that never recovered and
+                                // never explained itself, with BACK the only way out.
+                                //
+                                // HlsPlayerActivity hits the identical condition and
+                                // calls relaunchExtraction(); every other terminal
+                                // branch in this file ends at abandonSourceWithNotice().
+                                // This was the one dead end.
+                                //
+                                // reExtractAndResume owns the budget: it falls through
+                                // to abandonSourceWithNotice() when MEDIA_ID is missing
+                                // or the retries are spent, and refuses to restart into
+                                // an unchanged URL. So the worst case is now a message
+                                // the user can act on instead of silence.
+                                val why = grantAttempt.exceptionOrNull()
+                                    ?.let { "threw ${it.javaClass.simpleName}: ${it.message}" }
+                                    ?: grantAttempt.getOrNull()?.let { "http ${it.code()}" }
+                                    ?: "no response"
+                                Log.e(sCRAPE, "🛑 relay grant refused ($why) — re-extracting")
+                                reExtractAndResume("relay-grant-refused")
                                 return@launch
                             }
                             player?.apply {
@@ -254,8 +537,106 @@ class MiruroPlayerActivity : ComponentActivity() {
                                 playWhenReady = true
                             }
                         }
-                    } else if (usingFallback) {
-                        Log.e(sCRAPE, "❌ relay failed too — nothing left to try")
+                    } else {
+                        // ── Stage two ────────────────────────────────────────────
+                        //
+                        // A PLAIN `else`, NOT `else if (usingFallback)`. Two ways in:
+                        // the relay was tried and failed, OR there was never a relay
+                        // URL to try (fb == null, a caller that wanted this URL played
+                        // as-is). The second case used to match no branch at all and
+                        // froze in silence — the same symptom, one condition earlier.
+                        //
+                        // THE SPLIT THAT MATTERS: did the server REFUSE us, or did we
+                        // fail to reach it? They look alike to the player and want
+                        // opposite treatment.
+                        //
+                        //   401/403/429  the host answered, and said no. The url is
+                        //                fine — this client is in a penalty box. Wait.
+                        //   transport    connection reset, DNS, TLS, timeout. Nothing
+                        //                answered, so the url may genuinely be dead and
+                        //                a fresh one is worth fetching.
+                        //
+                        // Getting this backwards is what made the previous version worse
+                        // than the freeze: it read a 403 as an expired token and
+                        // re-extracted, four times in 73 seconds, each restarting
+                        // playback and firing another burst at a throttled CDN.
+                        val httpStatus = generateSequence(error.cause) { it.cause }
+                            .filterIsInstance<HttpDataSource.InvalidResponseCodeException>()
+                            .firstOrNull()?.responseCode
+
+                        if (httpStatus == 429 || httpStatus == 403 || httpStatus == 401) {
+                            // Already waiting — this is the other loader reporting the
+                            // same refusal, not a new one. Spending a retry on it is
+                            // what drained the budget in a third of the intended time.
+                            if (cooldownPending) {
+                                Log.e(sCRAPE, "[recovery] HTTP $httpStatus while a cooldown " +
+                                        "is already pending — ignoring (not spending a retry)")
+                                return
+                            }
+                            // ESCALATE TO RE-EXTRACTION ONCE WAITING HAS CLEARLY
+                            // FAILED. MEASURED 2026-08-28, mid-freeze, sampling 40
+                            // distinct segments of the manifest the player was stuck
+                            // on: 13 answered 200 and 27 answered 403, and an
+                            // immediate retry of eight failures recovered NONE of
+                            // them. That manifest was not throttled or expired — two
+                            // thirds of it was simply gone, permanently.
+                            //
+                            // A fresh extraction at the same moment returned a
+                            // different host (watami rather than piltover) serving
+                            // 6 of 8 sampled segments. So the remedy for a rotten
+                            // manifest is a different manifest, and no amount of
+                            // patience substitutes for it.
+                            //
+                            // WHY COOLDOWN STILL COMES FIRST: a genuine rate-limit
+                            // does exist and does clear on its own, and re-extracting
+                            // into one costs a browser run to be refused again. Two
+                            // waits separate "asked to slow down" from "this copy is
+                            // broken"; after that, waiting longer is just a slower
+                            // way to fail. reExtractAndResume refuses to restart into
+                            // an unchanged url, so the escalation cannot loop.
+                            if (cooldownRetries >= 2 && reTmdb != null) {
+                                Log.e(sCRAPE, "[recovery] $cooldownRetries cooldowns did not " +
+                                        "clear HTTP $httpStatus — this manifest looks broken, " +
+                                        "re-extracting for a different one")
+                                cooldownRetries = 0
+                                cooldownPending = false
+                                reExtractAndResume("stale-manifest-$httpStatus")
+                            } else if (cooldownRetries < MAX_COOLDOWN_RETRIES) {
+                                cooldownRetries++
+                                val waitMs = COOLDOWN_BASE_MS shl (cooldownRetries - 1)
+                                Log.e(sCRAPE, "[recovery] HTTP $httpStatus — cooling down " +
+                                        "${waitMs / 1000}s ($cooldownRetries/$MAX_COOLDOWN_RETRIES), " +
+                                        "same url, NOT re-extracting")
+                                Toast.makeText(this@MiruroPlayerActivity,
+                                    "Server is throttling — retrying in ${waitMs / 1000}s…",
+                                    Toast.LENGTH_SHORT).show()
+                                cooldownPending = true
+                                lifecycleScope.launch {
+                                    delay(waitMs)
+                                    // prepare() replays the SAME source. The url was
+                                    // never the problem, so there is nothing to rebuild.
+                                    runCatching { player?.prepare() }
+                                    // Cleared only AFTER prepare, so errors arriving
+                                    // during the wait cannot spend another retry.
+                                    cooldownPending = false
+                                }
+                            } else {
+                                Log.e(sCRAPE, "[recovery] still $httpStatus after " +
+                                        "$MAX_COOLDOWN_RETRIES cooldowns — giving up on this source")
+                                abandonSourceWithNotice()
+                            }
+                        } else if (isNetworkFailure(error)) {
+                            // Nothing answered. A fresh url can plausibly help here, and
+                            // reExtractAndResume refuses to restart into an unchanged one.
+                            reExtractAndResume(error.errorCodeName)
+                        } else {
+                            // 4000s are decode/renderer faults. A fresh URL would
+                            // decode exactly as badly, so re-extracting would spend a
+                            // browser run to reproduce the same failure.
+                            Log.e(sCRAPE, "[recovery] ${error.errorCodeName} is not a " +
+                                    "network fault — re-extraction cannot help")
+                            abandonSourceWithNotice()
+                        }
                     }
                 }
             })
@@ -294,8 +675,16 @@ class MiruroPlayerActivity : ComponentActivity() {
                 // the longer still-watching check instead. The pause hook has to
                 // hop to the main thread — ExoPlayer is single-threaded and
                 // IdleWatcher ticks on IO.
-                IdleWatcher.setPlaying(IdleWatcher.SOURCE_MIRURO, isPlaying) {
-                    runOnUiThread { player?.pause() }
+                IdleWatcher.setPlaying(IdleWatcher.SOURCE_MIRURO, isPlaying)
+
+                // FRAMES ARE FLOWING, SO THE PENALTY BOX IS BEHIND US. Without this
+                // the budget is a per-launch total, and a two-hour film that gets
+                // throttled four separate times would be abandoned on the fourth
+                // even though every previous cooldown did exactly its job.
+                if (isPlaying && cooldownRetries > 0) {
+                    Log.e(sCRAPE, "[recovery] playback resumed — clearing the cooldown budget")
+                    cooldownRetries = 0
+                    cooldownPending = false
                 }
 
                 if (isPlaying && !watchLogged) {
@@ -304,6 +693,12 @@ class MiruroPlayerActivity : ComponentActivity() {
                 }
             }
 
+            // LOGGING ONLY, AND SECOND. Recovery lives in the listener added
+            // earlier (see reExtractAndResume) — Player.Listener callbacks run in
+            // registration order, so that one has already decided what to do by the
+            // time this line prints. Kept because the message is the human-readable
+            // one, but do not add behaviour here: two listeners both acting on the
+            // same error is how you get a re-extraction racing a relay switch.
             override fun onPlayerError(error: PlaybackException) {
                 Log.e(sCRAPE, "❌ ExoPlayer error: ${error.message} | cause: ${error.cause?.message}")
             }
@@ -343,7 +738,6 @@ class MiruroPlayerActivity : ComponentActivity() {
                     // overlay. Takes no focus and consumes no input; any remote
                     // press dismisses it through the window hook in
                     // BlueHiveApplication.
-                    StillWatchingOverlay()
                 }
             }
         }
@@ -557,6 +951,10 @@ class MiruroPlayerActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        // Applied HERE because the player is already released, so no request
+        // is in flight and the engine can be shut down properly. Rebuilding
+        // mid-playback leaked engines until Cronet stopped building at all.
+        ExoPlayerConfig.applyPendingQuicHints()
         Log.d(sCRAPE, "🧹 MiruroPlayerActivity onDestroy — releasing player")
         // Unconditionally and first: onIsPlayingChanged is not guaranteed to fire
         // false on the way out, and a source stuck in the playing set suppresses

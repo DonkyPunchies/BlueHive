@@ -71,33 +71,25 @@ object HostEntitlementRelay {
     private const val PROVIDER_URI = "content://io.host.entitlement.provider/assertion"
     private const val COLUMN = "assertion"
 
+    /**
+     * Whether the host still holds a session. Published by hosts from
+     * 2026-09-12; absent on older ones, which is why every read of it tolerates
+     * a missing column rather than treating it as a negative.
+     */
+    private const val COLUMN_PAIRED = "paired"
+
     /** Authority only, for asking Android whether a host exists at all. */
     private const val PROVIDER_AUTHORITY = "io.host.entitlement.provider"
 
     private const val PREFS = "host_entitlement"
     private const val KEY   = "assertion"
 
-    /** Debounce state for host-absence. See [hostPresenceReport]. */
-    private const val KEY_ABSENT_SINCE = "host_absent_since"
-    private const val KEY_ABSENT_COUNT = "host_absent_count"
-
-    /**
-     * How much evidence before we will say the host is gone.
-     *
-     * BOTH conditions, not either. Android reports a package as missing while it
-     * is being updated, while external storage is unmounted, and when the user has
-     * merely DISABLED it — so a single absent reading is worth nothing, and even
-     * three in a row can happen inside one reinstall if they land close together.
-     * Requiring the absence to persist across several checks AND to have lasted
-     * ten minutes means an update or a remount cannot reach the threshold, while a
-     * genuine uninstall reaches it within one evening's use.
-     *
-     * Getting this wrong in the lenient direction costs a delay. Getting it wrong
-     * in the strict direction locks a paying user out of their own TV because the
-     * host app happened to be mid-update when they opened BlueHive.
-     */
-    private const val ABSENT_READINGS_REQUIRED = 3
-    private const val ABSENT_MIN_SPAN_MS = 10L * 60 * 1000
+    // The absence debounce that used to live here is gone, along with the two
+    // preference keys that carried its state. It demanded three readings spanning
+    // ten minutes before it would admit the host was missing, which in practice
+    // meant three cold starts of this app before an uninstalled host had any
+    // effect. Absence is now reported the moment it is observed; see
+    // [hostPresenceReport] for why that trade is the right way round.
 
     /** Last standing the SERVER returned. Survives restarts so the lock does. */
     private const val KEY_STANDING = "standing"
@@ -191,7 +183,11 @@ object HostEntitlementRelay {
         scope.launch {
             runCatching {
                 val resp = ApiClient.bluehiveApi.submitHostEntitlement(
-                    HostEntitlementRequest(assertion, hostPresent = hostPresenceReport(app))
+                    HostEntitlementRequest(
+                        assertion,
+                        hostPresent = hostPresenceReport(app),
+                        hostPaired  = readPairedFromProvider(app),
+                    )
                 )
                 val standing = resp.body()?.standing?.trim()?.lowercase()
                 if (resp.isSuccessful && standing != null) applyStanding(app, standing)
@@ -353,7 +349,11 @@ object HostEntitlementRelay {
         }
         return runCatching {
             val resp = ApiClient.bluehiveApi.submitHostEntitlement(
-                HostEntitlementRequest(assertion, hostPresent = hostPresenceReport(app))
+                HostEntitlementRequest(
+                    assertion,
+                    hostPresent = hostPresenceReport(app),
+                    hostPaired  = readPairedFromProvider(app),
+                )
             )
             val standing = resp.body()?.standing?.trim()?.lowercase()
             if (resp.isSuccessful && standing != null) {
@@ -432,6 +432,31 @@ object HostEntitlementRelay {
         // Off the main thread: a provider query blocks the caller, and if the
         // host's process is dead this is the call that starts it.
         scope.launch {
+            // UNPAIR IS CHECKED FIRST, because the old order could never see it.
+            //
+            // This used to open with `readFromProvider(app) ?: return@launch`, on
+            // the reasoning that no token means nothing to report. That is true
+            // for a cold host and false for an unpaired one, and they produce the
+            // identical empty read. So the single case this hook most needed to
+            // catch was the one case it returned early on: a television unpaired
+            // while BlueHive sat open would go on working through every screen
+            // transition, because the check that was supposed to notice bailed
+            // one line in.
+            //
+            // Asking the host outright separates them. Only an explicit false
+            // gets here; a cold host, an older host with no such column, or a
+            // failed read all yield null and fall through to the original
+            // token-changed path untouched.
+            if (readPairedFromProvider(app) == false) {
+                Log.i(TAG, "host reports unpaired — reporting to lock this device")
+                // stored(), because the provider has nothing left to give. The
+                // mirrored pass is still a validly signed token, which is all the
+                // server needs to identify the device; host_paired=false is what
+                // it acts on, and it overrides whatever the token says inside.
+                stored(app)?.let { submit(app, it) }
+                return@launch
+            }
+
             val fresh = readFromProvider(app) ?: return@launch
             if (fresh == stored(app)) return@launch
             Log.i(TAG, "host assertion changed — re-reporting")
@@ -463,44 +488,41 @@ object HostEntitlementRelay {
      * What we are willing to TELL THE SERVER about the host's presence.
      *
      *   true  — a host is installed
-     *   false — confirmed gone, and only after [ABSENT_READINGS_REQUIRED] readings
-     *           spanning [ABSENT_MIN_SPAN_MS]
-     *   null  — do not know, or not confirmed yet
+     *   false — no host on this machine, reported the moment it is observed
+     *   null  — the lookup itself failed, so there is no evidence either way
      *
      * NULL IS THE DEFAULT AND THE SAFE ANSWER. It is omitted from the request
-     * body, and the server treats a missing field as no information. Everything
-     * uncertain lands here: the lookup failed, or the host is absent but has not
-     * been absent for long enough to rule out an update. Only a confirmed
-     * absence marks the machine, and that mark follows the hardware — so it is
-     * the one report in this file that must never be made on a guess.
+     * body, and the server treats a missing field as no information. Only one
+     * case lands there now: the package lookup itself threw. That is the single
+     * situation with no evidence either way, and it must never abandon anybody.
      *
-     * Seeing the host resets the counters, so an app that comes back mid-way
-     * through an update starts again from zero.
+     * The mark follows the hardware rather than the account, so it used to be
+     * described as the one report here that must never be made on a guess. It
+     * still is not a guess — resolveContentProvider either finds a host or does
+     * not. What changed is that we no longer wait to see the same answer three
+     * times before believing it.
      */
     private fun hostPresenceReport(context: Context): Boolean? {
-        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        // ANSWERED ON THE SPOT. This used to require three separate readings
+        // spanning ten minutes before it would say the host was gone, and the
+        // readings only accrued on a cold start — so uninstalling the host meant
+        // opening BlueHive three times over ten minutes before anything happened.
+        // The rule is simply: no host, no access, decided the moment we look.
+        //
+        // The debounce existed because Android reports a package as missing while
+        // it is being updated, so a badly timed launch could mark a healthy
+        // machine. That risk is now carried somewhere better: the mark is
+        // reversible, and pairing forces a fresh mint, so a host that comes back
+        // clears it. Trading a ten-minute hole for a narrow update window is the
+        // right way round, because the hole was permanent and the window is
+        // seconds long and self-healing.
+        //
+        // NULL STILL MEANS "COULD NOT TELL", and only the lookup itself failing
+        // produces it. That is the one case with no evidence either way, and it
+        // must not abandon anybody.
         val installed = hostPackageInstalled(context) ?: return null
-
-        if (installed) {
-            if (prefs.contains(KEY_ABSENT_SINCE) || prefs.contains(KEY_ABSENT_COUNT)) {
-                prefs.edit().remove(KEY_ABSENT_SINCE).remove(KEY_ABSENT_COUNT).apply()
-            }
-            return true
-        }
-
-        val now = System.currentTimeMillis()
-        var since = prefs.getLong(KEY_ABSENT_SINCE, 0L)
-        // Wall clock, so it survives a reboot — but a clock that has moved
-        // BACKWARDS would park `since` in the future and hold the span negative
-        // forever. Restart the window rather than trusting it.
-        if (since == 0L || since > now) since = now
-
-        val count = prefs.getInt(KEY_ABSENT_COUNT, 0) + 1
-        prefs.edit().putLong(KEY_ABSENT_SINCE, since).putInt(KEY_ABSENT_COUNT, count).apply()
-
-        val confirmed = count >= ABSENT_READINGS_REQUIRED && (now - since) >= ABSENT_MIN_SPAN_MS
-        if (confirmed) Log.i(TAG, "host package gone — $count readings over ${(now - since) / 60_000}min")
-        return if (confirmed) false else null
+        if (!installed) Log.i(TAG, "host package not installed — reporting machine abandoned")
+        return installed
     }
 
     private fun stored(context: Context): String? =
@@ -513,6 +535,34 @@ object HostEntitlementRelay {
                 if (c.moveToFirst()) c.getString(c.getColumnIndexOrThrow(COLUMN)) else null
             }
     }.getOrNull()?.takeIf { it.isNotBlank() }
+
+    /**
+     * Does the host still hold an account, or has it been unpaired?
+     *
+     * THE QUESTION [readFromProvider] CANNOT ANSWER. An empty assertion means
+     * either "I have been unpaired" or "my process just started and has not
+     * loaded anything yet", and those want opposite responses. Guessing wrong
+     * towards the first abandons a working television on every cold boot;
+     * guessing wrong towards the second is what let an unpaired one keep working
+     * off our mirrored pass until it expired. The host now states it outright.
+     *
+     * NULL IS THE DEFAULT AND THE SAFE ANSWER, returned for every uncertainty:
+     * no host installed, a host too old to publish the column, a provider that
+     * throws, a host that could not read its own store. Only a host that is
+     * present and says plainly that it holds no session yields false, and only
+     * false has consequences.
+     */
+    private fun readPairedFromProvider(context: Context): Boolean? = runCatching {
+        context.contentResolver.query(Uri.parse(PROVIDER_URI), null, null, null, null)
+            ?.use { c ->
+                if (!c.moveToFirst()) return@use null
+                // getColumnIndex, not getColumnIndexOrThrow: an older host has no
+                // such column, and that is a supported configuration rather than
+                // an error. -1 falls through to null.
+                val i = c.getColumnIndex(COLUMN_PAIRED)
+                if (i < 0 || c.isNull(i)) null else c.getInt(i) == 1
+            }
+    }.getOrNull()
 
     /**
      * The best pass available right now, for the ONE caller that needs the token

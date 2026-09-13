@@ -270,6 +270,52 @@ object CrashReporter {
         }
     }
 
+    /**
+     * One row per playback that actually reached frames, direct or relayed.
+     *
+     * THE DENOMINATOR, AND THE REASON RELAY DATA COULD NOT ANSWER ANYTHING.
+     * bluehive.relay_sessions records failures and nothing else, so it can say
+     * which CDN relayed the most and never what share of that source's plays
+     * that was: a source relaying twice out of three and one relaying twice out
+     * of two hundred produce identical rows. "Is this getting worse" was
+     * therefore unanswerable, and so was the comparison that actually diagnoses
+     * these fastest — what the plays that did NOT relay did differently.
+     *
+     * ON THE EXISTING REPORTS ENDPOINT ON PURPOSE. The client path, the route,
+     * the JSONB meta column and the nightly retention sweep all already exist,
+     * so this costs one report type and no migration. Which of these fields
+     * deserve real columns is exactly what we do not know yet, and guessing at a
+     * schema before the first query is how you get a table nobody uses.
+     *
+     * FIRED ONCE PER PLAYBACK, at the first time frames flow. A relay always
+     * happens before that point — a stream that relays never reaches READY on
+     * the direct attempt — so `relayed` describes how this playback actually
+     * started. The rare mid-play relay, hours in from the stall watchdog, is
+     * already recorded in relay_sessions and is not re-reported here.
+     */
+    fun reportPlaybackStart(
+        context: Context,
+        extraMeta: Map<String, Any?> = emptyMap(),
+    ) {
+        ioScope.launch {
+            try {
+                val body = buildReport(
+                    context,
+                    reportType = "playback_start",
+                    extraMeta = extraMeta,
+                )
+                val resp = ApiClient.bluehiveApi.submitDeviceReport(body)
+                if (resp.isSuccessful) {
+                    Log.i(TAG, "📤 Playback start reported")
+                } else {
+                    Log.w(TAG, "Playback start report rejected: HTTP ${resp.code()}")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Playback start report failed: ${e.message}")
+            }
+        }
+    }
+
     // ── Report assembly ───────────────────────────────────────────────────────
 
     private fun buildReport(

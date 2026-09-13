@@ -19,6 +19,25 @@ package com.example.bluehive.utilities
 //  7. Composables — ConfirmationOverlay (the reusable two-button dialog)
 // ─────────────────────────────────────────────────────────────────────────────
 
+import androidx.activity.compose.BackHandler
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.foundation.Image
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
+import kotlin.math.cos
+import kotlin.math.sin
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -806,6 +825,653 @@ private fun ServerRow(
                 fontFamily = AppTypography.interBold,
                 fontSize = 11.sp,
             )
+        }
+    }
+}
+/**
+ * "Welcome back, <name>" — the profile-entry transition.
+ *
+ * SHARED BY TWO SCREENS ON PURPOSE, and that sharing is the whole point.
+ *
+ * MEASURED 2026-09-04 on the onn 4K box: pressing a profile fires
+ * startActivity(HomeScreenCompose) as the press animation ends, but Android
+ * keeps the OLD activity on screen until the new one draws its first frame —
+ * and that frame costs 1355ms ("Displayed HomeScreenCompose: +1s355ms"). This
+ * overlay lived only inside HomeScreenCompose, so for that whole second the
+ * viewer sat looking at a frozen, shrunken, greyed-out profile card with no
+ * indication anything was happening. The loading screen could not cover the
+ * wait for itself.
+ *
+ * ProfileScreenActivity now raises this the instant the press animation
+ * finishes, and HomeScreenCompose raises the identical thing when it finally
+ * draws. Because both render the same composable, the handoff is invisible: one
+ * continuous loading screen spanning two activities, rather than a dead second
+ * followed by a loading screen.
+ *
+ * STILL CHEAP, AND THAT CONSTRAINT DID NOT RELAX WHEN THIS GOT PRETTIER. One of
+ * the two places this renders IS HomeScreenCompose's first frame — the very
+ * frame it exists to cover — so anything it does is paid for out of the wait it
+ * is hiding. Hence: no bitmap anywhere. The comb is seven Paths of six points
+ * each, recomputed per frame from two floats, which costs orders of magnitude
+ * less than decoding a logo PNG on a 2GB box that is simultaneously inflating a
+ * home screen. A spinner was the old answer to the same constraint; this is a
+ * better answer to it, not a relaxation of it.
+ */
+@Composable
+fun ProfileEntryOverlay(profileName: String) {
+    // ── Comb palette ─────────────────────────────────────────────────────────
+    //
+    // A royal blue sitting between the app accent (378ADD) and a near-pure
+    // electric blue (0D00FF). Both ends were tried on the panel and both were
+    // wrong: the accent is a sky blue that goes weightless on black, and 0D00FF
+    // at full chroma blooms on a large screen and posterises as it falls off.
+    //
+    // 2A4AD6 keeps enough green in the mix to stay a BLUE rather than drifting
+    // violet, which is what made the electric version read as harsh, while still
+    // carrying far more depth than the accent. The gradient does the rest: the
+    // eye reads the range instead of any single value, so no one stop has to
+    // carry the whole impression.
+    val combBase = Color(0xFF2A4AD6)   // the colour the comb actually reads as
+    val combLift = Color(0xFF7A90E8)   // top, so upper cells clear the black
+    val combDeep = Color(0xFF121E5E)   // bottom, same hue well down in value
+    val edgeLift = Color(0xFFA8BCF2)   // outlines run brighter than the fills,
+    val edgeDeep = Color(0xFF2B3C9E)   // so the comb keeps its shape when lit
+    val bg       = Color(0xFF0C0C0C)
+
+    val motion = rememberInfiniteTransition(label = "profileEntry")
+
+    // One phase drives the whole comb. Each cell reads it at its own offset, so
+    // the wave costs a single animation rather than seven.
+    val phase by motion.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2200, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart,
+        ),
+        label = "phase",
+    )
+
+    // The core breathes on its own clock, slower than the wave, so the middle of
+    // the comb never lands in perfect lockstep with the ring travelling round it.
+    val core by motion.animateFloat(
+        initialValue = 0.55f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1500, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "core",
+    )
+
+    Box(
+        modifier = Modifier.fillMaxSize().background(bg),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+
+            Box(contentAlignment = Alignment.Center) {
+                // Halo. Kept faint on purpose: a TV panel bands dark blues badly,
+                // and this only needs to lift the comb off the black.
+                Box(
+                    modifier = Modifier
+                        .size(PROFILE_COMB_SIZE * 1.8f)
+                        .background(
+                            Brush.radialGradient(
+                                colors = listOf(
+                                    combBase.copy(alpha = 0.16f * core),
+                                    Color.Transparent,
+                                ),
+                            ),
+                            shape = CircleShape,
+                        )
+                )
+
+                Canvas(modifier = Modifier.size(PROFILE_COMB_SIZE)) {
+                    val cx = size.width / 2f
+                    val cy = size.height / 2f
+                    val r = size.width / 5.4f           // cell circumradius
+                    val step = r * 1.732f               // centre-to-centre, pointy-top
+                    val stroke = Stroke(width = r * 0.13f)
+
+                    // HOISTED OUT OF THE CELL LOOP. Both brushes span the whole
+                    // comb, so a cell's colour depends on where it sits in the
+                    // cluster rather than on its own bounds — that is what makes
+                    // this read as one object lit from above instead of seven
+                    // separately-shaded tiles. Building them once per frame
+                    // rather than seven times also keeps the allocation cost of
+                    // this screen where the header promises it is.
+                    val fillBrush = Brush.linearGradient(
+                        colors = listOf(combLift, combBase, combDeep),
+                        start = Offset(0f, 0f),
+                        end = Offset(0f, size.height),
+                    )
+                    val edgeBrush = Brush.linearGradient(
+                        colors = listOf(edgeLift, combBase, edgeDeep),
+                        start = Offset(0f, 0f),
+                        end = Offset(0f, size.height),
+                    )
+
+                    // Centre first, then the ring clockwise from the right.
+                    for (i in 0..6) {
+                        val centre = if (i == 0) {
+                            Offset(cx, cy)
+                        } else {
+                            val a = ((i - 1) * 60f) * PI_OVER_180
+                            Offset(cx + step * cos(a), cy + step * sin(a))
+                        }
+
+                        // Cell brightness. The centre holds steady and breathes;
+                        // the ring runs a comet — sharp rise, slow decay — so the
+                        // comb reads as filling rather than blinking.
+                        val lit = if (i == 0) {
+                            core
+                        } else {
+                            val t = (((phase - (i - 1) * 0.14f) % 1f) + 1f) % 1f
+                            val decay = 1f - t
+                            0.18f + 0.82f * decay * decay * decay
+                        }
+
+                        // Brush for the colour, alpha for the animation. Keeping
+                        // those separate is what lets one gradient serve every
+                        // cell while each still pulses on its own clock.
+                        val path = hexPath(centre, r)
+                        drawPath(path, brush = fillBrush, alpha = 0.14f + 0.34f * lit)
+                        drawPath(
+                            path,
+                            brush = edgeBrush,
+                            alpha = 0.24f + 0.76f * lit,
+                            style = stroke,
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(38.dp))
+
+            // PERSONAL FIRST, STATUS SECOND. The old copy led with the machine's
+            // job ("Getting X's profile ready") and buried the person in the
+            // middle of it. Greeting them first is the whole difference between a
+            // progress message and a welcome.
+            Text(
+                text = if (profileName.isNotBlank()) "Welcome back, $profileName" else "Welcome back",
+                color = Color(0xFFF5F5F2),
+                fontSize = 30.sp,
+                fontFamily = AppTypography.interBold,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center,
+            )
+
+            Spacer(Modifier.height(10.dp))
+
+            Text(
+                text = "Setting up your space",
+                color = Color(0xFF9A9AA2),
+                fontSize = 14.sp,
+                fontFamily = AppTypography.interSemiBold,
+                letterSpacing = 0.4.sp,
+                textAlign = TextAlign.Center,
+            )
+        }
+    }
+}
+
+/** Diameter of the honeycomb cluster. */
+private val PROFILE_COMB_SIZE = 132.dp
+
+private const val PI_OVER_180 = 0.017453292f
+
+/**
+ * One pointy-top hexagon.
+ *
+ * Vertices start at -90 degrees so a point sits at the top; in screen space y
+ * grows downward, which is why that reads as "up" rather than 90.
+ */
+private fun hexPath(centre: Offset, radius: Float): Path = Path().apply {
+    for (v in 0..5) {
+        val a = (60f * v - 90f) * PI_OVER_180
+        val x = centre.x + radius * cos(a)
+        val y = centre.y + radius * sin(a)
+        if (v == 0) moveTo(x, y) else lineTo(x, y)
+    }
+    close()
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. PlaybackSettingsOverlay
+//    Reached from the browser button in the corner of a details screen. Controls
+//    whether picking a streaming source raises the "our player, or the site?"
+//    prompt (DefaultServerPrompt, above) or goes straight to the built-in player.
+//
+//    WHY THIS EXISTS. That prompt is correct the first few times and tiresome
+//    after that: most viewers pick the same answer every time, and it stands
+//    between them and playback on every single episode. Rather than removing it
+//    — the site path is a genuine fallback when extraction fails — this lets a
+//    viewer turn it off once.
+//
+//    Two buttons rather than a checkbox: on a remote, "which of these two" is
+//    one press, while a checkbox is a press plus working out what state it
+//    ended up in. Each button names its OUTCOME, not "on"/"off", so neither
+//    needs the label read twice.
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Composable
+fun PlaybackSettingsOverlay(
+    askEachTime: Boolean,
+    onChoose: (Boolean) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val askFocus    = remember { FocusRequester() }
+    val directFocus = remember { FocusRequester() }
+
+    // Focus lands on the setting that is CURRENTLY active, so the overlay opens
+    // showing the viewer where they already are. Confirming without reading is
+    // then a no-op rather than a silent change of behaviour.
+    LaunchedEffect(Unit) {
+        awaitFrame()
+        if (askEachTime) askFocus.requestFocus() else directFocus.requestFocus()
+    }
+
+    BackHandler(enabled = true) { onDismiss() }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(overlayScrimColor())
+    )
+
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier.fillMaxSize(),
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier
+                .background(color = overlayCardBackgroundColor(), shape = overlayCardShape())
+                .border(width = 1.dp, color = overlayCardBorderColor(), shape = overlayCardShape())
+                .padding(
+                    horizontal = OVERLAY_CARD_PADDING_HORIZONTAL,
+                    vertical   = OVERLAY_CARD_PADDING_VERTICAL,
+                )
+                .width(OVERLAY_CARD_WIDTH),
+        ) {
+            Text(
+                text = "Playback method",
+                color = Color.White,
+                fontFamily = AppTypography.interBold,
+                fontWeight = FontWeight.Bold,
+                fontSize = 17.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth(),
+            )
+
+            Text(
+                text = "Some sources can be played in the built-in player or " +
+                       "opened directly on the streaming site. Choose whether " +
+                       "to be asked each time, or to go straight to the " +
+                       "built-in player.",
+                color = Color(0xFFB8B8C0),
+                fontFamily = AppTypography.interSemiBold,
+                fontSize = 11.sp,
+                lineHeight = 16.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 10.dp, bottom = 20.dp),
+            )
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(
+                    space = 15.dp,
+                    alignment = Alignment.CenterHorizontally,
+                ),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                ModularButton(
+                    textConfig = ModularButtonTextConfig(text = "Ask each time", fontSize = 10f),
+                    isToggleable = false,
+                    fontFamily = AppTypography.interBold,
+                    focusRequester = askFocus,
+                    onClick = { onChoose(true) },
+                    modifier = Modifier.focusProperties {
+                        up    = FocusRequester.Cancel
+                        down  = FocusRequester.Cancel
+                        left  = FocusRequester.Cancel
+                        right = directFocus
+                    },
+                    dimensions = overlayButtonDimensions(),
+                    colors = overlayCancelButtonColors(),
+                    glowConfig = overlayButtonGlowConfig(),
+                    animationConfig = overlayButtonAnimationConfig(),
+                )
+
+                ModularButton(
+                    textConfig = ModularButtonTextConfig(text = "Built-in player", fontSize = 10f),
+                    isToggleable = false,
+                    fontFamily = AppTypography.interBold,
+                    focusRequester = directFocus,
+                    onClick = { onChoose(false) },
+                    modifier = Modifier.focusProperties {
+                        up    = FocusRequester.Cancel
+                        down  = FocusRequester.Cancel
+                        left  = askFocus
+                        right = FocusRequester.Cancel
+                    },
+                    dimensions = overlayButtonDimensions(),
+                    colors = overlayCancelButtonColors(),
+                    glowConfig = overlayButtonGlowConfig(),
+                    animationConfig = overlayButtonAnimationConfig(),
+                )
+            }
+
+            // Current state, spelled out. The two buttons say what WILL happen;
+            // without this there is nothing saying which one is already in force,
+            // and focus position alone is too subtle to carry it.
+            Text(
+                text = if (askEachTime) "Currently: asking each time"
+                       else            "Currently: using the built-in player",
+                color = Color(0xFF8A8A93),
+                fontFamily = AppTypography.interSemiBold,
+                fontSize = 10.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 16.dp),
+            )
+        }
+    }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. UpdateRequiredOverlay
+//     The consent gate shown BEFORE a byte of the update is downloaded.
+//
+//     WHY A GATE AT ALL. The updater used to open straight onto a progress bar,
+//     so the first thing a user learned about an update was that one was already
+//     happening to them. On the home-screen path that arrived on top of a screen
+//     they were using, which reads as the app breaking rather than the app
+//     maintaining itself. Asking first costs one press and turns the same event
+//     into something the user agreed to.
+//
+//     NO "LATER" BUTTON, DELIBERATELY. The two outcomes are accept or leave,
+//     because the build the operator has published is the only build the backend
+//     is being kept compatible with. A third button offering to postpone would be
+//     offering something the app cannot honour.
+//
+//     Specs are broken out into their own functions, matching the rest of this
+//     file, so the card can be re-proportioned without touching the composable.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Width of the update card. Wider than [OVERLAY_CARD_WIDTH] — it carries prose. */
+val UPDATE_CARD_WIDTH = 500.dp
+
+/** Horizontal padding inside the update card. */
+val UPDATE_CARD_PADDING_HORIZONTAL = 40.dp
+
+/** Vertical padding inside the update card. */
+val UPDATE_CARD_PADDING_VERTICAL = 26.dp
+
+/** Rendered size of the BlueHive mark at the top of the card. */
+val UPDATE_LOGO_SIZE = 84.dp
+
+/** Hairline rule between the heading and the body copy. */
+fun updateDividerColor(): Color = Color(0xFF2E2C2C)
+
+/** Body copy colour — softer than the heading so the hierarchy reads at 10 feet. */
+fun updateBodyTextColor(): Color = Color(0xFFB8B8C0)
+
+/** The version line and the closing note. Quietest text on the card. */
+fun updateFootnoteTextColor(): Color = Color(0xFF8A8A93)
+
+/**
+ * Wider than [overlayButtonDimensions] so "Close Application" fits on one line
+ * without dropping the font size below what is readable from a sofa.
+ */
+fun updateButtonDimensions(): ModularButtonDimensions = ModularButtonDimensions(
+    mainWidth          = 152.dp,
+    mainHeight         = 27.dp,
+    mainYOffset        = 6.5.dp,
+    secondWidth        = 152.dp,
+    secondHeight       = 12.dp,
+    secondYOffset      = 26.dp,
+    mainCornerRadius   = 7f,
+    secondCornerRadius = 8f,
+    shadowHeight       = 12.dp,
+    glowWidth          = 170.dp,
+    glowHeight         = 41.dp,
+)
+
+/** Glow spec for the update buttons. Re-centred for the wider face. */
+fun updateButtonGlowConfig(): ModularButtonGlowConfig = ModularButtonGlowConfig(
+    enabled               = true,
+    defaultRes            = R.drawable.button_focus_wide_glow,
+    offsetX               = (-9).dp,
+    offsetY               = 7.dp,
+    cornerRadius          = 100.dp,
+    fadeOutDurationMillis = 200,
+    fadeInDurationMillis  = 400,
+)
+
+/**
+ * UpdateRequiredOverlay
+ *
+ * @param currentVersion  versionName of the build that is running now.
+ * @param newVersion      versionName the update server is offering.
+ * @param onAccept        begin the update. The caller owns permission + download.
+ * @param onClose         leave the app. Nothing is downloaded.
+ *
+ * Focus lands on Accept, which is the opposite of [ConfirmationOverlay]'s rule
+ * and intentionally so. There the default had to be the harmless button because
+ * the other one deleted something; here the harmless button is the one that
+ * proceeds, and the press worth guarding against is the one that closes the app.
+ */
+@Composable
+fun UpdateRequiredOverlay(
+    currentVersion: String,
+    newVersion:     String,
+    onAccept:       () -> Unit,
+    onClose:        () -> Unit,
+) {
+    val acceptFocus = remember { FocusRequester() }
+    val closeFocus  = remember { FocusRequester() }
+
+    LaunchedEffect(Unit) {
+        awaitFrame()
+        acceptFocus.requestFocus()
+    }
+
+    // BACK MEANS THE SAME THING AS "CLOSE APPLICATION", because on this screen
+    // those are the same intent. Back is how you leave, and the only way to
+    // leave this gate is to stop using the app until you take the update.
+    //
+    // It used to be swallowed, on the reasoning that Back must not dismiss a
+    // gate the user has not answered. That is still true -- this does not
+    // dismiss anything, it takes the decline branch explicitly -- but a button
+    // that does nothing at all reads as the remote being broken, which is worse
+    // than either real outcome.
+    //
+    // ONLY WHILE THIS OVERLAY IS COMPOSED. SelfUpdateActivity keeps its own
+    // swallow-everything callback for the download and install phase, and this
+    // one is registered later, so it wins while it exists and hands Back back to
+    // the activity the moment the user accepts. Pressing Back mid-install still
+    // does nothing, which is what you want with an install in flight.
+    BackHandler(enabled = true) { onClose() }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(overlayScrimColor())
+    )
+
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier.fillMaxSize(),
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier
+                .background(brush = overlayCardBackgroundBrush(), shape = overlayCardShape())
+                .border(width = 1.dp, color = overlayCardBorderColor(), shape = overlayCardShape())
+                .padding(
+                    horizontal = UPDATE_CARD_PADDING_HORIZONTAL,
+                    vertical   = UPDATE_CARD_PADDING_VERTICAL,
+                )
+                .width(UPDATE_CARD_WIDTH),
+        ) {
+
+            // ── Mark ──────────────────────────────────────────────────────────
+            // painterResource, not the BitmapFactory path BeeLogo uses. That
+            // cache exists because the extraction overlay appears at a memory
+            // peak on 2 GB boxes; this screen appears at launch or on an idle
+            // home screen, where the ordinary resource loader is fine.
+            Image(
+                painter            = painterResource(R.drawable.blue_bee),
+                contentDescription = null,
+                contentScale       = ContentScale.Fit,
+                modifier           = Modifier.size(UPDATE_LOGO_SIZE),
+            )
+
+            // ── Heading ───────────────────────────────────────────────────────
+            Text(
+                text       = "A new version of BlueHive is ready",
+                color      = Color.White,
+                fontFamily = AppTypography.interBold,
+                fontWeight = FontWeight.Bold,
+                fontSize   = 18.sp,
+                lineHeight = 24.sp,
+                textAlign  = TextAlign.Center,
+                modifier   = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 6.dp),
+            )
+
+            // ── Rule ──────────────────────────────────────────────────────────
+            Box(
+                modifier = Modifier
+                    .padding(top = 14.dp, bottom = 14.dp)
+                    .fillMaxWidth()
+                    .height(1.dp)
+                    .background(updateDividerColor())
+            )
+
+            // ── Body ──────────────────────────────────────────────────────────
+            // Says what is being asked, why, and what happens next. The line
+            // about the confirmation screen is not filler: Android raises its own
+            // install dialog over the top of this app, and someone who is not
+            // expecting it tends to dismiss it and end up back where they
+            // started with no idea what went wrong.
+            //
+            // KEPT SHORT ON PURPOSE, and the copy is load-bearing on the layout.
+            // An Android TV viewport is 960x540 dp whatever the panel's pixel
+            // count, so this card has ~540 dp of height to live in and no
+            // scrolling to fall back on. At [UPDATE_CARD_WIDTH] each of these
+            // paragraphs wraps to three lines and the whole card stacks to about
+            // 420 dp. Adding a sentence is not free — it is 19 dp off the margin.
+            Text(
+                text = "This release is required to continue using BlueHive. It keeps " +
+                       "your device in step with our servers, so sign-in, your profiles " +
+                       "and your library all keep working as they should.",
+                color      = updateBodyTextColor(),
+                fontFamily = AppTypography.interSemiBold,
+                fontSize   = 12.sp,
+                lineHeight = 19.sp,
+                textAlign  = TextAlign.Center,
+                modifier   = Modifier.fillMaxWidth(),
+            )
+
+            // HEDGED ON PURPOSE. On API 31+ the system confirm dialog is now
+            // suppressed (see UpdateManager.install), so promising it outright
+            // would describe a screen most devices never show. It can still
+            // appear on an older box, or if the platform declines the request,
+            // so the copy prepares for it without depending on it.
+            Text(
+                text = "The download takes only a moment, then BlueHive will close while " +
+                       "the update installs. If your device asks you to confirm, please accept.",
+                color      = updateBodyTextColor(),
+                fontFamily = AppTypography.interSemiBold,
+                fontSize   = 12.sp,
+                lineHeight = 19.sp,
+                textAlign  = TextAlign.Center,
+                modifier   = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 10.dp),
+            )
+
+            Text(
+                text       = "Thank you for your patience.",
+                color      = updateBodyTextColor(),
+                fontFamily = AppTypography.interSemiBold,
+                fontSize   = 12.sp,
+                lineHeight = 19.sp,
+                textAlign  = TextAlign.Center,
+                modifier   = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 10.dp),
+            )
+
+            // ── Versions ──────────────────────────────────────────────────────
+            Text(
+                text       = "Version $currentVersion  →  Version $newVersion",
+                color      = updateFootnoteTextColor(),
+                fontFamily = AppTypography.interBold,
+                fontSize   = 11.sp,
+                textAlign  = TextAlign.Center,
+                modifier   = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 18.dp, bottom = 20.dp),
+            )
+
+            // ── Buttons ───────────────────────────────────────────────────────
+            // Red on the left, blue on the right, matching every other two-button
+            // overlay in this file so the colour keeps meaning the same thing.
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(
+                    space     = 15.dp,
+                    alignment = Alignment.CenterHorizontally,
+                ),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                ModularButton(
+                    textConfig      = ModularButtonTextConfig(text = "Close Application", fontSize = 10f),
+                    isToggleable    = false,
+                    fontFamily      = AppTypography.interBold,
+                    focusRequester  = closeFocus,
+                    onClick         = onClose,
+                    modifier        = Modifier.focusProperties {
+                        up    = FocusRequester.Cancel
+                        down  = FocusRequester.Cancel
+                        left  = FocusRequester.Cancel
+                        right = acceptFocus
+                    },
+                    dimensions      = updateButtonDimensions(),
+                    colors          = overlayConfirmButtonColors(),
+                    glowConfig      = updateButtonGlowConfig(),
+                    animationConfig = overlayButtonAnimationConfig(),
+                )
+
+                ModularButton(
+                    textConfig      = ModularButtonTextConfig(text = "Accept Update", fontSize = 10f),
+                    isToggleable    = false,
+                    fontFamily      = AppTypography.interBold,
+                    focusRequester  = acceptFocus,
+                    onClick         = onAccept,
+                    modifier        = Modifier.focusProperties {
+                        up    = FocusRequester.Cancel
+                        down  = FocusRequester.Cancel
+                        left  = closeFocus
+                        right = FocusRequester.Cancel
+                    },
+                    dimensions      = updateButtonDimensions(),
+                    colors          = overlayCancelButtonColors(),
+                    glowConfig      = updateButtonGlowConfig(),
+                    animationConfig = overlayButtonAnimationConfig(),
+                )
+            }
         }
     }
 }

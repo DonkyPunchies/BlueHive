@@ -2,6 +2,7 @@ package com.example.bluehive
 
 import android.content.Intent
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -38,6 +39,9 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.lifecycle.lifecycleScope
+import com.example.bluehive.update.UpdateGate
+import kotlinx.coroutines.launch
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
@@ -57,7 +61,56 @@ private const val LOADING_MIN_DISPLAY_MS = 1_500L   // branding video shows at l
 // profile picker; nothing is abandoned.
 private const val LOADING_MAX_WAIT_MS    = 20_000L
 
+/**
+ * Total wall-clock the update answer gets, measured from onCreate — NOT from the
+ * moment the warm-up finishes.
+ *
+ * WHY THIS REPLACED A 5s WAIT. The old constant was 5s spent AFTER AppWarmup, and
+ * it silently lost the race on the launch that matters most. UpdateManager's
+ * manifest client is deliberately allowed 20s, because a cold DNS lookup plus a
+ * TLS handshake to a remote host does not reliably fit in less. The loading
+ * screen was giving that 20s job as little as 6.5s: AppWarmup is entirely
+ * best-effort and swallows every network failure, so on a launch where the
+ * network has not settled yet it returns almost immediately and the screen ends
+ * at its LOADING_MIN_DISPLAY_MS floor.
+ *
+ * That is exactly the first launch after an install — slowest possible fetch,
+ * fastest possible warm-up — so the update was missed precisely when it was most
+ * likely to exist, and only the home-screen fallback caught it, one profile pick
+ * later. The next launch found it immediately because DNS and TLS were warm,
+ * which is what makes the bug look like luck.
+ *
+ * MEASURED FROM onCreate SO THE TWO BUDGETS DO NOT ADD UP. The fetch starts at
+ * onCreate, so any time AppWarmup spends is time the fetch already had. Waiting
+ * this long again afterwards would make a broken network cost AppWarmup's 20s
+ * cap PLUS this one. Subtracting the elapsed time keeps the whole launch inside
+ * one ceiling instead of the sum of two.
+ *
+ * SLIGHTLY ABOVE THE FETCH'S OWN 20s, on purpose. The intent is that a fetch
+ * which completes is never cut off, so this stops being a policy about how long
+ * an update check may take and becomes only a backstop against one that hangs
+ * past its own timeout. It exists so the launch path can never wait forever, not
+ * to decide anything.
+ *
+ * In the normal case none of this is spent: the answer is already in hand when
+ * the warm-up ends and the await returns instantly. It only elapses against a
+ * black-holed network — one that accepts a connection and then says nothing.
+ * Airplane mode and an ordinary outage both fail in milliseconds.
+ */
+private const val GATE_TOTAL_BUDGET_MS = 22_000L
+
 class LoadingScreenActivity : ComponentActivity() {
+
+    /**
+     * When the manifest fetch was started, so the wait for it can be charged
+     * against the time the warm-up already spent rather than added to it.
+     *
+     * elapsedRealtime, not wall clock: these boxes sync their time shortly after
+     * boot, and a clock that steps backwards mid-launch would inflate the
+     * remaining budget instead of shrinking it.
+     */
+    private var prefetchStartedAt = 0L
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -69,6 +122,20 @@ class LoadingScreenActivity : ComponentActivity() {
             systemBarsBehavior =
                 WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
+
+        // FETCH THE MANIFEST NOW, IN PARALLEL WITH THE WARM-UP.
+        //
+        // The loading screen is time the user already spends, and the manifest is
+        // a few kilobytes, so the answer is normally back well before this screen
+        // is finished — at no cost to how long the launch takes. An earlier
+        // version of this check blocked the launch behind a 4s timeout and
+        // skipped the update on 4 of 6 cold starts; starting it here instead
+        // means the wait later is only ever for what has not arrived yet.
+        //
+        // The timestamp is taken FIRST so the fetch is credited with every
+        // millisecond it actually gets — see GATE_TOTAL_BUDGET_MS.
+        prefetchStartedAt = SystemClock.elapsedRealtime()
+        UpdateGate.prefetch()
 
         setContent {
             LoadingScreen(
@@ -87,9 +154,44 @@ class LoadingScreenActivity : ComponentActivity() {
                     Log.d("SessionCheck", "userId          : ${session.userId}")
                     Log.d("SessionCheck", "================================")
                     if (isAuth) {
-                        Log.d("SessionCheck", "→ Routing to ProfileScreenActivity")
-                        startActivity(Intent(this, ProfileScreenActivity::class.java))
-                        finish()
+                        // THE UPDATE GATE, WHERE IT COSTS THE USER NOTHING.
+                        //
+                        // A required update belongs here rather than after the
+                        // profile picker. This is already a routing decision, so
+                        // it is a branch and not a timer: the user is sent to the
+                        // updater instead of the profile screen, rather than
+                        // reaching one and having it pulled away a few seconds
+                        // later — which is what the home-screen check did, and it
+                        // read as the app failing rather than updating.
+                        //
+                        // Returns false when the prefetch found no update OR has
+                        // not answered yet. Both mean the same thing here: carry
+                        // on. HomeScreenCompose still runs its own check, so a
+                        // slow answer costs a later prompt, never a missed one.
+                        // AWAITED, not sampled. The check was started in
+                        // onCreate and has normally been done for seconds by the
+                        // time the animation ends, so this returns instantly.
+                        //
+                        // WHAT IS LEFT OF THE BUDGET, not a fresh timer. The
+                        // fetch has been running since onCreate, so the warm-up's
+                        // elapsed time is time it already had; charging it again
+                        // here is what let a 20s-capable fetch be abandoned after
+                        // 6.5s. Subtracting instead keeps the launch inside one
+                        // ceiling rather than the sum of two, and coerceAtLeast
+                        // keeps a warm-up that overran the whole budget from
+                        // passing a negative timeout.
+                        val gateWaitMs = (GATE_TOTAL_BUDGET_MS -
+                            (SystemClock.elapsedRealtime() - prefetchStartedAt))
+                            .coerceAtLeast(0L)
+                        lifecycleScope.launch {
+                            if (UpdateGate.awaitAndRoute(this@LoadingScreenActivity, gateWaitMs)) {
+                                Log.d("SessionCheck", "→ Update required — routing to the updater")
+                            } else {
+                                Log.d("SessionCheck", "→ Routing to ProfileScreenActivity")
+                                startActivity(Intent(this@LoadingScreenActivity, ProfileScreenActivity::class.java))
+                            }
+                            finish()
+                        }
                     } else {
                         // PHASE 2: BlueHive has no pairing screen of its own —
                         // identity lives in the host. A direct launcher
@@ -114,7 +216,16 @@ fun LoadingScreen(onLoadingComplete: () -> Unit) {
         ExoPlayer.Builder(context).build().apply {
             val videoUri = "android.resource://${context.packageName}/${R.raw.bluehive_loading_4k}".toUri()
             setMediaItem(MediaItem.fromUri(videoUri))
-            repeatMode = Player.REPEAT_MODE_OFF
+            // LOOP. The clip is 3.0s (90 frames at 30fps) but this screen stays
+            // up until AppWarmup finishes -- MIN_DISPLAY alone is 1.5s and a cold
+            // start is routinely well past 3s -- so with REPEAT_MODE_OFF the
+            // animation ran once and then held its final frame for the rest of
+            // the wait. Most of what anyone actually saw was a still logo.
+            //
+            // Safe to loop: the first and last frames are the same image (mean
+            // difference 0.2/255), so the wrap is invisible rather than a visible
+            // snap back to the start.
+            repeatMode = Player.REPEAT_MODE_ALL
             volume = 0f
             prepare()
             playWhenReady = true

@@ -207,6 +207,8 @@ fun CreateProfileButton(
     dimensions: ProfileButtonDimensions = ProfileButtonDimensions(),
     glowConfig: CreateProfileGlowConfig = CreateProfileGlowConfig(),
     animConfig: ProfileButtonAnimationConfig = ProfileButtonAnimationConfig(),
+    // Fired only on a focus GAIN — see ProfileButtonBase.
+    onFocusGained: () -> Unit = {},
 ) {
     ProfileButtonBase(
         topImageRes    = R.drawable.create_profile,
@@ -216,6 +218,7 @@ fun CreateProfileButton(
         dimensions     = dimensions,
         animConfig     = animConfig,
         glowConfig     = glowConfig,
+        onFocusGained  = onFocusGained,
     )
 }
 
@@ -233,6 +236,10 @@ private fun ProfileButtonBase(
     animConfig: ProfileButtonAnimationConfig,
     // null = no glow (ProfilePictureButton). Non-null = render glow (CreateProfileButton).
     glowConfig: CreateProfileGlowConfig?,
+    // Fired only when this button GAINS focus, never on a loss and never on a
+    // recomposition reporting the same state. Default does nothing, so
+    // ProfilePictureButton and every other caller are unaffected.
+    onFocusGained: () -> Unit = {},
 ) {
     var isFocused by remember { mutableStateOf(false) }
     var pressWave by remember { mutableIntStateOf(0) }
@@ -384,7 +391,13 @@ private fun ProfileButtonBase(
                     .clip(RoundedCornerShape(dimensions.imageCornerRadius))
                     .align(Alignment.TopCenter)
                     .focusRequester(focusRequester)
-                    .onFocusChanged { isFocused = it.isFocused }
+                    .onFocusChanged {
+                        // Compared BEFORE assigning: onFocusChanged also
+                        // fires on recompositions carrying the same state.
+                        val gained = it.isFocused && !isFocused
+                        isFocused = it.isFocused
+                        if (gained) onFocusGained()
+                    }
                     .focusable(interactionSource = interactionSource)
                     .onKeyEvent { event ->
                         if (event.type == KeyEventType.KeyDown &&

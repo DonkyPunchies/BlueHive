@@ -125,10 +125,13 @@ class SessionManager private constructor(context: Context) {
 
 
     /**
-     * PHASE 2 (host contract): inject an access token obtained from the host
-     * over IPC, without a refresh token. In the host-driven model BlueHive does
-     * NOT own a refresh token — the host owns it and BlueHive pulls short-lived
-     * access tokens on demand. This writes ONLY the access token.
+     * Write ONLY the access token, leaving any stored refresh token untouched.
+     *
+     * NAMED FOR A MODEL THAT NO LONGER EXISTS. It was for tokens obtained from
+     * the host over IPC, back when BlueHive owned no refresh token of its own.
+     * TokenProvider ended that: BlueHive holds a refresh token and rotates it
+     * against its own backend, and this is now simply the access-token-only
+     * writer used when a refresh returns a new access token.
      *
      * Note: isAuthenticated is still refresh-token-based for now (legacy self-pair
      * path). Step 4 (identity port) redefines auth around host-provided tokens and

@@ -244,10 +244,7 @@ class MainWebViewer : AppCompatActivity() {
             // the two ExoPlayer activities.
             mediaSessionDelegate = object : MediaSession.Delegate {
                 override fun onPlay(session: GeckoSession, mediaSession: MediaSession) {
-                    IdleWatcher.setPlaying(IdleWatcher.SOURCE_WEBVIEW, true) {
-                        // Gecko is main-thread-only, same as ExoPlayer.
-                        mainHandler.post { runCatching { mediaSession.pause() } }
-                    }
+                    IdleWatcher.setPlaying(IdleWatcher.SOURCE_WEBVIEW, true)
                 }
 
                 override fun onPause(session: GeckoSession, mediaSession: MediaSession) {

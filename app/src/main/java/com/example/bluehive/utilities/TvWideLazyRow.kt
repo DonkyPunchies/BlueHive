@@ -246,18 +246,15 @@ fun TvWideLazyRow(
                                 }
                         }
 
-                        val runTimeText = remember(mediaItem.runtime) {
-                            val minutes = mediaItem.runtime ?: return@remember null
-                            if (minutes <= 0) null else {
-                                val h = minutes / 60
-                                val m = minutes % 60
-                                when {
-                                    h > 0 && m > 0 -> "${h}h ${m}m"
-                                    h > 0 -> "${h}h"
-                                    m > 0 -> "${m}m"
-                                    else -> null
-                                }
-                            }
+                        // WAS runtime-only, so every TV show on the home rows
+                        // carried no badge while the same show in Favourites
+                        // showed its season count. Shared now — see TitleCardFormat.
+                        val runTimeText = remember(
+                            mediaItem.runtime, mediaItem.numberOfSeasons, mediaItem.mediaType
+                        ) {
+                            TitleCardFormat.meta(
+                                mediaItem.mediaType, mediaItem.runtime, mediaItem.numberOfSeasons
+                            )
                         }
 
                         // AFTER
@@ -269,7 +266,10 @@ fun TvWideLazyRow(
                                 derivedStateOf { hasRowFocus && focusedIndex == index }
                             }
 
-                            var isPressed by remember { mutableStateOf(false) }
+                            // MutableState, not a delegated var: runTitleCardPress
+                            // flips these from a coroutine after this composition.
+                            val isPressed = remember { mutableStateOf(false) }
+                            val pressBusy = remember { mutableStateOf(false) }
                             var titleVisible by remember { mutableStateOf(false) }
                             val titleAlpha by animateFloatAsState(
                                 targetValue = if (titleVisible) 1f else 0f,
@@ -289,8 +289,10 @@ fun TvWideLazyRow(
 
 
                             val cardScale by animateFloatAsState(
-                                targetValue   = if (isItemFocused && isPressed) 0.80f else 1f,
-                                animationSpec = androidx.compose.animation.core.tween(250),
+                                targetValue   = if (isItemFocused && isPressed.value) TitleCardPress.SCALE else 1f,
+                                animationSpec = androidx.compose.animation.core.tween(
+                                    if (isPressed.value) TitleCardPress.SHRINK_MS else TitleCardPress.REGROW_MS
+                                ),
                                 label         = "cardScale",
                             )
 
@@ -317,9 +319,9 @@ fun TvWideLazyRow(
                                     }
                                     .onKeyEvent { event ->
                                         if (event.type == KeyEventType.KeyUp) {
-                                            if (event.key == Key.DirectionCenter || event.key == Key.Enter || event.key == Key.NumPadEnter) {
-                                                isPressed = false
-                                            }
+                                            // Release no longer ends the dip — runTitleCardPress
+                                            // owns the whole sequence, so a quick tap animates
+                                            // identically to a long hold.
                                             return@onKeyEvent false
                                         }
                                         if (event.type != KeyEventType.KeyDown) return@onKeyEvent false
@@ -391,9 +393,12 @@ fun TvWideLazyRow(
                                             }
 
                                             Key.Enter, Key.NumPadEnter, Key.DirectionCenter -> {
-                                                isPressed = true
+                                                // Sound now, navigation after the card has
+                                                // shrunk and sprung back — see TitleCardPress.
                                                 BlueHiveApplication.playClickSound()
-                                                onItemClick(mediaItem)
+                                                coroutineScope.runTitleCardPress(isPressed, pressBusy) {
+                                                    onItemClick(mediaItem)
+                                                }
                                                 true
                                             }
 
@@ -405,7 +410,7 @@ fun TvWideLazyRow(
 
                             var fontSize by remember(mediaItem.title) { mutableStateOf(16.sp) }
 
-                            if (isItemFocused && !isPressed) {
+                            if (isItemFocused && !isPressed.value) {
                                 Box(
                                     modifier = Modifier
                                         .width(145.dp)

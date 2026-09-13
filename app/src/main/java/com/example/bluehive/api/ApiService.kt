@@ -91,6 +91,30 @@ interface ApiService {
         @Query("media_type") mediaType: String,
     ): MediaDetailResponse
 
+    /**
+     * Details for many titles in ONE request.
+     *
+     * `ids` is a comma-separated list of `<tmdb_id>:<media_type>` pairs.
+     *
+     * WHY THIS EXISTS. Favourites fetched getMediaDetails once per entry and
+     * awaited them all. MEASURED 2026-09-04 with 131 favourites: the server
+     * answered each in ~3.5ms, but OkHttp caps concurrent requests to one host
+     * at 5 (this app sets no Dispatcher, so the default applies), making ~27
+     * sequential round trips to render one screen. The same 131 titles come
+     * back from this endpoint in a single call in ~20ms.
+     *
+     * NEITHER ORDER NOR COMPLETENESS IS GUARANTEED. Match results back by
+     * (tmdb_id, media_type); an id the server knows nothing about is simply
+     * absent, exactly as it would have 404'd individually.
+     *
+     * The server caps a single call at 300 pairs — see MEDIA_BATCH_MAX. Callers
+     * with more must chunk.
+     */
+    @GET("/api/media/batch")
+    suspend fun getMediaBatch(
+        @Query("ids") ids: String,
+    ): List<MediaDetailResponse>
+
     @GET("/api/media/search")
     suspend fun searchMedia(
         @Query("q")          query:     String,
@@ -187,6 +211,19 @@ data class CheckSlotResponse(val ok: Boolean)
 
 data class SimpleOkResponse(val ok: Boolean)
 
+/**
+ * Reply to POST /api/android/heartbeat.
+ *
+ * intervalSeconds is the SERVER'S choice of cadence, echoed on every beat so it
+ * can be retuned from the backend .env without shipping an app release. Nullable
+ * because an older backend answers a bare {"ok": true} — the client keeps its
+ * own default in that case rather than treating a missing field as zero.
+ */
+data class HeartbeatResponse(
+    val ok: Boolean,
+    @SerializedName("interval_seconds") val intervalSeconds: Int? = null,
+)
+
 data class ProfileResponse(
     val id:                   Int,
     val display_name:         String,
@@ -258,6 +295,21 @@ data class WatchHistoryResponse(
  * Names are only meaningful alongside the audio track they were read under —
  * see the endpoint doc.
  */
+data class CdnHostsResponse(
+    val hosts: List<String> = emptyList(),
+    val count: Int = 0,
+    /**
+     * Hosts the backend has PROVEN cannot speak h3, and which must therefore
+     * never be given a QUIC hint.
+     *
+     * Distinct from simple absence, and that distinction is why this field
+     * exists: mergeQuicHints merges and never removes, deliberately, so a device
+     * keeps hosts the backend has not met. Dropping a host from `hosts` alone
+     * would therefore evict nothing. This is positive evidence, so it evicts.
+     */
+    @SerializedName("h2_only") val h2Only: List<String> = emptyList(),
+)
+
 data class ExtractServerOption(
     val name:       String,
     val is_default: Boolean = false,
@@ -271,6 +323,37 @@ data class ExtractServersResponse(
 )
 
 data class ExtractResponse(
+    /**
+     * Every host this playlist points at, manifest and segments alike.
+     *
+     * The client cannot pre-warm DNS/ECH for a host it has never heard of, and
+     * /api/cdn-hosts is fetched only at app start. A segment host first seen
+     * during THIS extraction is therefore unknown to the player about to use it,
+     * so it resolves inside the playback critical path, loses the race for its
+     * ECH config, goes out in cleartext and gets severed — one relay.
+     *
+     * MEASURED 2026-08-30 on "Men": paperorbit.top failed exactly that way while
+     * cedarforge.top, proudotter.top and moon.peakstorm.top — all pre-warmed at
+     * startup — reached h3 200 in the same playback.
+     *
+     * Null or empty on older backends and on cache entries written before the
+     * field existed, which simply means no warm.
+     */
+    /**
+     * Is this manifest a PLAYLIST (HLS) or a whole file?
+     *
+     * The player otherwise guesses from the URL, which fails on any source whose
+     * media URL carries no extension. MEASURED 2026-08-30: VidLove serves HLS
+     * from https://a2.shows.st/api?d=... — no ".m3u8" anywhere — so the guess
+     * picked progressive, the MP4 extractors were handed a playlist, and playback
+     * died with UnrecognizedInputFormatException / NoDeclaredBrand.
+     *
+     * Nullable on purpose: it is a HINT, not a mandate. Where it is absent (an
+     * on-device extractor, a mid-play re-extraction) the player falls back to the
+     * URL heuristic exactly as before.
+     */
+    @SerializedName("is_hls") val isHls: Boolean? = null,
+    @SerializedName("cdn_hosts") val cdnHosts: List<String>? = null,
     val m3u8:         String,
     val referer:      String?,
     val user_agent:   String?,
@@ -279,7 +362,60 @@ data class ExtractResponse(
     val proxy_url:    String?,
     val cached:       Boolean = false,
     val expires_in:   Int     = 0,
+    /**
+     * The track this extraction ACTUALLY produced — "sub" | "dub".
+     *
+     * Without it a dub request that the site quietly served as sub was
+     * undetectable: the response carried a perfectly good manifest and the app
+     * played it, labelled it "Miruro (Dub)" in watch history, and the user got
+     * Japanese audio with nothing anywhere saying why. The on-device extractor
+     * has always reported this (RESULT_DUB_FALLBACK) and fails over on it; the
+     * backend path — which now serves EVERY anime play — had no equivalent, so
+     * that failover was dead code.
+     *
+     * Nullable ON PURPOSE. A backend that predates this field deserialises to
+     * null, which every caller reads as "can't tell" and treats exactly as it
+     * did before. Nothing regresses while the two sides are out of step.
+     */
+    val audio:        String? = null,
 )
+
+/**
+ * What one backend extract-and-play attempt produced.
+ *
+ * A plain Boolean could not express the case that matters: an extraction that
+ * SUCCEEDED but returned the wrong audio track. That reads as success to a
+ * caller checking for a manifest, which is precisely how sub audio reached a
+ * dub request unnoticed.
+ */
+/**
+ * One poll of a backend extraction job.
+ *
+ * [result] carries exactly the same payload [ExtractResponse] does on the
+ * synchronous path — the server rebuilds it per request, so proxy_url points at
+ * whatever host this client actually reached.
+ */
+data class ExtractJobResponse(
+    @SerializedName("job_id") val jobId:  String?,
+    val state:  String,
+    val result: ExtractResponse? = null,
+    val error:  ExtractJobError? = null,
+    val ms:     Long? = null,
+)
+
+data class ExtractJobError(
+    val reason: String? = null,
+    val detail: String? = null,
+)
+
+enum class ExtractOutcome {
+    /** Manifest in hand, player launched. */
+    PLAYED,
+    /** No manifest — backend down, blocked, or beaten by a site change. */
+    MISS,
+    /** Manifest in hand, but it is the other track. Caller decides what to do. */
+    WRONG_TRACK,
+}
 
 
 
@@ -485,8 +621,9 @@ interface BluehiveApiService {
     ): Response<BhAuthResponse>
 
     // ── Streaming-session / device-slot (PHASE 3, moved off PlatformApiService) ──
-    // These ride bluehiveHttpClient, which sends the host-supplied Bearer and
-    // refreshes it over IPC via hostTokenAuthenticator — exactly the auth shape
+    // These ride bluehiveHttpClient, which sends the Bearer token and refreshes
+    // it via hostTokenAuthenticator — which despite its name goes to bluehive-api
+    // over HTTP, not to the host over IPC — exactly the auth shape
     // bluehive-api expects. bluehive-api identifies the session from the JWT's
     // `device_id` claim (and scopes the cap by `ws`), so unlike the old platform
     // endpoints it needs no matching device_fingerprint row.
@@ -500,6 +637,14 @@ interface BluehiveApiService {
 
     @POST("/api/android/end-session")
     suspend fun endSession(): Response<SimpleOkResponse>
+
+    /**
+     * Client liveness. See SessionHeartbeat for why this exists at all — briefly:
+     * it is the only signal a FROZEN app cannot produce, and every other signal
+     * the backend had was authored by the backend itself.
+     */
+    @POST("/api/android/heartbeat")
+    suspend fun heartbeat(): Response<HeartbeatResponse>
 
     /**
      * Server-side m3u8 extraction (VidFast).
@@ -548,6 +693,51 @@ interface BluehiveApiService {
     ): Response<ExtractResponse>
 
     /**
+     * Begin an extraction and get a job id to poll — the same work as
+     * [extractStream], with the waiting moved off the request.
+     *
+     * WHY THIS EXISTS. [extractStream] answers on one request, so the server's
+     * entire budget has to fit inside this client's 30s readTimeout. It does not:
+     * the extractor is allowed 45s and the API retries once, so a cold extraction
+     * can legitimately need 60-90s. MEASURED 2026-08-30 on Jeepers Creepers and
+     * Poltergeist — two SocketTimeoutExceptions 61s apart, then the very next
+     * press played instantly, because the extraction the client had abandoned
+     * finished server-side and filled the cache. The work was never the problem;
+     * throwing it away was.
+     *
+     * The backend has had this endpoint for a while and no client ever called it.
+     *
+     * A CACHE HIT STILL ANSWERS INLINE, state="done" with the result attached, so
+     * the common path costs exactly one request as before — polling is entered
+     * only when there is genuinely something to wait for.
+     */
+    @GET("/api/extract/start")
+    suspend fun extractStart(
+        @Query("type")     type:     String,
+        @Query("tmdb_id")  tmdbId:   Int,
+        @Query("season")   season:   Int? = null,
+        @Query("episode")  episode:  Int? = null,
+        @Query("source")   source:   String = "vidfast",
+        @Query("refresh")  refresh:  Int    = 0,
+        @Query("mtype")    mtype:    String? = null,
+        @Query("title")    title:    String? = null,
+        @Query("profile")  profile:  Int?    = null,
+        @Query("device")   device:   String? = null,
+        @Query("audio")    audio:    String? = null,
+        @Query("server")   server:   String? = null,
+    ): Response<ExtractJobResponse>
+
+    /**
+     * Poll one job. Terminal states are "done" and "failed"; "expired" means the
+     * job outlived its TTL and a fresh start is needed — deliberately distinct
+     * from a 404, which would mean the id was never real.
+     */
+    @GET("/api/extract/job/{job_id}")
+    suspend fun extractJob(
+        @retrofit2.http.Path("job_id") jobId: String,
+    ): Response<ExtractJobResponse>
+
+    /**
      * Provider list for one title+track — the backend equivalent of the old
      * on-device ENUMERATE pass.
      *
@@ -556,6 +746,19 @@ interface BluehiveApiService {
      * so a list fetched under the wrong track names servers that do not exist on
      * the one about to play.
      */
+    /**
+     * CDN hostnames this backend has extracted from, for QUIC hinting.
+     *
+     * A client cannot discover these on its own without failing first: an
+     * SNI-filtering ISP severs the TCP handshake before any alt-svc header can
+     * arrive, so Chromium never learns the host speaks QUIC and can only be told
+     * at engine-build time. Left alone, every device pays one relayed playback
+     * per host — and these CDNs rotate constantly, so it never amortises.
+     * The backend meets every host first, so it publishes the list.
+     */
+    @GET("/api/cdn-hosts")
+    suspend fun cdnHosts(): Response<CdnHostsResponse>
+
     @GET("/api/extract/servers")
     suspend fun extractServers(
         @Query("type")     type:     String,          // "tv" | "movie"

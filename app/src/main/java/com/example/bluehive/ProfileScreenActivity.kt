@@ -41,11 +41,14 @@ import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.ColorMatrix
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -80,6 +83,7 @@ import com.example.bluehive.utilities.ProfileButtonAnimationConfig
 import com.example.bluehive.utilities.ProfileButtonDimensions
 import com.example.bluehive.utilities.RetryOverlay
 import com.example.bluehive.utilities.ConfirmationOverlay
+import com.example.bluehive.utilities.ProfileEntryOverlay
 import com.example.bluehive.utilities.AppTypography
 import com.example.bluehive.auth.AuthActivity
 import com.example.bluehive.auth.DeviceEventStream
@@ -157,6 +161,50 @@ val PROFILE_NAME_FOCUSED_COLOR: Color = Color.White
 const val PROFILE_NAME_FONT_SIZE_SP   = 11f
 val PROFILE_NAME_PADDING_TOP: Dp      = 5.dp
 val PROFILE_NAME_HEIGHT: Dp           = 22.dp
+
+// ── Profile card press animation ─────────────────────────────────────────────
+//
+// ONE CONTINUOUS DEPARTURE, NOT A BOUNCE. Pressing a profile shrinks the avatar,
+// drains its colour to grey, and fades the name and glow — all in the same
+// direction, all the way down. The loading screen appears the moment it reaches
+// its smallest, so the card hands off to the next screen instead of springing
+// back to a state the user has already left.
+//
+// It used to dip and return, which meant the card ended the gesture looking
+// exactly as it started; the press read as a twitch rather than as a commitment.
+//
+// The load is deferred to the end on purpose. Fired on the press frame, the next
+// screen covered the animation before any of it was visible.
+const val PROFILE_FOCUS_SCALE  = 1.06f
+const val PROFILE_PRESS_SCALE  = 0.88f
+
+/**
+ * The whole gesture, and therefore how long until the loading screen appears.
+ *
+ * Holds the ~1s total that the previous dip-and-return version had — the length
+ * was right, the return leg was not — so the press feels the same length and
+ * simply stops resolving backwards.
+ */
+const val PROFILE_PRESS_MS     = 1050
+const val PROFILE_NAME_FADE_MS = 500
+
+/**
+ * How grey the avatar ends up. 0f is fully greyscale.
+ *
+ * Colour drains over exactly the same clock as the shrink and does not come
+ * back, so size and colour read as one gesture rather than as two effects that
+ * happen to overlap.
+ */
+const val PROFILE_PRESS_SATURATION = 0f
+
+/**
+ * The focus glow fades out with the press and does NOT come back.
+ *
+ * One-way, like the name. The glow says "this is where you are"; once the press
+ * is committed and the screen is leaving, re-lighting it as the card springs
+ * back would say the selection had been cancelled.
+ */
+const val PROFILE_GLOW_FADE_MS = 450
 
 class ProfileScreenActivity : ComponentActivity() {
 
@@ -328,6 +376,24 @@ fun ProfileScreen(
     // session underneath it — so reading live would blank the text mid-dismiss.
     val signedInEmail = remember { SessionManager.get().email }
     var showSignOutConfirm by remember { mutableStateOf(false) }
+
+    // ── Profile-entry overlay ────────────────────────────────────────────────
+    // Set when a card's press animation finishes. Covers the frozen, shrunken
+    // card for the ~1.4s HomeScreenCompose needs to draw its first frame — see
+    // ProfileEntryOverlay. Non-null means "this profile is being entered"; it is
+    // never cleared, because the screen is on its way out.
+    var enteringProfileName by remember { mutableStateOf<String?>(null) }
+
+    // ── Input lock ───────────────────────────────────────────────────────────
+    // Engaged the moment a profile is PRESSED, not when the overlay appears a
+    // second later. Between those two points the card is visibly animating away
+    // while the grid underneath is still fully live — without this you can walk
+    // focus onto another profile, or press it, and end up entering two.
+    //
+    // Swallowing keys rather than moving focus is deliberate. Parking focus
+    // elsewhere would drop isFocused on the pressed card, and its unfocused tint
+    // would fade in over the top of the shrink animation.
+    var inputLocked by remember { mutableStateOf(false) }
     val activity = LocalActivity.current
 
 
@@ -343,8 +409,17 @@ fun ProfileScreen(
     val parkingFocusRequester = remember { FocusRequester() }
     var focusParked by remember { mutableStateOf(true) }
 
+    // ── Navigation-sound arming ───────────────────────────────────────────────
+    // The sound is for MOVING between profiles, so the screen's own opening
+    // focus must not trigger it — otherwise every visit to the picker, and every
+    // return from Manage Profiles, announces itself with a swap that never
+    // happened. Armed one frame AFTER the initial requestFocus lands, which is
+    // what guarantees that focus event has already been delivered.
+    var navSoundArmed by remember { mutableStateOf(false) }
+
     LaunchedEffect(isLoadingGrid) {
         if (isLoadingGrid) {
+            navSoundArmed = false
             focusParked = true
             kotlinx.coroutines.android.awaitFrame()
             if (focusParked) parkingFocusRequester.requestFocus()
@@ -356,10 +431,15 @@ fun ProfileScreen(
     // AFTER
     LaunchedEffect(isLoadingGrid, profiles.size) {
         if (isLoadingGrid) return@LaunchedEffect
+        navSoundArmed = false
 
         if (profiles.isEmpty()) {
             createFocusRequester.requestFocus()
             focusParked = false          // release the parking spot
+            // Same one-frame wait as below: with no profiles the screen opens
+            // focused on Create, and that landing is not a navigation.
+            kotlinx.coroutines.android.awaitFrame()
+            navSoundArmed = true
             return@LaunchedEffect
         }
 
@@ -369,6 +449,10 @@ fun ProfileScreen(
         kotlinx.coroutines.android.awaitFrame()
         focusRequesters[0].requestFocus()
         focusParked = false              // release the parking spot
+        // One more frame, so the focus event from the line above has already
+        // been delivered and cannot be mistaken for a swap.
+        kotlinx.coroutines.android.awaitFrame()
+        navSoundArmed = true
     }
 
 
@@ -399,7 +483,14 @@ fun ProfileScreen(
             (PROFILE_CARD_SIZE / 2) - (77.25.dp / 2)
 
     // AFTER
-    Box(modifier = Modifier.fillMaxSize()) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            // Returning true consumes the event before it reaches the focused
+            // child, so nothing on this screen responds while a profile is
+            // being entered.
+            .onPreviewKeyEvent { inputLocked }
+    ) {
 
         // Background
         Image(
@@ -491,7 +582,22 @@ fun ProfileScreen(
                         avatarResId    = avatarResId,
                         focusRequester = requester,
                         modifier       = Modifier.offset(x = cardX, y = cardY),
-                        onClick        = { onProfileSelected(profile.id, profile.display_name, avatarResId) },
+                        // Fires on the key press itself, ahead of the animation.
+                        onPressStart   = { inputLocked = true },
+                        onClick        = {
+                            // Raised BEFORE the activity launch, so the loading
+                            // screen is already up when the press animation
+                            // ends rather than 1.4s later.
+                            enteringProfileName = profile.display_name
+                            onProfileSelected(profile.id, profile.display_name, avatarResId)
+                        },
+                        // No edge check is needed: at the leftmost card a Left
+                        // press moves focus nowhere, so no card ever gains it and
+                        // nothing plays. The silence at the ends is the absence
+                        // of an event, not a special case.
+                        onFocusGained  = {
+                            if (navSoundArmed) BlueHiveApplication.playProfileSwapSound()
+                        },
                     )
                 }
             }
@@ -501,6 +607,7 @@ fun ProfileScreen(
         if (profiles.size < 8) CreateProfileButton(
             focusRequester = createFocusRequester,
             onClick        = { onCreateProfile(creationLauncher) },
+            onFocusGained  = { if (navSoundArmed) BlueHiveApplication.playNavClickSound() },
             modifier       = Modifier
                 .align(Alignment.TopStart)
                 // Sign Out now sits between Create and Manage, so right-from-Create
@@ -546,6 +653,7 @@ fun ProfileScreen(
             isToggleable   = false,
             fontFamily     = AppTypography.interBold,
             focusRequester = signOutFocusRequester,
+            onFocusGained  = { if (navSoundArmed) BlueHiveApplication.playNavClickSound() },
             onClick        = { showSignOutConfirm = true },
             modifier       = Modifier
                 .align(Alignment.TopStart)
@@ -608,6 +716,7 @@ fun ProfileScreen(
             isToggleable   = false,
             fontFamily     = com.example.bluehive.utilities.AppTypography.interBold,
             focusRequester = manageFocusRequester,
+            onFocusGained  = { if (navSoundArmed) BlueHiveApplication.playNavClickSound() },
             onClick        = { onManageProfiles(manageLauncher) },
             modifier       = Modifier
                 .align(Alignment.TopStart)
@@ -674,6 +783,14 @@ fun ProfileScreen(
         //   up, back dismisses it; the rest of the time back falls through to the
         //   close-app prompt as before. Without the gate we would swallow every
         //   back press on this screen.
+        // TOPMOST, above every other overlay here: once a profile is being
+        // entered, nothing else on this screen is actionable.
+        enteringProfileName?.let { ProfileEntryOverlay(it) }
+
+        // Back counts as navigation. Registered BEFORE the sign-out handler so
+        // it wins while locked; leaving mid-commit would strand the selection.
+        BackHandler(enabled = inputLocked) { /* swallowed */ }
+
         BackHandler(enabled = showSignOutConfirm) { showSignOutConfirm = false }
 
         if (showSignOutConfirm) {
@@ -770,20 +887,93 @@ fun ProfileCard(
     focusRequester: FocusRequester,
     onClick:        () -> Unit,
     modifier:       Modifier = Modifier,
+    // Fired only on a GAIN, never on a loss, and never on a recomposition that
+    // reports the same state. The caller uses it for the profile-swap sound.
+    onFocusGained:  () -> Unit = {},
+    // Fired on the key press, BEFORE the animation starts — as opposed to
+    // onClick, which fires when it finishes. The caller locks input here.
+    onPressStart:   () -> Unit = {},
 ) {
     var isFocused by remember { mutableStateOf(false) }
 
+    // ── Press state ──────────────────────────────────────────────────────────
+    // BOTH FLAGS ARE ONE-WAY. `pressed` drives the shrink and the colour drain,
+    // `leaving` the name and glow fade. Nothing here reverses: the card is on its
+    // way off screen, and every part of it should be heading the same direction.
+    var pressed      by remember { mutableStateOf(false) }
+    var leaving      by remember { mutableStateOf(false) }
+    var clickPending by remember { mutableStateOf(false) }
+    val pressScope = rememberCoroutineScope()
+
     val glowAlpha by androidx.compose.animation.core.animateFloatAsState(
-        targetValue   = if (isFocused) 1f else 0f,
-        animationSpec = tween(durationMillis = if (isFocused) 150 else 100),
-        label         = "profileCardGlow",
+        targetValue   = if (isFocused && !leaving) 1f else 0f,
+        animationSpec = tween(
+            durationMillis = when {
+                leaving   -> PROFILE_GLOW_FADE_MS
+                isFocused -> 150
+                else      -> 100
+            }
+        ),
+        label = "profileCardGlow",
     )
 
     val scale by androidx.compose.animation.core.animateFloatAsState(
-        targetValue   = if (isFocused) 1.06f else 1f,
-        animationSpec = tween(durationMillis = 200),
-        label         = "profileCardScale",
+        targetValue = when {
+            pressed   -> PROFILE_PRESS_SCALE
+            isFocused -> PROFILE_FOCUS_SCALE
+            else      -> 1f
+        },
+        animationSpec = tween(durationMillis = PROFILE_PRESS_MS),
+        label = "profileCardScale",
     )
+
+    val nameAlpha by androidx.compose.animation.core.animateFloatAsState(
+        targetValue   = if (leaving) 0f else 1f,
+        animationSpec = tween(durationMillis = PROFILE_NAME_FADE_MS),
+        label         = "profileNameAlpha",
+    )
+
+    // Deliberately the SAME clock as the scale, so colour and size move as one
+    // gesture instead of two effects that merely overlap.
+    val saturation by androidx.compose.animation.core.animateFloatAsState(
+        targetValue   = if (pressed) PROFILE_PRESS_SATURATION else 1f,
+        animationSpec = tween(durationMillis = PROFILE_PRESS_MS),
+        label         = "profileCardSaturation",
+    )
+
+    // NULL AT REST, which is the point. A ColorFilter allocates a matrix and
+    // costs a GPU pass; at full saturation there is nothing to correct, so the
+    // idle card — every card, all the time — pays neither. Only the pressed card
+    // allocates, and only for the half-second the animation runs.
+    val avatarColorFilter = if (saturation >= 0.999f) null else {
+        ColorFilter.colorMatrix(ColorMatrix().apply { setToSaturation(saturation) })
+    }
+
+    /**
+     * Run the press animation, then load the profile.
+     *
+     * The click sound is immediate while the load is not: feedback has to be
+     * instant even when the action is deferred, or the press feels ignored and
+     * gets repeated.
+     *
+     * Guarded against a second press. Without it an impatient double-tap would
+     * launch the profile twice, and the animation would restart mid-flight.
+     */
+    fun handlePress() {
+        if (clickPending) return
+        clickPending = true
+        onPressStart()
+        BlueHiveApplication.playClickSound()
+        leaving = true
+        pressed    = true
+        pressScope.launch {
+            // Hands off exactly as the card reaches its smallest — `pressed` is
+            // never cleared, so the avatar is still at PROFILE_PRESS_SCALE and
+            // fully grey underneath the loading screen.
+            kotlinx.coroutines.delay(PROFILE_PRESS_MS.toLong())
+            onClick()
+        }
+    }
 
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -835,7 +1025,15 @@ fun ProfileCard(
                     )
                     .clip(RoundedCornerShape(PROFILE_CARD_CORNER))
                     .focusRequester(focusRequester)
-                    .onFocusChanged { isFocused = it.isFocused }
+                    .onFocusChanged {
+                        // Compare BEFORE assigning: onFocusChanged also fires on
+                        // recompositions that carry the same state, and a bare
+                        // "if (it.isFocused) play()" would re-fire the sound on
+                        // every one of them while the card simply sat there.
+                        val gained = it.isFocused && !isFocused
+                        isFocused = it.isFocused
+                        if (gained) onFocusGained()
+                    }
                     .focusable()
                     .onKeyEvent { event ->
                         if (event.type == KeyEventType.KeyDown &&
@@ -843,7 +1041,7 @@ fun ProfileCard(
                                     event.key == Key.Enter       ||
                                     event.key == Key.NumPadEnter)
                         ) {
-                            onClick()
+                            handlePress()
                             true
                         } else false
                     },
@@ -852,6 +1050,7 @@ fun ProfileCard(
                     painter            = painterResource(id = avatarResId),
                     contentDescription = profile.display_name,
                     contentScale       = ContentScale.Crop,
+                    colorFilter        = avatarColorFilter,
                     modifier           = Modifier.matchParentSize(),
                 )
                 // Grey tint overlay — fades in when unfocused
@@ -884,6 +1083,7 @@ fun ProfileCard(
             modifier   = Modifier
                 .padding(top = PROFILE_NAME_PADDING_TOP)
                 .offset(y = nameOffsetY)
+                .alpha(nameAlpha)
                 .size(width = PROFILE_CARD_SIZE, height = PROFILE_NAME_HEIGHT),
         )
     }

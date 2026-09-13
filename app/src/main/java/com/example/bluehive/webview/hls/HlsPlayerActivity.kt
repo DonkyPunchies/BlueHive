@@ -51,7 +51,6 @@ import androidx.media3.ui.PlayerView
 import androidx.media3.ui.SubtitleView
 import com.example.bluehive.BuildConfig
 import com.example.bluehive.IdleWatcher
-import com.example.bluehive.StillWatchingOverlay
 import com.example.bluehive.webview.exoplayer_resources.ExoPlayerConfig
 import com.example.bluehive.R
 import kotlinx.coroutines.Dispatchers
@@ -68,6 +67,7 @@ import okhttp3.OkHttpClient
 import java.io.File
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import com.example.bluehive.api.extractStreamAwait
 
 /**
  * Plays an extracted HLS (m3u8) stream in ExoPlayer. Source-agnostic —
@@ -115,6 +115,36 @@ class HlsPlayerActivity : ComponentActivity() {
     // caller didn't pass one, in which case behaviour is exactly as before.
     private var relayUrl: String? = null
     private var usingRelay = false
+
+    /**
+     * elapsedRealtime at the start of the DIRECT attempt, 0 before one begins.
+     *
+     * Reported to the relay as direct_ms. Without it relay_sessions records when
+     * the RELAY started and nothing about the attempt it replaced, so a host that
+     * failed instantly and one that limped for thirty seconds before giving up are
+     * the same row — and they are not the same problem.
+     */
+    private var directStartedAtMs = 0L
+
+    /**
+     * The FIRST url this playback tried, kept after a relay overwrites currentM3u8.
+     *
+     * Both reports describe the direct attempt, not the relay: the host worth
+     * recording is the CDN we tried to reach, and once switchToRelay runs
+     * currentM3u8 points at our own backend, whose transport is always going to
+     * look healthy.
+     */
+    private var directUrl: String = ""
+
+    /**
+     * Guards the one playback_start report per playback.
+     *
+     * NOT the existing loggedDuration flag, which switchToRelay deliberately
+     * resets so the relayed stream logs its own duration. Reusing it would post a
+     * second report for the same playback every time one relayed, and the rate
+     * this row exists to compute would count those plays twice.
+     */
+    private var reportedPlaybackStart = false
 
     // One watch-history row per launch, written on confirmed playback (see
     // onIsPlayingChanged). The flag survives a mid-play re-extract, so recovering
@@ -195,6 +225,32 @@ class HlsPlayerActivity : ComponentActivity() {
         val title     = intent.getStringExtra("MEDIA_TITLE")
         val epName    = intent.getStringExtra("EPISODE_NAME")
         val source    = intent.getStringExtra("SOURCE_NAME") ?: "HLS"
+
+        // ── COLLAPSE THE DETAILS BACK-STACK ─────────────────────────────────
+        //
+        // Browsing recommendation -> recommendation pushes each page onto
+        // BlueHiveApplication.detailsHistory (capped at 8, oldest evicted). Once
+        // something actually PLAYS, that trail is spent: the user's next BACK
+        // should return them to wherever they entered from — Home, History,
+        // Favorites — not walk them back through eight pages they already left.
+        //
+        // Clearing is the whole mechanism: with the stack empty,
+        // popPreviousDetails() returns null and the details screen's back handler
+        // falls through to its sourceScreen branch, which goes to the entry point.
+        //
+        // WHY IT HAD STOPPED WORKING. clearDetailsHistory() was only ever called
+        // from handleStreamingSourceSelected — the GeckoView path. Once playback
+        // moved to backend extraction + ExoPlayer, that function stopped being
+        // reached for almost every play, so the stack was never collapsed and BACK
+        // walked the whole trail again.
+        //
+        // Placed here, gated by the same guard as the history row, so "logged to
+        // watch history" and "back-stack collapsed" are always the same event —
+        // which is the rule that makes the behaviour predictable.
+        runCatching {
+            (application as? com.example.bluehive.BlueHiveApplication)?.clearDetailsHistory()
+        }
+
 
         kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
             try {
@@ -358,7 +414,7 @@ class HlsPlayerActivity : ComponentActivity() {
         recoveryLog("pre-emptive refresh: fetching a replacement URL (player untouched)")
 
         val body = runCatching {
-            ApiClient.bluehiveApi.extractStream(
+            ApiClient.bluehiveApi.extractStreamAwait(
                 type = type, tmdbId = tmdb, season = season, episode = episode,
                 source = source, refresh = 1, mtype = type,
                 title = intent.getStringExtra("MEDIA_TITLE"),
@@ -436,7 +492,16 @@ class HlsPlayerActivity : ComponentActivity() {
     private var embedUrl: String? = null
     private var currentM3u8: String = ""
     private var resumePositionMs: Long = 0
-    private var referer: String = "https://cinesrc.st/"
+    // EMPTY BY DEFAULT, so "no Referer" is expressible.
+    //
+    // This was "https://cinesrc.st/". Combined with the `?:` reads below, a null
+    // REFERER extra silently became that hardcoded value — so when the backend
+    // deliberately suppresses the header for a source whose CDN 403s it, the
+    // client sent cinesrc.st anyway. MEASURED 2026-08-30: the backend logged
+    // "referer suppressed for moviesapi" and returned null, and NetLog shows the
+    // very next segment going out with `referer: https://cinesrc.st/` and coming
+    // back 403. The suppression could not have worked while this default existed.
+    private var referer: String = ""
     private var ua: String = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
@@ -525,6 +590,16 @@ class HlsPlayerActivity : ComponentActivity() {
     /** Builds (or rebuilds) the ExoPlayer for a given m3u8. Safe to call on retry. */
     private fun startPlayback(url: String) {
         currentM3u8 = url
+        // Start of the DIRECT attempt, for the relay report's direct_ms. Only the
+        // direct path arms it: re-arming on the relay's own startPlayback would
+        // measure the relay against itself and report ~0ms every time. Left alone
+        // once set, so a re-extraction that is still direct keeps the original
+        // clock — the number worth having is "how long before bytes arrived", not
+        // "how long since the most recent attempt".
+        if (!usingRelay && directStartedAtMs == 0L) {
+            directStartedAtMs = android.os.SystemClock.elapsedRealtime()
+            directUrl = url
+        }
         Log.d(TAG, "▶️ playing vidapi m3u8: $url (referer=$referer)")
         // Re-armed on EVERY startPlayback, including recovery rebuilds: a fresh
         // URL restarts the expiry clock, so the old timer would fire early and the
@@ -595,6 +670,57 @@ class HlsPlayerActivity : ComponentActivity() {
                             Log.d(TAG, "⏱ duration=${player?.duration}ms | isLive=${player?.isCurrentMediaItemLive}")
                         }
 
+                        // ── THE DENOMINATOR ──────────────────────────────────
+                        //
+                        // One row per playback that reached frames. See
+                        // CrashReporter.reportPlaybackStart for why this exists
+                        // at all; the short version is that a table of failures
+                        // cannot produce a rate.
+                        //
+                        // MEASURES THE DIRECT ATTEMPT, not whatever is playing
+                        // now. After a relay, currentM3u8 points at our own
+                        // backend and its transport always looks healthy, so
+                        // reporting that would make every relayed play look like
+                        // a clean h2 200 and defeat the whole point.
+                        if (state == Player.STATE_READY && !reportedPlaybackStart) {
+                            reportedPlaybackStart = true
+                            val probed = directUrl.ifBlank { currentM3u8 }
+                            val transport = ExoPlayerConfig.transportFor(probed)
+                            val startupMs =
+                                if (directStartedAtMs > 0L)
+                                    (android.os.SystemClock.elapsedRealtime() - directStartedAtMs).toInt()
+                                else -1
+                            Log.e(TAG, "📈 playback start: source=${intent.getStringExtra("SOURCE_NAME")} " +
+                                    "relayed=$usingRelay http=${transport?.httpStatus ?: -1} " +
+                                    "proto=${transport?.protocol ?: "(unknown)"} startupMs=$startupMs")
+                            com.example.bluehive.diagnostics.CrashReporter.reportPlaybackStart(
+                                context = this@HlsPlayerActivity,
+                                extraMeta = mapOf(
+                                    "source_name" to intent.getStringExtra("SOURCE_NAME"),
+                                    "relayed"     to usingRelay,
+                                    // The server derives origin_host from this with
+                                    // the same unwrap the relay path uses, then drops
+                                    // it before the row is written. A signed CDN url
+                                    // is not something to keep in telemetry.
+                                    "stream_url"  to probed,
+                                    "http_status" to (transport?.httpStatus ?: -1),
+                                    "negotiated_protocol" to (transport?.protocol ?: "(unknown)"),
+                                    "host_was_new" to ExoPlayerConfig.wasNewlyLearned(probed),
+                                    // Recorded on the SUCCESS path too, so a
+                                    // network where ECH quietly stopped arming is
+                                    // visible before it costs anyone a relay.
+                                    "ech_state"    to ExoPlayerConfig.echState(),
+                                    "host_publishes_ech" to ExoPlayerConfig.hostPublishesEch(probed),
+                                    "startup_ms"  to startupMs,
+                                    "media_tmdb_id"  to intent.getIntExtra("TMDB_ID", -1).takeIf { it > 0 },
+                                    "media_type"     to intent.getStringExtra("MEDIA_TYPE"),
+                                    "season_number"  to intent.getIntExtra("SEASON_NUMBER", -1).takeIf { it > 0 },
+                                    "episode_number" to intent.getIntExtra("EPISODE_NUMBER", -1).takeIf { it > 0 },
+                                    "media_title"    to intent.getStringExtra("MEDIA_TITLE"),
+                                ),
+                            )
+                        }
+
                         // ── STATE_ENDED WAS NOT HANDLED AT ALL ────────────────
                         //
                         // The credits rolled and this activity simply stayed up on a
@@ -638,9 +764,7 @@ class HlsPlayerActivity : ComponentActivity() {
                         // still-watching prompt goes unanswered. It must run on the
                         // main thread: ExoPlayer is single-threaded and throws if
                         // touched from the watcher's IO tick.
-                        IdleWatcher.setPlaying(IdleWatcher.SOURCE_HLS, isPlaying) {
-                            runOnUiThread { player?.pause() }
-                        }
+                        IdleWatcher.setPlaying(IdleWatcher.SOURCE_HLS, isPlaying)
 
                         if (isPlaying) {
                             // Frames are flowing, so whatever recovery was in
@@ -768,7 +892,7 @@ class HlsPlayerActivity : ComponentActivity() {
                                     error.errorCode == PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE
                         // Relay first — see switchToRelay for why re-extraction
                         // cannot fix a blocked CDN.
-                        if (isCdnFailure && switchToRelay(error.errorCodeName)) return
+                        if (isCdnFailure && switchToRelay(error.errorCodeName, httpStatus)) return
                         if (isCdnFailure && embedUrl != null && extractRetries < MAX_EXTRACT_RETRIES) {
                             extractRetries++
                             Log.w(TAG, "↻ CDN failure — re-extracting for a fresh server (retry $extractRetries/$MAX_EXTRACT_RETRIES)")
@@ -881,7 +1005,6 @@ class HlsPlayerActivity : ComponentActivity() {
                     // toast and the subtitle picker. It takes no focus and consumes
                     // no input (any key dismisses it through the window hook), so
                     // sitting on top costs the picker nothing if both are somehow up.
-                    StillWatchingOverlay()
                 }
             }
         }
@@ -907,15 +1030,21 @@ class HlsPlayerActivity : ComponentActivity() {
             backendHost != null && backendHost.equals(streamHost, ignoreCase = true)
         } catch (_: Exception) { false }
 
+        // Referer only when the backend supplies one; Origin never. See
+        // ExoPlayerConfig.streamHeaders for the measured per-level table and for
+        // why a blanket removal (build 114) was wrong.
         val requestHeaders = mutableMapOf(
             "User-Agent" to ua,
-            "Referer" to referer,
-            "Origin" to originHeader,
             "Accept" to "*/*",
             "Accept-Language" to "en-US,en;q=0.9"
         )
+        if (referer.isNotBlank()) requestHeaders["Referer"] = referer
         if (isBackendRelay) requestHeaders["X-API-Key"] = BuildConfig.API_KEY
 
+        // BEFORE the factory, because addQuicHint is build-time state. A filtered
+        // CDN never advertises alt-svc (its TCP handshake dies first), so QUIC has
+        // to be tried on the very first request or not at all.
+        ExoPlayerConfig.ensureQuicHint(this, url)
         val factory = ExoPlayerConfig.dataSourceFactory(ua, requestHeaders, context = this)
 
         // Decided from the URL, NOT from the backend's is_hls flag. The player is
@@ -935,10 +1064,28 @@ class HlsPlayerActivity : ComponentActivity() {
                 !url.lowercase().contains(".m3u8") && !url.lowercase().contains(".mpd")
         }.getOrDefault(false)
 
-        Log.d(TAG, "🎞 source=${if (looksProgressive) "progressive" else "hls"} url=${url.take(90)}")
+        // THE BACKEND'S FLAG WINS WHEN WE HAVE ONE. The URL heuristic above stays
+        // as the fallback — it is still the only signal present on every path —
+        // but it cannot see past an extensionless URL, and some sources have one.
+        //
+        // MEASURED 2026-08-30: VidLove serves HLS from
+        // https://a2.shows.st/api?d=... with no ".m3u8" anywhere. The heuristic
+        // called it progressive, the MP4 extractors were fed a playlist, and it
+        // died on UnrecognizedInputFormatException / NoDeclaredBrand — a decode
+        // error that says nothing about the real cause.
+        //
+        // Absent extra -> unchanged behaviour, which is why this is safe for the
+        // on-device and re-extraction paths that never set it.
+        val hlsHint: Boolean? =
+            if (intent.hasExtra("IS_HLS")) intent.getBooleanExtra("IS_HLS", true) else null
+        val useHls = hlsHint ?: !looksProgressive
 
-        return if (looksProgressive) ExoPlayerConfig.progressiveMediaSource(url, factory)
-               else ExoPlayerConfig.hlsMediaSource(url, factory)
+        Log.e(TAG, "🎞 source=${if (useHls) "hls" else "progressive"} " +
+                "(${if (hlsHint != null) "backend is_hls=$hlsHint" else "inferred from url"}) " +
+                "url=${url.take(80)}")
+
+        return if (useHls) ExoPlayerConfig.hlsMediaSource(url, factory)
+               else ExoPlayerConfig.progressiveMediaSource(url, factory)
     }
 
     // ── Captions: CC button + self-rendering ─────────────────────────────────
@@ -1210,15 +1357,64 @@ class HlsPlayerActivity : ComponentActivity() {
      * strictly once: if the relay itself dies, we fall through to the old
      * re-extraction path rather than looping.
      */
-    private fun switchToRelay(why: String): Boolean {
+    private fun switchToRelay(why: String, httpStatus: Int? = null): Boolean {
         val relay = relayUrl
         if (relay == null || usingRelay) return false
+        // READ THE DIRECT ATTEMPT'S FACTS BEFORE usingRelay FLIPS. Everything
+        // below describes the attempt that just failed, and currentM3u8 is still
+        // the direct URL at this point — one line later it is the relay's.
+        val diedOn = currentM3u8
+        val transport = ExoPlayerConfig.transportFor(diedOn)
+        val wasNew = ExoPlayerConfig.wasNewlyLearned(diedOn)
+        // TWO LEVELS, BECAUSE ECH FAILS AT TWO LEVELS. echState says whether the
+        // device is negotiating ECH at all; hostEch says whether this CDN even
+        // published a config to negotiate with. "ECH broke" and "this host was
+        // never eligible" are different faults and only the pair separates them.
+        val echState = ExoPlayerConfig.echState()
+        val hostEch = when (ExoPlayerConfig.hostPublishesEch(diedOn)) {
+            true  -> "yes"
+            false -> "no"
+            null  -> "unknown"
+        }
+        val directMs =
+            if (directStartedAtMs > 0L)
+                (android.os.SystemClock.elapsedRealtime() - directStartedAtMs).toInt()
+            else -1
+
         usingRelay = true
         // Remember the position BEFORE the teardown so recovery resumes.
         player?.let { if (it.currentPosition > 0) resumePositionMs = it.currentPosition }
-        // Tags the relay session with what drove us here; lands in
-        // bluehive.relay_sessions.error_code via the master-playlist request.
-        val tagged = relay + "&err=" + URLEncoder.encode(why, "UTF-8")
+        // ── WHAT THE RELAY ROW GETS TOLD ─────────────────────────────────────
+        //
+        // err alone could not answer the only question that matters when a relay
+        // shows up: was this the ISP filter, or did the CDN simply say no?
+        // ERROR_CODE_IO_BAD_HTTP_STATUS covers 403, 404, 410 and every 5xx, which
+        // are four different faults with four different fixes.
+        //
+        //   http  — the actual status. -1 when the failure was not an HTTP one.
+        //   proto — h3 means QUIC carried it and the filter was not involved;
+        //           (none) with http=-1 is the filter's own signature.
+        //   ms    — how long direct was attempted before giving up.
+        //   new   — whether this host was first seen by this playback's warm, so
+        //           "the defence lost" is distinguishable from "there was none".
+        //
+        // Query params on a URL the grant endpoint preserves verbatim, so no new
+        // transport, endpoint or schema round trip is involved.
+        val tagged = buildString {
+            append(relay)
+            append("&err=").append(URLEncoder.encode(why, "UTF-8"))
+            append("&http=").append(httpStatus ?: transport?.httpStatus ?: -1)
+            append("&proto=").append(
+                URLEncoder.encode(transport?.protocol ?: "(unknown)", "UTF-8")
+            )
+            append("&ms=").append(directMs)
+            append("&new=").append(if (wasNew) 1 else 0)
+            append("&ech=").append(URLEncoder.encode(echState, "UTF-8"))
+            append("&hostech=").append(hostEch)
+        }
+        Log.e(TAG, "🔀 relay report: err=$why http=${httpStatus ?: transport?.httpStatus ?: -1} " +
+                "proto=${transport?.protocol ?: "(unknown)"} directMs=$directMs newHost=$wasNew " +
+                "ech=$echState hostEch=$hostEch")
         Log.w(TAG, "🔀 CDN unreachable ($why) — relaying via backend, " +
                 "resuming at ${resumePositionMs}ms")
         loggedDuration = false
@@ -1303,7 +1499,7 @@ class HlsPlayerActivity : ComponentActivity() {
                 // refresh=1 forces a real browser run rather than a cache hit —
                 // essential here, because the cached entry is the one that just
                 // handed us a blocked CDN. A fresh run re-draws from the pool.
-                ApiClient.bluehiveApi.extractStream(
+                ApiClient.bluehiveApi.extractStreamAwait(
                     type = type, tmdbId = tmdb, season = season, episode = episode,
                     source = source, refresh = 1,
                     // A re-extract is the LIKELIEST relay of all — it only happens
@@ -1443,6 +1639,10 @@ class HlsPlayerActivity : ComponentActivity() {
     override fun onPause()  { super.onPause();  player?.pause() }
     override fun onResume() { super.onResume(); player?.play() }
     override fun onDestroy() {
+        // Applied HERE because the player is already released, so no request
+        // is in flight and the engine can be shut down properly. Rebuilding
+        // mid-playback leaked engines until Cronet stopped building at all.
+        ExoPlayerConfig.applyPendingQuicHints()
         Log.d(TAG, "🧹 onDestroy — releasing player")
         // Unconditionally, and before anything can throw. onIsPlayingChanged is not
         // guaranteed to fire false on the way out — a process kill, a crash during

@@ -51,6 +51,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.currentStateAsState
 import com.example.bluehive.api.SessionExpiredBus
 import com.example.bluehive.auth.HostEntitlementRelay
+import com.example.bluehive.update.UpdateGate
 import com.example.bluehive.auth.SessionManager
 import com.example.bluehive.catalog.openMediaCatalogScreen
 import com.example.bluehive.searchBarComponent.openSearchScreen
@@ -232,6 +233,22 @@ class HomeScreenCompose : ComponentActivity() {
         // duplicate onResume) and self-cancelling when the token has not changed,
         // so bouncing in and out of a detail page costs nothing.
         HostEntitlementRelay.checkNow(this)
+
+        // ── Is this TV still allowed to run this build? ──────────────────────
+        //
+        // Deliberately alongside the entitlement check rather than inside it.
+        // They ask different questions of different servers and only one of them
+        // can lock somebody out of a paid account; tangling them would mean an
+        // update bug could take entitlement down with it.
+        //
+        // Same placement for the same reason though: every route back into the
+        // app resumes this activity, and a cold start lands here after the
+        // loading screen — so one hook covers reboot and navigation both.
+        //
+        // Rate limited internally, runs off the main thread, waits a couple of
+        // seconds so the home screen is not yanked away the instant it appears,
+        // and does nothing at all when the device is already current.
+        UpdateGate.checkNow(this)
     }
 
     override fun onPause() {
@@ -999,34 +1016,11 @@ fun HomeScreenComposeContent(
             enter   = androidx.compose.animation.EnterTransition.None,
             exit    = fadeOut(animationSpec = tween(durationMillis = 400)),
         ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Color(0xFF0C0C0C)),
-                contentAlignment = Alignment.Center,
-            ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center,
-                ) {
-                    CircularProgressIndicator(
-                        color       = Color(0xFF2644A6),
-                        strokeWidth = 3.dp,
-                        modifier    = Modifier.size(44.dp),
-                    )
-                    Text(
-                        text       = if (profileName.isNotBlank())
-                            "Getting $profileName's profile ready\nfor your entertainment"
-                        else
-                            "Getting your profile ready\nfor your entertainment",
-                        color      = Color.White,
-                        fontSize   = 15.sp,
-                        fontFamily = AppTypography.passionRegular,
-                        textAlign  = TextAlign.Center,
-                        modifier   = Modifier.padding(top = 24.dp),
-                    )
-                }
-            }
+            // Shared with ProfileScreenActivity, which raises the identical
+            // overlay the instant its press animation ends — see
+            // ProfileEntryOverlay. The two must stay identical, or the
+            // handoff between the activities becomes a visible flicker.
+            com.example.bluehive.utilities.ProfileEntryOverlay(profileName)
         }
 
         // ── Exit confirmation overlay / back-button routing ─────────────────────

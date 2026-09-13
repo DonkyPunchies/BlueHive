@@ -76,7 +76,7 @@ object TokenProvider {
             if (intended.isNullOrBlank()) {
                 // Nothing to spend. Not "revoked" in the sense of the backend
                 // refusing us — there is simply no session to refresh.
-                Log.w(TAG, "no refresh token stored")
+                Log.e(TAG, "no refresh token stored")
                 return TokenResult.Revoked
             }
 
@@ -126,24 +126,24 @@ object TokenProvider {
 
                             when (code) {
                                 "revoked", "token_expired" -> {
-                                    Log.w(TAG, "refresh rejected (code=$code) — session over")
+                                    Log.e(TAG, "refresh rejected (code=$code) — session over")
                                     TokenResult.Revoked
                                 }
                                 else -> {
-                                    Log.w(TAG, "refresh got ${resp.code()} with no recognised " +
+                                    Log.e(TAG, "refresh got ${resp.code()} with no recognised " +
                                             "code — treating as transient, keeping session")
                                     TokenResult.Unavailable
                                 }
                             }
                         }
                         else -> {
-                            Log.w(TAG, "refresh failed HTTP ${resp.code()} — transient")
+                            Log.e(TAG, "refresh failed HTTP ${resp.code()} — transient")
                             TokenResult.Unavailable
                         }
                     }
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "refresh unreachable (${e.message}) — transient")
+                Log.e(TAG, "refresh unreachable (${e.message}) — transient")
                 TokenResult.Unavailable
             }
         }

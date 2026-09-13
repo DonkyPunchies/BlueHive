@@ -50,6 +50,8 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import com.example.bluehive.utilities.TitleCardPress
+import com.example.bluehive.utilities.runTitleCardPress
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -232,6 +234,17 @@ fun FavoritesScreen(profileId: Int = -1, refreshTrigger: Int = 0) {
     var isAnyDropdownExpanded by remember { mutableStateOf(false) }
     var selectedFilter        by remember { mutableStateOf("all") }
     var suppressNextHover     by remember { mutableStateOf(false) }
+
+    // ── Hover-sound arming ───────────────────────────────────────────────────
+    // The page auto-focuses its first card once loading finishes (see the
+    // "On page enter" effect below). That focus event is indistinguishable from
+    // a real one at the card, so opening Favourites always announced itself with
+    // a navigation sound for a move the viewer never made.
+    //
+    // Armed one frame AFTER that initial requestFocus lands, which is what
+    // guarantees the event has already been delivered. Re-disarmed whenever the
+    // page reloads, since the same auto-focus runs again.
+    var hoverArmed            by remember { mutableStateOf(false) }
     var removeMode            by remember { mutableStateOf(false) }
     var showDeleteConfirm     by remember { mutableStateOf(false) }
     val deletedEntries        = remember { mutableStateListOf<FavoriteEntry>() }
@@ -269,6 +282,7 @@ fun FavoritesScreen(profileId: Int = -1, refreshTrigger: Int = 0) {
             selectedFilter = "all"
             isAnyDropdownExpanded = false
             suppressNextHover = false
+            hoverArmed = false
             removeMode = false
             showDeleteConfirm = false
 
@@ -307,24 +321,46 @@ fun FavoritesScreen(profileId: Int = -1, refreshTrigger: Int = 0) {
         if (!silent) isLoading = true
         try {
             val rawList = ApiClient.bluehiveApi.getFavorites(profileId)
-            val detailed = rawList.map { fav ->
-                async {
+
+            // ONE REQUEST FOR EVERY FAVOURITE, not one per favourite.
+            //
+            // This used to fire a getMediaDetails per entry and awaitAll() them.
+            // MEASURED 2026-09-04 on a profile with 131 favourites: the server
+            // answered each in ~3.5ms, but OkHttp allows only 5 concurrent
+            // requests per host by default, so the screen waited on ~27
+            // sequential round trips. The same details now arrive in one call.
+            //
+            // CHUNKED because the endpoint caps a call at 300 pairs. At 131 this
+            // is a single request; it only matters for someone who hoards.
+            val details = rawList
+                .map { "${it.media_tmdb_id}:${it.media_type}" }
+                .chunked(200)
+                .flatMap { chunk ->
                     try {
-                        ApiClient.trailerApi.getMediaDetails(
-                            tmdbId    = fav.media_tmdb_id,
-                            mediaType = fav.media_type,
-                        ).toFavoriteEntry(favoriteId = fav.id, addedAt = fav.added_at)
-                    } catch (_: Exception) {
-                        FavoriteEntry(
-                            favoriteId = fav.id,
-                            tmdbId     = fav.media_tmdb_id,
-                            mediaType  = fav.media_type,
-                            addedAt    = fav.added_at,
-                            title      = fav.media_title ?: "Unknown",
+                        ApiClient.trailerApi.getMediaBatch(chunk.joinToString(","))
+                    } catch (e: Exception) {
+                        android.util.Log.w(
+                            "FavoritesScreen", "batch details failed: ${e.message}"
                         )
+                        emptyList()
                     }
                 }
-            }.awaitAll()
+                .associateBy { it.tmdb_id to it.media_type }
+
+            // Built from rawList, so the server's ordering is preserved and every
+            // favourite gets a card. A title the batch had nothing for falls back
+            // to the same stub the per-item 404 produced before.
+            val detailed = rawList.map { fav ->
+                details[fav.media_tmdb_id to fav.media_type]
+                    ?.toFavoriteEntry(favoriteId = fav.id, addedAt = fav.added_at)
+                    ?: FavoriteEntry(
+                        favoriteId = fav.id,
+                        tmdbId     = fav.media_tmdb_id,
+                        mediaType  = fav.media_type,
+                        addedAt    = fav.added_at,
+                        title      = fav.media_title ?: "Unknown",
+                    )
+            }
             favEntries.clear()
             favEntries.addAll(detailed)
         } catch (e: Exception) {
@@ -364,8 +400,22 @@ fun FavoritesScreen(profileId: Int = -1, refreshTrigger: Int = 0) {
         }
     }
 
-    // ── Per-item FocusRequesters keyed to list size — same pattern as TvWideLazyRow ──
-    val gridFocusRequesters = remember { List(200) { FocusRequester() } }
+    // ── Per-item FocusRequesters, ACTUALLY keyed to list size ────────────────
+    //
+    // This was `remember { List(200) { ... } }` while the comment claimed it was
+    // keyed to the list — it was a fixed pool, and the grid indexes it with the
+    // position from itemsIndexed(filteredEntries). A profile with 200+ favorites
+    // therefore threw IndexOutOfBoundsException from inside composition the moment
+    // card 201 scrolled into view, taking the Favorites screen down and leaving it
+    // unreachable. Neither side caps: getFavorites takes no limit/offset and the
+    // backend returns every row.
+    //
+    // Re-creating on size change is safe here: every focus-restore path already
+    // awaitFrame()s after a size change (see the LaunchedEffects below), so the
+    // new requesters are attached before anything requests focus through them.
+    val gridFocusRequesters = remember(filteredEntries.size) {
+        List(filteredEntries.size) { FocusRequester() }
+    }
 
     // ── Grid scroll state ─────────────────────────────────────────────────────
     val gridState = rememberLazyGridState()
@@ -381,7 +431,7 @@ fun FavoritesScreen(profileId: Int = -1, refreshTrigger: Int = 0) {
     LaunchedEffect(filteredEntries.size, hasGridFocus) {
         if (hasGridFocus && filteredEntries.isNotEmpty() && focusedGridIndex == -1) {
             focusedGridIndex = 0
-            gridFocusRequesters[0].requestFocus()
+            gridFocusRequesters.getOrNull(0)?.requestFocus()
         }
     }
 
@@ -390,6 +440,9 @@ fun FavoritesScreen(profileId: Int = -1, refreshTrigger: Int = 0) {
     // awaitFrame gives the grid one frame to compose its items before we
     // request focus — without it the FocusRequester may not be attached yet.
     LaunchedEffect(isLoading) {
+        // Disarmed for the whole of this effect: a reload re-runs the auto-focus
+        // below, and that landing must stay as silent as the first one.
+        hoverArmed = false
         if (!isLoading && filteredEntries.isNotEmpty()) {
             kotlinx.coroutines.android.awaitFrame()
             val targetIndex = focusedGridIndex.coerceIn(0, filteredEntries.lastIndex)
@@ -397,7 +450,11 @@ fun FavoritesScreen(profileId: Int = -1, refreshTrigger: Int = 0) {
             gridState.scrollToItem(targetIndex)
             kotlinx.coroutines.android.awaitFrame()
             gridFocusRequesters.getOrNull(targetIndex)?.requestFocus()
+            // One more frame, so the focus event above has been delivered and
+            // cannot be mistaken for the viewer navigating.
+            kotlinx.coroutines.android.awaitFrame()
         }
+        hoverArmed = true
     }
 
 
@@ -417,7 +474,10 @@ fun FavoritesScreen(profileId: Int = -1, refreshTrigger: Int = 0) {
     fun focusGridItem(index: Int, scroll: Boolean = true) {
         if (index !in filteredEntries.indices) return
         focusedGridIndex = index
-        gridFocusRequesters[index].requestFocus()
+        // getOrNull even though the line above bounds-checks: that check is against
+        // filteredEntries, which is a DIFFERENT list from this pool. Validating one
+        // and indexing the other is precisely how the 200-item crash happened.
+        gridFocusRequesters.getOrNull(index)?.requestFocus()
         if (scroll) {
             coroutineScope.launch {
                 val layoutInfo = gridState.layoutInfo
@@ -739,7 +799,7 @@ fun FavoritesScreen(profileId: Int = -1, refreshTrigger: Int = 0) {
                     .offset(x = dropdownOffsetX + dropdownSpacing + 150.dp, y = filterButtonOffsetY)
                     .zIndex(1f)
                     .onFocusChanged {
-                        if (it.isFocused) BlueHiveApplication.playHoverSound()
+                        if (it.isFocused && hoverArmed) BlueHiveApplication.playHoverSound()
                     },
                 dimensions = ModularButtonDimensions(
                     mainWidth          = 80.dp,
@@ -942,10 +1002,15 @@ fun FavoritesScreen(profileId: Int = -1, refreshTrigger: Int = 0) {
                             // card plays the disintegration effect, not the whole grid.
                             val vanishController = rememberVanishController(glSurfaceView)
 
-                            var isPressed by remember { mutableStateOf(false) }
+                            // MutableState, not a delegated var: runTitleCardPress flips
+                            // these from a coroutine after this composition.
+                            val isPressed = remember { mutableStateOf(false) }
+                            val pressBusy = remember { mutableStateOf(false) }
                             val cardScale by animateFloatAsState(
-                                targetValue   = if (isPressed) 0.80f else 1f,
-                                animationSpec = androidx.compose.animation.core.tween(250),  // higher number is slower animation
+                                targetValue   = if (isPressed.value) TitleCardPress.SCALE else 1f,
+                                animationSpec = androidx.compose.animation.core.tween(
+                                    if (isPressed.value) TitleCardPress.SHRINK_MS else TitleCardPress.REGROW_MS
+                                ),
                                 label         = "cardScale",
                             )
 
@@ -988,22 +1053,11 @@ fun FavoritesScreen(profileId: Int = -1, refreshTrigger: Int = 0) {
                                     }
                             }
 
-                            // TV: show season count. Movies: show runtime if available.
+                            // TV: season count. Movies: runtime. Shared with every
+                            // other row via TitleCardFormat.
                             val runTimeText = remember(entry.runtime, entry.numberOfSeasons, entry.mediaType) {
-                                if (entry.mediaType == "tv") {
-                                    entry.numberOfSeasons?.takeIf { it > 0 }?.let { "S: $it" }
-                                } else {
-                                    val minutes = entry.runtime ?: return@remember null
-                                    if (minutes <= 0) null else {
-                                        val h = minutes / 60
-                                        val m = minutes % 60
-                                        when {
-                                            h > 0 && m > 0 -> "${h}h ${m}m"
-                                            h > 0          -> "${h}h"
-                                            else           -> "${m}m"
-                                        }
-                                    }
-                                }
+                                com.example.bluehive.utilities.TitleCardFormat
+                                    .meta(entry.mediaType, entry.runtime, entry.numberOfSeasons)
                             }
 
 
@@ -1042,18 +1096,25 @@ fun FavoritesScreen(profileId: Int = -1, refreshTrigger: Int = 0) {
                                         // unbounded = titlecard_focused halo (137dp) can overflow
                                         // the 112dp column without clipping — same as TvWideLazyRow
                                         .wrapContentSize(unbounded = true)
-                                        .focusRequester(gridFocusRequesters[index])
+                                        // Guarded: the pool is re-created on size
+                                        // change, so a recomposition mid-change can
+                                        // briefly index past it. A throwaway requester
+                                        // is inert — nothing holds a reference to it.
+                                        .focusRequester(
+                                            gridFocusRequesters.getOrNull(index)
+                                                ?: remember { FocusRequester() }
+                                        )
                                         .onFocusChanged { fs ->
                                             if (fs.isFocused) {
                                                 focusedGridIndex = index
-                                                BlueHiveApplication.playHoverSound()
+                                                if (hoverArmed) BlueHiveApplication.playHoverSound()
                                             }
                                         }
                                         .onKeyEvent { event ->
                                             if (event.type == KeyEventType.KeyUp) {
-                                                if (event.key == Key.DirectionCenter || event.key == Key.Enter || event.key == Key.NumPadEnter) {
-                                                    isPressed = false
-                                                }
+                                                // Release is no longer what ends the dip —
+                                                // runTitleCardPress owns the whole sequence, so
+                                                // a quick tap animates identically to a long hold.
                                                 return@onKeyEvent false
                                             }
                                             if (event.type != KeyEventType.KeyDown) return@onKeyEvent false
@@ -1117,7 +1178,6 @@ fun FavoritesScreen(profileId: Int = -1, refreshTrigger: Int = 0) {
                                                 Key.DirectionCenter,
                                                 Key.Enter,
                                                 Key.NumPadEnter -> {
-                                                    isPressed = true
                                                     BlueHiveApplication.playClickSound()
                                                     if (removeMode) {
                                                         vanishController.vanish()
@@ -1143,7 +1203,10 @@ fun FavoritesScreen(profileId: Int = -1, refreshTrigger: Int = 0) {
                                                             deletedEntries.add(entry)
                                                         }
                                                     } else {
-                                                        navigateToDetails(entry)
+                                                        // Animate, then open — see TitleCardPress.
+                                                        coroutineScope.runTitleCardPress(isPressed, pressBusy) {
+                                                            navigateToDetails(entry)
+                                                        }
                                                     }
                                                     true
                                                 }
@@ -1338,7 +1401,7 @@ fun FavoritesScreen(profileId: Int = -1, refreshTrigger: Int = 0) {
                             },
                             modifier = Modifier
                                 .onFocusChanged {
-                                    if (it.isFocused) BlueHiveApplication.playHoverSound()
+                                    if (it.isFocused && hoverArmed) BlueHiveApplication.playHoverSound()
                                 }
                                 .onKeyEvent { event ->
                                     if (event.type == KeyEventType.KeyDown) {
@@ -1408,7 +1471,7 @@ fun FavoritesScreen(profileId: Int = -1, refreshTrigger: Int = 0) {
                             },
                             modifier = Modifier
                                 .onFocusChanged {
-                                    if (it.isFocused) BlueHiveApplication.playHoverSound()
+                                    if (it.isFocused && hoverArmed) BlueHiveApplication.playHoverSound()
                                 }
                                 .onKeyEvent { event ->
                                     if (event.type == KeyEventType.KeyDown) {
