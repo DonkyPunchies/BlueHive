@@ -131,3 +131,28 @@
 ############################################################
 # End of rules
 ############################################################
+
+# -- R8 VerifyError guard: the two detail screens -------------------------------
+#
+# OPENING ANY TV SHOW KILLED THE APP. ART refused to load
+# TVShowsDetailsScreenComposeKt at all -- "Verifier rejected class ... type
+# Conflict unexpected as arg to if-eqz" -- because R8's optimizer emitted
+# bytecode for TVShowsDetailsScreenContent that fails verification: a register
+# carrying incompatible types down different branches, then tested as a
+# condition. That function takes 27 parameters and is a single enormous
+# composable, which is the shape these R8 miscompiles live in.
+#
+# THE FILE HAD NOT CHANGED. R8 re-optimizes the whole app on every release
+# build, so edits elsewhere shifted how it treated this function; the source
+# was byte-identical to the build where it worked. Debug builds never show it,
+# because they skip R8 entirely.
+#
+# Keeping the class stops R8 rewriting these members' signatures and inlining
+# them, which is what produced the unverifiable register types. The movie
+# screen is kept too: same shape, same risk, and the verifier scan that
+# should have caught this one did not, so its absence of complaints about
+# the movie screen proves nothing. The real fix is splitting both functions;
+# remove these lines only after that, and only once a release build has been
+# opened on a device.
+-keep class com.example.bluehive.TVShowsDetailsScreenComposeKt { *; }
+-keep class com.example.bluehive.MoviesDetailsScreenComposeKt { *; }
