@@ -36,6 +36,7 @@ import com.example.bluehive.api.RelayGrantRequest
 import com.example.bluehive.auth.SessionManager
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
+import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.HttpDataSource
 import java.net.URLEncoder
 import androidx.media3.common.Player
@@ -127,6 +128,20 @@ class HlsPlayerActivity : ComponentActivity() {
     private var directStartedAtMs = 0L
 
     /**
+     * Forces the container interpretation after one has been proven wrong.
+     *
+     * Null means "believe the backend flag, then the url heuristic", which is the
+     * normal path. Set only by the container-parse retry below.
+     */
+    private var forcedUseHls: Boolean? = null
+
+    /** Which interpretation the current media source was actually built with. */
+    private var lastUsedHls: Boolean = true
+
+    /** One container-parse retry per playback. See the handler for why exactly one. */
+    private var containerRetried = false
+
+    /**
      * The FIRST url this playback tried, kept after a relay overwrites currentM3u8.
      *
      * Both reports describe the direct attempt, not the relay: the host worth
@@ -183,6 +198,11 @@ class HlsPlayerActivity : ComponentActivity() {
     private var progressJob: kotlinx.coroutines.Job? = null
     private var recoveryWatchdogJob: kotlinx.coroutines.Job? = null
     private var progressiveRefreshJob: kotlinx.coroutines.Job? = null
+    // The stall watchdog polls ONE player instance. startPlayback rebuilds the
+    // player on every recovery, so the previous loop is cancelled before the
+    // player it holds is released. Before this was tracked, each rebuild left
+    // another 1 Hz loop polling a dead player until the Activity died.
+    private var stallWatchdogJob: kotlinx.coroutines.Job? = null
 
     /**
      * Always-visible recovery breadcrumb.
@@ -433,13 +453,18 @@ class HlsPlayerActivity : ComponentActivity() {
         // could replace a playing stream with a dead one — precisely the risk this
         // rewrite exists to remove. One ranged request is far cheaper than a second
         // ExoPlayer instance on a memory-tight TV box.
-        if (!probeStreamReachable(body.m3u8)) {
+        if (!probeStreamReachable(
+                body.m3u8,
+                probeUa = body.user_agent?.takeIf { it.isNotBlank() } ?: ua,
+                probeReferer = body.referer?.takeIf { it.isNotBlank() } ?: referer,
+            )
+        ) {
             recoveryLog("pre-emptive refresh: replacement URL did not answer — KEEPING current stream")
             rescheduleProgressiveRetry(); return
         }
 
         // Committed. Everything from here mirrors a normal recovery swap.
-        player?.let { if (it.currentPosition > 0) resumePositionMs = it.currentPosition }
+        captureResumeState()
         body.referer?.takeIf { it.isNotBlank() }?.let { referer = it }
         body.user_agent?.takeIf { it.isNotBlank() }?.let { ua = it }
         body.proxy_url?.takeIf { it.isNotBlank() }?.let { relayUrl = it }
@@ -470,28 +495,71 @@ class HlsPlayerActivity : ComponentActivity() {
      * or a misleading 200 while the real GET 404s, which would defeat the point.
      * Carries the same Referer/UA the player will use, because some of them gate on
      * exactly that.
+     *
+     * THROUGH THE SAME TRANSPORT AS PLAYBACK, which is the whole point. This used
+     * to be a java.net.HttpURLConnection: system DNS, plaintext SNI, TCP only. On
+     * an SNI-filtered line that is exactly the request the filter severs, so a
+     * fresh URL that Cronet with QUIC and ECH could play was judged dead, added
+     * to failedStreamUrls, charged against extractRetries and ultimately ended in
+     * abandonSourceWithNotice. It also cost up to 20 s of its own timeouts. Now
+     * the probe opens a two-byte ranged request on the data source playback will
+     * use, so its verdict and the player's outcome cannot disagree.
+     *
+     * [probeUa] / [probeReferer] default to the current stream's values; pass the
+     * candidate's own when the backend supplied new ones, since those are what
+     * the player will send once the URL is committed.
      */
-    private suspend fun probeStreamReachable(url: String): Boolean = withContext(Dispatchers.IO) {
-        runCatching {
-            val c = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
-                requestMethod = "GET"
-                setRequestProperty("Range", "bytes=0-1")
-                setRequestProperty("User-Agent", ua)
-                setRequestProperty("Referer", referer)
-                connectTimeout = 10_000
-                readTimeout    = 10_000
-                instanceFollowRedirects = true
-            }
-            val code = c.responseCode
-            c.disconnect()
-            code in 200..299
-        }.getOrDefault(false)
+    private suspend fun probeStreamReachable(
+        url: String,
+        probeUa: String = ua,
+        probeReferer: String = referer,
+    ): Boolean = withContext(Dispatchers.IO) {
+        val source = streamDataSourceFactory(url, probeUa, probeReferer).createDataSource()
+        try {
+            // position 0, length 2 -> "Range: bytes=0-1". open() returns once the
+            // response headers are in and throws on anything outside 2xx, which
+            // is the same yes/no the old responseCode check gave.
+            source.open(DataSpec.Builder().setUri(url).setPosition(0).setLength(2).build())
+            true
+        } catch (e: Exception) {
+            Log.d(TAG, "probe: candidate did not answer (${e.javaClass.simpleName}: ${e.message})")
+            false
+        } finally {
+            runCatching { source.close() }
+        }
     }
 
     // --- stream params (kept so we can rebuild on retry) ---
     private var embedUrl: String? = null
     private var currentM3u8: String = ""
     private var resumePositionMs: Long = 0
+
+    /**
+     * Should the rebuilt player start playing? Travels with [resumePositionMs].
+     *
+     * Defaults TRUE so the first build, which has no previous player to ask,
+     * behaves exactly as before. Every rebuild path overwrites it through
+     * [captureResumeState], and startPlayback resets it to true once consumed —
+     * so a stale false can never leak into a later, unrelated build.
+     */
+    private var resumePlayWhenReady: Boolean = true
+
+    /**
+     * Snapshot what a rebuild has to carry across: where we were, and whether we
+     * were watching.
+     *
+     * ONE HELPER BECAUSE THERE ARE FOUR CALLERS and there was nearly a fifth.
+     * The position was already being copied at all four — the progressive
+     * refresh, the container retry, the relay switch and re-extraction — and the
+     * play/pause state at none of them, which is precisely the kind of omission
+     * that happens when the same three lines are written out four times.
+     */
+    private fun captureResumeState() {
+        player?.let {
+            if (it.currentPosition > 0) resumePositionMs = it.currentPosition
+            resumePlayWhenReady = it.playWhenReady
+        }
+    }
     // EMPTY BY DEFAULT, so "no Referer" is expressible.
     //
     // This was "https://cinesrc.st/". Combined with the `?:` reads below, a null
@@ -532,6 +600,26 @@ class HlsPlayerActivity : ComponentActivity() {
     /** True only if WE paused to show the picker, so closing it can't resume a
      *  video the user had deliberately paused before pressing CC. */
     private var pausedForPicker = false
+
+    /**
+     * Was playback running when this activity last went to the background?
+     *
+     * THE SAME RULE AS pausedForPicker, applied to the lifecycle. onResume used
+     * to call play() unconditionally, so anything that backgrounded the activity
+     * and came back resumed a film the user had deliberately paused. The one
+     * trigger that is certain to do that on a television is the daydream: this
+     * box has screensaver_enabled=1 and screen_off_timeout=600000, so pausing
+     * and sitting still for ten minutes backgrounds the app, and the key press
+     * that dismisses the screensaver brings it back — playing.
+     *
+     * playWhenReady, NOT isPlaying. isPlaying is briefly false mid-buffer (see
+     * ExoPlayerConfig.togglePlayPause, which flips playWhenReady for exactly
+     * this reason), so pausing during a stall would record "was not playing" and
+     * the film would stay paused on return — trading one wrong behaviour for
+     * another. playWhenReady is the user's intent rather than the decoder's
+     * moment-to-moment state.
+     */
+    private var wasPlayingBeforePause = false
 
     // Subtitle timing offset in ms (+ = show later, − = show earlier), persisted per title.
     private var subtitleOffsetMs: Long = 0
@@ -608,7 +696,11 @@ class HlsPlayerActivity : ComponentActivity() {
 
         val mediaSource = buildMediaSource(url)
 
-        // Release any previous instance before rebuilding (retry path).
+        // Release any previous instance before rebuilding (retry path). The
+        // watchdog goes first: it holds the OLD player and runs on this same
+        // thread, so cancelling here guarantees it never touches a released one.
+        stallWatchdogJob?.cancel()
+        stallWatchdogJob = null
         playerView?.player = null
         player?.run { stop(); clearMediaItems(); release() }
 
@@ -648,7 +740,7 @@ class HlsPlayerActivity : ComponentActivity() {
                 // a dead url, not a stuck codec — an expired token presents this
                 // way because it hangs instead of erroring, so onPlayerError
                 // never fires and nothing below would otherwise recover.
-                ExoPlayerConfig.attachStallWatchdog(this, lifecycleScope, TAG) {
+                stallWatchdogJob = ExoPlayerConfig.attachStallWatchdog(this, lifecycleScope, TAG) {
                     // A wedge on a blocked CDN looks like this rather than an
                     // error — the request hangs instead of failing — so the relay
                     // belongs here too.
@@ -885,6 +977,45 @@ class HlsPlayerActivity : ComponentActivity() {
                             return
                         }
 
+                        // ── THE LABEL WAS WRONG, NOT THE STREAM ─────────────
+                        //
+                        // A container error means the bytes arrived and no parser
+                        // recognised them. That is overwhelmingly one thing: a
+                        // playlist handed to the file parsers, or the reverse. The
+                        // fetch worked, so no amount of relaying or re-extracting
+                        // helps — and none of them even ran, because this code is
+                        // not a CDN failure and fell straight through to
+                        // abandonSourceWithNotice.
+                        //
+                        // MEASURED 2026-09-13 on VidNest: the stream was HLS with
+                        // its manifest named master.txt and its segments named
+                        // .woff2, so the extractor found no ".m3u8", called it
+                        // progressive, and ExoPlayer died on NoDeclaredBrand with
+                        // a perfectly good stream on the other end.
+                        //
+                        // Retrying with the OTHER interpretation needs no knowledge
+                        // of how any site names its files: the parsers rejecting it
+                        // is itself the evidence. Exactly once, because if both
+                        // readings fail the stream really is unplayable and a third
+                        // attempt just delays the honest answer.
+                        if (error.errorCode ==
+                                PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED &&
+                            !containerRetried
+                        ) {
+                            containerRetried = true
+                            forcedUseHls = !lastUsedHls
+                            // Log.e: R8 strips w from release builds, and this
+                            // line is the only thing that explains why the source
+                            // type changed between the two lines around it.
+                            Log.e(TAG, "↻ container unrecognised as " +
+                                    "${if (lastUsedHls) "hls" else "progressive"} — " +
+                                    "retrying once as " +
+                                    "${if (forcedUseHls == true) "hls" else "progressive"}")
+                            captureResumeState()
+                            startPlayback(currentM3u8)
+                            return
+                        }
+
                         val isCdnFailure =
                             error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS ||
                                     error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ||
@@ -915,7 +1046,21 @@ class HlsPlayerActivity : ComponentActivity() {
                 prepare()
                 if (resumePositionMs > 0) seekTo(resumePositionMs)
                 resumePositionMs = 0
-                playWhenReady = true
+                // PAUSED STAYS PAUSED ACROSS A REBUILD.
+                //
+                // This was an unconditional `true`, which is right for the first
+                // build and wrong for every later one. startPlayback is also the
+                // tail of four rebuild paths — the 50-minute progressive refresh,
+                // the container retry, the relay switch and re-extraction — and
+                // each of those carefully carries the POSITION across
+                // (resumePositionMs) while dropping whether the user was watching.
+                //
+                // The refresh is the one that bites, because it is the only one
+                // that fires with no user action and no error: arm it at 09:09,
+                // pause the film at 09:15, and at 09:59 it swaps the URL and
+                // starts playing to an empty room.
+                playWhenReady = resumePlayWhenReady
+                resumePlayWhenReady = true
             }
 
         playerView?.player = player
@@ -1011,6 +1156,41 @@ class HlsPlayerActivity : ComponentActivity() {
     }
 
     /**
+     * The data-source factory playback uses for [url]: the same headers, the same
+     * QUIC hint, the same Cronet-or-OkHttp choice. Shared by [buildMediaSource]
+     * and [probeStreamReachable] so that a URL is judged by the transport that
+     * will actually play it.
+     */
+    private fun streamDataSourceFactory(
+        url: String,
+        streamUa: String,
+        streamReferer: String,
+    ): androidx.media3.datasource.DataSource.Factory {
+        val isBackendRelay = try {
+            val backendHost = android.net.Uri.parse(BuildConfig.API_BASE_URL).host
+            val streamHost  = android.net.Uri.parse(url).host
+            backendHost != null && backendHost.equals(streamHost, ignoreCase = true)
+        } catch (_: Exception) { false }
+
+        // Referer only when the backend supplies one; Origin never. See
+        // ExoPlayerConfig.streamHeaders for the measured per-level table and for
+        // why a blanket removal (build 114) was wrong.
+        val requestHeaders = mutableMapOf(
+            "User-Agent" to streamUa,
+            "Accept" to "*/*",
+            "Accept-Language" to "en-US,en;q=0.9"
+        )
+        if (streamReferer.isNotBlank()) requestHeaders["Referer"] = streamReferer
+        if (isBackendRelay) requestHeaders["X-API-Key"] = BuildConfig.API_KEY
+
+        // BEFORE the factory, because addQuicHint is build-time state. A filtered
+        // CDN never advertises alt-svc (its TCP handshake dies first), so QUIC has
+        // to be tried on the very first request or not at all.
+        ExoPlayerConfig.ensureQuicHint(this, url)
+        return ExoPlayerConfig.dataSourceFactory(streamUa, requestHeaders, context = this)
+    }
+
+    /**
      * Video-only source. Captions are rendered separately (see class doc).
      *
      * HLS unless the URL is demonstrably a whole file. VidNest returns
@@ -1024,28 +1204,7 @@ class HlsPlayerActivity : ComponentActivity() {
             if (u.scheme != null && u.host != null) "${u.scheme}://${u.host}" else "https://cinesrc.st"
         } catch (_: Exception) { "https://cinesrc.st" }
 
-        val isBackendRelay = try {
-            val backendHost = android.net.Uri.parse(BuildConfig.API_BASE_URL).host
-            val streamHost  = android.net.Uri.parse(url).host
-            backendHost != null && backendHost.equals(streamHost, ignoreCase = true)
-        } catch (_: Exception) { false }
-
-        // Referer only when the backend supplies one; Origin never. See
-        // ExoPlayerConfig.streamHeaders for the measured per-level table and for
-        // why a blanket removal (build 114) was wrong.
-        val requestHeaders = mutableMapOf(
-            "User-Agent" to ua,
-            "Accept" to "*/*",
-            "Accept-Language" to "en-US,en;q=0.9"
-        )
-        if (referer.isNotBlank()) requestHeaders["Referer"] = referer
-        if (isBackendRelay) requestHeaders["X-API-Key"] = BuildConfig.API_KEY
-
-        // BEFORE the factory, because addQuicHint is build-time state. A filtered
-        // CDN never advertises alt-svc (its TCP handshake dies first), so QUIC has
-        // to be tried on the very first request or not at all.
-        ExoPlayerConfig.ensureQuicHint(this, url)
-        val factory = ExoPlayerConfig.dataSourceFactory(ua, requestHeaders, context = this)
+        val factory = streamDataSourceFactory(url, ua, referer)
 
         // Decided from the URL, NOT from the backend's is_hls flag. The player is
         // handed a URL from several places — the relay, a mid-play re-extraction,
@@ -1078,7 +1237,8 @@ class HlsPlayerActivity : ComponentActivity() {
         // on-device and re-extraction paths that never set it.
         val hlsHint: Boolean? =
             if (intent.hasExtra("IS_HLS")) intent.getBooleanExtra("IS_HLS", true) else null
-        val useHls = hlsHint ?: !looksProgressive
+        val useHls = forcedUseHls ?: (hlsHint ?: !looksProgressive)
+        lastUsedHls = useHls
 
         Log.e(TAG, "🎞 source=${if (useHls) "hls" else "progressive"} " +
                 "(${if (hlsHint != null) "backend is_hls=$hlsHint" else "inferred from url"}) " +
@@ -1383,7 +1543,7 @@ class HlsPlayerActivity : ComponentActivity() {
 
         usingRelay = true
         // Remember the position BEFORE the teardown so recovery resumes.
-        player?.let { if (it.currentPosition > 0) resumePositionMs = it.currentPosition }
+        captureResumeState()
         // ── WHAT THE RELAY ROW GETS TOLD ─────────────────────────────────────
         //
         // err alone could not answer the only question that matters when a relay
@@ -1446,7 +1606,7 @@ class HlsPlayerActivity : ComponentActivity() {
         val embed = embedUrl ?: run { finish(); return }
         // Remember where we were BEFORE tearing the player down, so a recovery
         // resumes the episode instead of restarting it.
-        player?.let { if (it.currentPosition > 0) resumePositionMs = it.currentPosition }
+        captureResumeState()
         player?.run { stop(); clearMediaItems(); release() }
         player = null
         // Which extractor to re-run is the caller's decision — this player is
@@ -1528,7 +1688,12 @@ class HlsPlayerActivity : ComponentActivity() {
             // A 200 from our backend means extraction ran, not that the link serves
             // bytes. Probing costs one ranged request; handing a dead URL to
             // ExoPlayer costs a full connect/read timeout and another error cycle.
-            if (!probeStreamReachable(body.m3u8)) {
+            if (!probeStreamReachable(
+                    body.m3u8,
+                    probeUa = body.user_agent?.takeIf { it.isNotBlank() } ?: ua,
+                    probeReferer = body.referer?.takeIf { it.isNotBlank() } ?: referer,
+                )
+            ) {
                 failedStreamUrls += body.m3u8
                 recoveryLog("re-extracted URL does not answer — not handing it to the player")
                 if (extractRetries < MAX_EXTRACT_RETRIES) {
@@ -1636,8 +1801,18 @@ class HlsPlayerActivity : ComponentActivity() {
         return super.dispatchKeyEvent(event)
     }
 
-    override fun onPause()  { super.onPause();  player?.pause() }
-    override fun onResume() { super.onResume(); player?.play() }
+    override fun onPause() {
+        super.onPause()
+        // Recorded BEFORE pausing, or we would always read false.
+        wasPlayingBeforePause = player?.playWhenReady == true
+        player?.pause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Only resume what WE paused. A film the user stopped stays stopped.
+        if (wasPlayingBeforePause) player?.play()
+    }
     override fun onDestroy() {
         // Applied HERE because the player is already released, so no request
         // is in flight and the engine can be shut down properly. Rebuilding
@@ -1657,6 +1832,7 @@ class HlsPlayerActivity : ComponentActivity() {
         progressJob?.cancel()
         recoveryWatchdogJob?.cancel()
         progressiveRefreshJob?.cancel()
+        stallWatchdogJob?.cancel()
         toastJob?.cancel()
         captionTickerJob?.cancel()
         playerView?.player = null

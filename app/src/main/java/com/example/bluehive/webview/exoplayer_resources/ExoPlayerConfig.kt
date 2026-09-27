@@ -408,6 +408,12 @@ object ExoPlayerConfig {
      *
      * [isLoading] is the discriminator that keeps this from firing on an honest
      * rebuffer: a real one is actively fetching, a wedge is not.
+     *
+     * @return the polling Job. The loop holds THIS [player] instance, so a caller
+     *   that rebuilds its player must cancel the returned Job before releasing
+     *   the old one. Without that, every recovery rebuild in HlsPlayerActivity
+     *   added another 1 Hz loop polling a released player until the Activity
+     *   died.
      */
     fun attachStallWatchdog(
         player: ExoPlayer,
@@ -419,8 +425,8 @@ object ExoPlayerConfig {
          * retry-forever behaviour for callers with no way to get a fresh one.
          */
         onManifestDead: (() -> Unit)? = null,
-    ) {
-        scope.launch {
+    ): kotlinx.coroutines.Job {
+        return scope.launch {
             var lastPos = -1L
             var stalledMs = 0L
             var seeks = 0
@@ -777,6 +783,32 @@ object ExoPlayerConfig {
                 .setForceHighestSupportedBitrate(FORCE_HIGHEST_BITRATE)
                 .setMaxVideoSize(MAX_VIDEO_WIDTH, MAX_VIDEO_HEIGHT)
                 .setTunnelingEnabled(TUNNELING_ENABLED)
+                // ── AUDIO LANGUAGE, STATED RATHER THAN ASSUMED ──────────────
+                //
+                // Nothing set this before, and DefaultTrackSelector's context
+                // constructor fills in a preferred TEXT language but not a
+                // preferred AUDIO one. With no preference the scorer falls back
+                // to the manifest's own DEFAULT flag, so whatever the packager
+                // marked wins.
+                //
+                // MEASURED 2026-09-13 on VidNest (Gundam Hathaway, tmdb 910850):
+                //
+                //   NAME="हिन्दी"  LANGUAGE="hi"  AUTOSELECT=YES  DEFAULT=YES
+                //   NAME="English" LANGUAGE="en"  AUTOSELECT=NO   DEFAULT=NO
+                //   NAME="日本語"   LANGUAGE="ja"  AUTOSELECT=NO   DEFAULT=NO
+                //
+                // Hindi is the declared default, so it played Hindi on a box
+                // whose entire UI is English. The tracks ARE tagged with proper
+                // language codes, which is what makes a stated preference work:
+                // an explicit language match outscores the DEFAULT flag.
+                //
+                // Device locale first so this stays right if the box is ever set
+                // to another language, English second as the fallback the
+                // catalogue is actually in. A stream with one audio track is
+                // unaffected — there is nothing to choose between.
+                .setPreferredAudioLanguages(
+                    java.util.Locale.getDefault().language, "en"
+                )
         )
     }
 
@@ -832,7 +864,15 @@ object ExoPlayerConfig {
     }
 
     /** HTTP client for stream fetches. Redirects followed — CDNs bounce a lot. */
-    fun okHttpClient(): OkHttpClient =
+    //
+    // ONE INSTANCE, BUILT ON FIRST USE. This used to construct a new client on
+    // every call, and dataSourceFactory evaluated it as a default argument on
+    // every playback start and every recovery rebuild, including the Cronet path
+    // that never used the result. Each instance owns a connection pool and a
+    // dispatcher thread pool, so a troubled film leaked a handful of both.
+    // OkHttpClient is immutable and built to be shared; a caller that needs
+    // different timeouts can newBuilder() this one and share its pools.
+    private val sharedOkHttpClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .dns(dohResolver)
             .followRedirects(true)
@@ -840,6 +880,26 @@ object ExoPlayerConfig {
             .connectTimeout(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .readTimeout(READ_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .build()
+    }
+
+    fun okHttpClient(): OkHttpClient = sharedOkHttpClient
+
+    /**
+     * Callback executor for every CronetDataSource, ONE for the process, which is
+     * how Media3's own demo app wires it. The callbacks only signal the data
+     * source's condition variable and hand over a buffer, so a single thread
+     * serves any number of concurrent sources.
+     *
+     * This used to be Executors.newSingleThreadExecutor() per dataSourceFactory
+     * call and was never shut down: its core thread is non-daemon with no idle
+     * timeout, so every playback start and every recovery rebuild left one more
+     * idle thread alive for the rest of the process.
+     */
+    private val cronetCallbackExecutor: java.util.concurrent.ExecutorService by lazy {
+        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "cronet-datasource-callback")
+        }
+    }
 
     /**
      * Data-source factory for extracted streams.
@@ -1722,6 +1782,14 @@ object ExoPlayerConfig {
                 Log.e("scraper-vidapi", "🔬 ECH PROBE failed (inconclusive): ${e.message}")
                 exec.shutdown()
             }
+
+            // Nothing cancels this request today. Covered anyway, so the executor
+            // is released on every terminal callback Cronet defines.
+            override fun onCanceled(
+                r: org.chromium.net.UrlRequest, i: org.chromium.net.UrlResponseInfo?
+            ) {
+                exec.shutdown()
+            }
         }
         runCatching {
             engine.newUrlRequestBuilder(
@@ -1730,6 +1798,11 @@ object ExoPlayerConfig {
         }.onFailure {
             echVerdict = "inconclusive"
             Log.e("scraper-vidapi", "🔬 ECH PROBE could not start: ${it.message}")
+            // No callback will ever run, so nothing else can release it. The
+            // worker thread is only created on the first task, so this closes a
+            // code path rather than a thread leak, but it is the only path that
+            // lacked it.
+            exec.shutdown()
         }
     }
 
@@ -1776,12 +1849,27 @@ object ExoPlayerConfig {
         java.net.URI(url).host?.lowercase()?.let { it in freshAtLastWarm }
     }.getOrDefault(false) ?: false
 
+    /**
+     * Executor for the request-finished listener below, ONE for the process.
+     *
+     * This used to be a fresh newSingleThreadExecutor() per engine build with no
+     * shutdown anywhere. An engine is rebuilt at every player teardown that
+     * learned a new QUIC host (applyPendingQuicHints), so each rebuild left one
+     * more idle thread behind for the life of the process. The listener only
+     * records a host's protocol and status, so one thread serves every engine
+     * and simply outlives them.
+     */
+    private val transportLogExecutor: java.util.concurrent.ExecutorService by lazy {
+        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "cronet-transport-log")
+        }
+    }
+
     private fun attachTransportLog(engine: org.chromium.net.CronetEngine) {
         val ex = engine as? org.chromium.net.ExperimentalCronetEngine ?: return
-        val exec = java.util.concurrent.Executors.newSingleThreadExecutor()
         runCatching {
             ex.addRequestFinishedListener(
-                object : org.chromium.net.RequestFinishedInfo.Listener(exec) {
+                object : org.chromium.net.RequestFinishedInfo.Listener(transportLogExecutor) {
                     override fun onRequestFinished(info: org.chromium.net.RequestFinishedInfo) {
                         val host = runCatching {
                             java.net.URI(info.url).host ?: return
@@ -2192,7 +2280,10 @@ object ExoPlayerConfig {
     fun dataSourceFactory(
         userAgent: String,
         headers: Map<String, String>,
-        client: OkHttpClient = okHttpClient(),
+        // Null means the shared client, resolved ONLY if the OkHttp branch is
+        // taken. A default of okHttpClient() here was evaluated on every call,
+        // Cronet or not.
+        client: OkHttpClient? = null,
         context: Context? = null,
     ): DataSource.Factory {
         // ── OKHTTP CANNOT PLAY ON THIS LINE, SO NEVER REACH FOR IT QUIETLY ──
@@ -2245,7 +2336,7 @@ object ExoPlayerConfig {
         }
         val http: DataSource.Factory = if (engine != null) {
             androidx.media3.datasource.cronet.CronetDataSource.Factory(
-                engine, java.util.concurrent.Executors.newSingleThreadExecutor()
+                engine, cronetCallbackExecutor
             )
                 .setUserAgent(userAgent)
                 .setDefaultRequestProperties(headers)
@@ -2261,7 +2352,7 @@ object ExoPlayerConfig {
                 // OkHttp path is the `else` below — taken when cronet() returns
                 // null. Removing it so the next reader is not misled the same way.
         } else {
-            OkHttpDataSource.Factory(client)
+            OkHttpDataSource.Factory(client ?: okHttpClient())
                 .setUserAgent(userAgent)
                 .setDefaultRequestProperties(headers)
         }

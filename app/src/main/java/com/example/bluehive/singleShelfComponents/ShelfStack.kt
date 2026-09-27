@@ -46,7 +46,8 @@ import com.example.bluehive.BuildConfig
 import com.example.bluehive.models.MediaItem
 import com.example.bluehive.utilities.AppTypography
 import com.example.bluehive.utilities.TvWideLazyRow
-import kotlinx.coroutines.Dispatchers
+import com.example.bluehive.utilities.TV_WIDE_ROW_VIEWPORT_WIDTH
+import com.example.bluehive.utilities.TV_WIDE_ROW_RIGHT_BODY_X
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
@@ -122,6 +123,12 @@ fun ShelfStack(
     onShelfChanged: (ContentShelf) -> Unit = {},
     profileId: Int = -1,
     onFirstPageReady: () -> Unit = {},
+    // False when the home screen is not showing the Continue Watching panel
+    // (the profile has no watch history): the first shelf then runs the full
+    // width of every other row instead of stopping short of the panel. Kept
+    // apart from showContinueWatching on purpose -- that one flips with the
+    // focused shelf, this one only when the history does.
+    reserveContinueWatching: Boolean = true,
 ) {
     val shelves = remember(mediaType) {
         when (mediaType) {
@@ -362,6 +369,7 @@ fun ShelfStack(
                             cardFocusEpoch       = tracker.cardFocusEpoch(shelf),
                             showContinueWatching = showContinueWatching
                                     && shelf == ContentShelf.POPULAR,
+                            reserveContinueWatching = reserveContinueWatching,
                             onMediaClick         = onMediaClick,
                             profileId            = profileId,
                             onFirstPageReady     = if (shelf == ContentShelf.POPULAR) onFirstPageReady else ({ }),
@@ -405,12 +413,12 @@ private fun ShelfRowContent(
     onMediaClick: (MediaItem) -> Unit,
     profileId: Int = -1,
     onFirstPageReady: () -> Unit = {},
+    reserveContinueWatching: Boolean = true,
 ) {
     // Pagination knobs — unchanged from the old HomeSingleShelf.
     val pageSize        = 20
     val maxPages        = 2
     val prefetchTrigger = 12
-    val evictTrigger    = 20
     val reloadTrigger   = 5
 
     val context = LocalContext.current
@@ -452,7 +460,23 @@ private fun ShelfRowContent(
 
         loadingJob?.cancelAndJoin()
         loading = true
-        loadingJob = coroutineScope.launch(Dispatchers.IO) {
+        // MAIN, DELIBERATELY. ShelfRepository.loadPage is itself
+        // withContext(Dispatchers.IO), so the network never touches this thread —
+        // dropping the dispatcher here costs nothing and moves only the bookkeeping.
+        //
+        // WHY IT MATTERS: everything below mutates pageWindow — loadedPages (a
+        // plain mutableMapOf), windowStartPage, windowEndPage — and evictPage does
+        // the same from the focus callback on the main thread. Two threads writing
+        // an unsynchronised LinkedHashMap can lose or corrupt entries, and the two
+        // window indices are non-volatile ints, so a main-thread read can see a
+        // stale range and getAllItems then returns a list that disagrees with the
+        // map: cards missing or repeated, with nothing thrown.
+        //
+        // This was unreachable until eviction started working. Puts are serialised
+        // by the cancelAndJoin above and removes never happened, so the map only
+        // ever had one writer. Fixing the dead evict trigger is what introduced
+        // the second one, and this closes it in the same breath.
+        loadingJob = coroutineScope.launch {
             try {
                 val result = repository.loadPage(mediaType, shelf, pageNum, pageSize, profileId)
                 if (result.items.isNotEmpty()) {
@@ -565,8 +589,21 @@ private fun ShelfRowContent(
             }
         }
 
-        // EVICT trailing page once we're deep enough into the head page
-        if (pageNumber == pageWindow.windowEndPage && indexInPage >= evictTrigger) {
+        // EVICT the trailing page once focus is inside the newest one.
+        //
+        // THIS TEST COULD NEVER BE TRUE. It read `indexInPage >= evictTrigger`
+        // with evictTrigger 20 and pageSize 20, and indexInPage is
+        // `absoluteIndex % pageSize`, so it runs 0..19 and never reaches 20. The
+        // branch was dead, maxPages was never enforced while browsing forward,
+        // and every page scrolled past stayed resident for the life of the
+        // screen — which also made every recomposition of the row more expensive,
+        // since the flattened list only ever grew.
+        //
+        // Rewritten against the flattened list for exactly the reason the
+        // prefetch above was moved off the same arithmetic: short blend pages and
+        // dedup desync page-relative index maths. That is how a trigger equal to
+        // the page size survived unnoticed.
+        if (items.size > pageSize && listIndex >= items.size - pageSize) {
             val pageCount = pageWindow.getPageCount()
             if (pageCount > maxPages && pageWindow.windowStartPage < pageNumber) {
                 evictPage(pageWindow.windowStartPage)
@@ -592,6 +629,11 @@ private fun ShelfRowContent(
             }
         }
     }
+
+    // Remembered so the row sees a stable parameter and can still skip. Reading
+    // cardTracker here instead would put the snapshot read back into composition,
+    // which is the whole thing being removed.
+    val pendingFocusProvider = remember(shelf) { { cardTracker.cardTmdbId(shelf) } }
 
     val title = repository.getShelfTitle(mediaType, shelf)
 
@@ -628,16 +670,21 @@ private fun ShelfRowContent(
                 onFocusChanged     = ::handleFocusChange,
                 rowFocusRequester  = rowFocusRequester,
                 isPageLoading      = loading,
-                pendingFocusTmdbId = cardTracker.cardTmdbId(shelf),
+                pendingFocusTmdbId = pendingFocusProvider,
                 cardFocusEpoch     = cardFocusEpoch,
                 isFocusedShelf     = isFocused,
                 onFocusRestored    = {
                     if (BuildConfig.DEBUG) Log.d("FOCUS_MEMORY", "restored $shelf")
                 },
                 showTitle             = false,
-                viewportWidth         = 610.dp,
-                rightLowerBodyOffsetX = 580.dp,
-                rightUpperBodyOffsetX = 580.dp,
+                // FULL WIDTH WHEN THERE IS NO CONTINUE WATCHING PANEL. Only these
+                // three sizes change -- the Row and the row inside it stay exactly
+                // as they are, so the structure the search-bar fix above depends on
+                // never changes. And the flag behind them moves only when the
+                // history does, never mid-transition between shelves.
+                viewportWidth         = if (reserveContinueWatching) 610.dp else TV_WIDE_ROW_VIEWPORT_WIDTH,
+                rightLowerBodyOffsetX = if (reserveContinueWatching) 580.dp else TV_WIDE_ROW_RIGHT_BODY_X,
+                rightUpperBodyOffsetX = if (reserveContinueWatching) 580.dp else TV_WIDE_ROW_RIGHT_BODY_X,
             )
         }
     } else {
@@ -648,7 +695,7 @@ private fun ShelfRowContent(
             onFocusChanged     = ::handleFocusChange,
             rowFocusRequester  = rowFocusRequester,
             isPageLoading      = loading,
-            pendingFocusTmdbId = cardTracker.cardTmdbId(shelf),
+            pendingFocusTmdbId = pendingFocusProvider,
             cardFocusEpoch     = cardFocusEpoch,
             isFocusedShelf     = isFocused,
             onFocusRestored    = {

@@ -34,6 +34,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
@@ -280,9 +281,23 @@ fun HomeScreenContinueWatchingCompose(
     downNeighbor: FocusRequester? = null,
     onNavigateLeft: () -> Unit = {},
     onNavigateDown: () -> Unit = {},
+    // Told whether the profile has any watch history, each time a load
+    // settles (the first, and every ON_RESUME refresh). The home screen uses it
+    // to leave this panel out -- and run the first shelf full width -- when
+    // there is none. Not called while a load is in flight or after one fails.
+    onHistoryKnown: (hasHistory: Boolean) -> Unit = {},
+    // What the screen already knew from an earlier load, for the moments before
+    // this one answers. The panel is created afresh each time the first shelf
+    // comes back into view, and without this a profile with no history flashed
+    // an empty frame there until its fetch returned.
+    knownHasHistory: Boolean? = null,
 ) {
     // ── Data loading ──────────────────────────────────────────────────────────
     var historyItems by remember { mutableStateOf<List<WatchHistoryResponse>>(emptyList()) }
+
+    // True once a load has actually answered. Until then an empty list means
+    // "not asked yet", not "no history", and the panel keeps its frame.
+    var historyLoaded by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     var isNavigating by remember { mutableStateOf(false) }
@@ -315,6 +330,7 @@ fun HomeScreenContinueWatchingCompose(
         if (prefetched != null) {
             Log.d("CONTINUE_WATCHING", "⚡ Using ${prefetched.size} prefetched items for profile $profileId")
             historyItems = prefetched
+            historyLoaded = true
             return@LaunchedEffect
         }
 
@@ -326,10 +342,24 @@ fun HomeScreenContinueWatchingCompose(
             )
             Log.d("CONTINUE_WATCHING", "✅ Fetched ${fetched.size} items (key=$refreshKey)")
             historyItems = fetched
+            historyLoaded = true
         } catch (e: Exception) {
             Log.e("CONTINUE_WATCHING", "Failed to load: ${e.message}")
         }
     }
+
+    // ── No history, no panel ─────────────────────────────────────────────────
+    // Reported on every settled load, so the home screen follows the history
+    // both ways: a new profile, or one whose history was cleared on the server,
+    // loses the panel; the first thing watched brings it back on the next
+    // ON_RESUME refresh -- which is why everything above this line keeps
+    // running while nothing below it is drawn.
+    val currentOnHistoryKnown by rememberUpdatedState(onHistoryKnown)
+    LaunchedEffect(historyLoaded, historyItems.isEmpty()) {
+        if (historyLoaded) currentOnHistoryKnown(historyItems.isNotEmpty())
+    }
+    val drawNothing = if (historyLoaded) historyItems.isEmpty() else knownHasHistory == false
+    if (drawNothing) return
 
     // ── Focus tracking for the outer frame ───────────────────────────────────
     val frameInteraction = remember { MutableInteractionSource() }

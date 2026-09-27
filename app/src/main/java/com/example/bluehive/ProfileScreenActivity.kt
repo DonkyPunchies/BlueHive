@@ -9,21 +9,36 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.BringIntoViewSpec
+import androidx.compose.foundation.gestures.LocalBringIntoViewSpec
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.wrapContentSize
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -52,6 +67,7 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -63,6 +79,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.example.bluehive.api.ApiClient
+import com.example.bluehive.api.ProfileQuotaResponse
 import com.example.bluehive.api.ProfileResponse
 import com.example.bluehive.auth.HostEntitlementRelay
 import com.example.bluehive.auth.SessionManager
@@ -78,6 +95,8 @@ import com.example.bluehive.utilities.ModularButtonColors
 import com.example.bluehive.utilities.ModularButtonDimensions
 import com.example.bluehive.utilities.ModularButtonGlowConfig
 import com.example.bluehive.utilities.ModularButtonTextConfig
+import com.example.bluehive.utilities.NoticeContent
+import com.example.bluehive.utilities.NoticeOverlay
 import com.example.bluehive.utilities.NetworkMonitor
 import com.example.bluehive.utilities.ProfileButtonAnimationConfig
 import com.example.bluehive.utilities.ProfileButtonDimensions
@@ -120,15 +139,298 @@ private const val TAG = "ProfileScreen"
 /** Delay (ms) before launching ProfileCreationActivity after button press. */
 private const val CREATE_BUTTON_LAUNCH_DELAY_MS = 700L
 
+/**
+ * Which control the user left this screen from, so focus can be put back on it
+ * when they return.
+ *
+ * AN ENUM RATHER THAN THE FocusRequester ITSELF, for a dull but decisive
+ * reason: the launchers that need to record this are declared above the
+ * requesters they would have to name, and a Kotlin lambda cannot capture a
+ * local declared later in the same block. A token has no such ordering
+ * problem, and it survives the requesters being recreated.
+ */
+private enum class ReturnFocus { None, Manage, SignOut }
+
 // ── Profile card grid config ──────────────────────────────────────────────────
 
 val PROFILE_CARD_SIZE: Dp = 106.6.dp
 val PROFILE_CARD_GAP: Dp = 19.5.dp
-const val PROFILE_CARDS_PER_ROW = 4
+// SIX, NOT FOUR, because the account ceiling is 12 (four paired devices at
+// three profiles each) and the grid draws exactly two rows. Six per row is what
+// makes all twelve reachable without inventing a third row: at 126.1dp per card
+// a full row spans 737dp of the 960dp design space, where a third row would
+// have started below y475 in a space 540dp tall.
+const val PROFILE_CARDS_PER_ROW = 6
+
+/**
+ * How many profile cards this screen can DRAW. Not the account's limit.
+ *
+ * The grid is two absolutely-positioned rows inside a fixed 960x540 dp design
+ * space and the row Y is a two-way choice (top row or bottom row), so card 13
+ * would be painted directly on top of card 7. Six per row times two rows is
+ * therefore a hard ceiling on what can be SHOWN, and the create button hides at
+ * this number rather than offering a slot the grid cannot render.
+ *
+ * IT MATCHES THE SERVER'S CEILING ON PURPOSE: MAX_PROFILES_PER_USER is 12, being
+ * four paired devices at three profiles each. If that moves, this has to move
+ * with it or the account can hold profiles the TV cannot show — and the layout
+ * is what constrains it, not the arithmetic. Everything else (the create
+ * button, the focus wiring, the row maths) reads from these two constants.
+ */
+const val PROFILE_GRID_CAPACITY = PROFILE_CARDS_PER_ROW * 2
+
+/** A cell: the card plus its name label. Rows are built from these. */
+val PROFILE_CELL_HEIGHT: Dp get() = PROFILE_CARD_SIZE + 5.dp + PROFILE_NAME_HEIGHT
+
+/** Gap between rows. The old absolute layout used a 145dp pitch, so this is
+ *  what is left of it once the cell itself is accounted for -- a laid-out grid
+ *  then lands exactly where the positioned one used to. */
+val PROFILE_ROW_SPACING: Dp get() = 145.dp - PROFILE_CELL_HEIGHT
+
+/**
+ * One PAGE of the grid, which is also exactly how much of it is visible.
+ *
+ * TWO ROWS, because that is what fits between the subtitle painted into the
+ * artwork and the Sign Out strip -- and because keeping it at two means an
+ * account with no subscription peers sees exactly the screen it saw before any
+ * of this existed.
+ *
+ * THE GRID TURNS A WHOLE PAGE AT A TIME, never a row. Every page is built to
+ * this exact height and the window is this exact height, so at rest the window
+ * frames one page edge to edge and no row can be left half on screen. It used
+ * to scroll by row, and Android TV's default for that parks the focused row
+ * 30% of the way down the window (PivotBringIntoViewSpec, Compose foundation)
+ * -- which in a window two rows tall sliced the row above it and the row below
+ * it in half. See NoGridFocusScroll and flipGridTo().
+ *
+ * Page 0 is the account's own profiles (twelve at most, so always one page);
+ * the household's follow, twelve to a page, each under its own heading. When
+ * the account's own fit on ONE row, the household's first row takes page 0's
+ * second, as a plain second row: no heading there, the seat triangles tell the
+ * two apart.
+ */
+val GRID_PAGE_HEIGHT: Dp get() =
+    GRID_PAGE_HEADER + PROFILE_CELL_HEIGHT * 2 + PROFILE_ROW_SPACING + GRID_GLOW_FOOTROOM
+
+/**
+ * The band across the top of every page, above its first row.
+ *
+ * On the account's own page it is empty: it is the room the first row's focus
+ * glow needs (GRID_GLOW_HEADROOM), since the window clips whatever is painted
+ * outside it. On a household page it also carries the "Others on your
+ * subscription" heading, which is why it is 5dp deeper than the glow alone
+ * needs -- see GRID_HEADING_CLEARANCE.
+ *
+ * The rows stay on GRID_OFFSET_Y_TOP_ROW / _BOTTOM_ROW on every page; only the
+ * window's top edge moved, from 137 to 132, still 8.5dp below the subtitle,
+ * and at rest nothing but a focused card's glow ever reaches it.
+ */
+val GRID_PAGE_HEADER: Dp = 28.dp
+
+/**
+ * From the bottom of the section heading's text box to the first card.
+ *
+ * MEASURED ON THE TV, 2026-09-21: a focused card grows 1.06x, which lifts its
+ * white ring 6dp above the card's resting top, and the bloom round the ring
+ * fades into the background over the next ~10dp. 14dp keeps the heading's
+ * descenders clear of all but the last faint edge of it, and leaves the
+ * heading's cap tops 5dp inside the window.
+ */
+val GRID_HEADING_CLEARANCE: Dp = 14.dp
+
+/** One page flip, top to bottom of the easing curve. */
+const val GRID_PAGE_FLIP_MS = 350
+
+/** The section heading and the hint that points to it share a colour. */
+val GRID_SECTION_LABEL_COLOR = Color(0xFF6E7BA8)
+
+/**
+ * Top of the "N more on your subscription" hint. Sets its text on the same
+ * baseline as the Sign Out label beside it (glyphs measured at 465.5..474.5,
+ * baseline 472.7; a 9sp Inter line puts its baseline 8.7dp below its top).
+ */
+val GRID_MORE_HINT_Y: Dp = 464.dp
+
+/**
+ * Blank space the viewport keeps ABOVE the first row, and the reason it exists.
+ *
+ * Modifier.verticalScroll clips along its scroll axis. A profile card's focus
+ * glow is drawn 23dp ABOVE the card (PROFILE_CARD_GLOW_OFFSET_Y), which cost
+ * nothing while the grid was absolutely positioned and free to paint anywhere
+ * on the screen -- but inside a scroll viewport whose top edge is the card's
+ * own top edge, the ring on every first-row card was sliced flat. It read as
+ * the row being cut off, which is exactly what it was.
+ *
+ * The headroom lives inside each page, as part of GRID_PAGE_HEADER, so the
+ * cards still land on GRID_OFFSET_Y_TOP_ROW to the pixel; only the window
+ * around them grew.
+ *
+ * (The cross axis needs no such treatment: clipScrollableContainer leaves 30dp
+ * of slack perpendicular to the scroll direction for exactly this kind of
+ * shadow, which is more than the glow's 23dp of horizontal overhang.)
+ */
+val GRID_GLOW_HEADROOM: Dp get() = -PROFILE_CARD_GLOW_OFFSET_Y
+
+/**
+ * And below a page's second row, for the 5dp a focused card's name label drops.
+ *
+ * Deliberately small: the window's bottom lands at 444.6dp and the Sign Out
+ * strip's face begins at 454.5, so this is spending the last of the gap
+ * between them.
+ */
+val GRID_GLOW_FOOTROOM: Dp = 6.dp
+
+/** Six cells and the five gaps between them. */
+val GRID_ROW_WIDTH: Dp get() =
+    PROFILE_CARD_SIZE * PROFILE_CARDS_PER_ROW +
+    PROFILE_CARD_GAP * (PROFILE_CARDS_PER_ROW - 1)
 val PROFILE_CARD_CORNER: Dp = 5.dp
 
-val GRID_OFFSET_Y_TOP_ROW: Dp    = 185.dp
-val GRID_OFFSET_Y_BOTTOM_ROW: Dp = 330.dp
+// The grey edge round every UNFOCUSED card (the focused one drops it for the
+// white glow). 1dp -- a crisp 2px line on this 2x panel -- down from 1.5dp,
+// which read as a heavy frame across a grid of twelve. Thinner also uncovers
+// a little more of each seat triangle, whose outer edges this line overlays.
+val PROFILE_CARD_EDGE_WIDTH: Dp = 1.dp
+
+// The create button's tile, and how far into its grid cell it sits. Named
+// because the row centring measures a row that ends in the button to the
+// tile's right edge -- change the placement and the centring has to know.
+val CREATE_TILE_SIZE: Dp  = 77.25.dp
+val CREATE_TILE_INSET: Dp = 18.dp
+
+// ── Seat triangles ───────────────────────────────────────────────────────────
+//
+// WHICH SEAT ON THE SUBSCRIPTION A PROFILE BELONGS TO, as a corner triangle on
+// the card's top-left: amber for the admin's profiles, purple for a member's.
+// Any profile can be entered by anyone on the subscription, so this is
+// information, not permission.
+//
+// THE SAME DEVICE AS THE WATCHED MARKER on the episode grid (WatchedCornerFold),
+// mirrored: that one sits top-RIGHT and means "you've seen this", so the seat
+// mark takes the opposite corner and the two can never be read as each other.
+// 20dp, about 19% of the 106.6dp card. It has been 22dp (a fifth of the card,
+// the watched fold's proportion) and 16dp; 20 was settled on between the two.
+//
+// THIRD ATTEMPT AT THIS, and why each earlier one went. A coloured frame round
+// the whole card fought the white focus glow, which has to stay the loudest
+// thing on screen. A dot beside the name was too small to register from across
+// a room. A corner triangle is large enough to read, and stays clear of the
+// focus ring because the card clips it to its own rounded corner.
+//
+// 70% SATURATION, hue and lightness unchanged from the colours already
+// approved (HLS 35.9/57.5% and 260.0/71.0%), so the pair is the same two
+// colours as before, only stronger -- enough to read as a marker at card size.
+//
+// SHOWN WHENEVER THE SEAT IS KNOWN, household or not. An account that
+// installed BlueHive without Off Grid Drive is its own admin, so its profiles
+// carry the admin amber -- never the member purple, which would claim someone
+// else pays for them. The server decides that (profiles._seats_for) from
+// account-level evidence rather than the install flag, which adb reinstalls
+// rewrite. A seat of null -- a host-paired account whose first entitlement
+// report has not landed yet -- draws nothing rather than guessing.
+val PROFILE_SEAT_TRIANGLE_SIZE: Dp = 20.dp
+//
+// FULL SATURATION ON THE FOCUSED CARD. Every triangle rests at 70%; the one on
+// the card that has focus rises to 100%, on the same hue and lightness, so the
+// focused card's seat reads loudest without a single colour changing identity.
+// It animates on the card's own 200ms focus tween, alongside the tint and the
+// name, rather than snapping.
+// The admin amber is #D19814, chosen by eye rather than derived: a deeper,
+// more golden amber (HLS 41.9 / 44.9% / 82.5%) than the 70%-rule colour it
+// replaced, so it rests hotter than the member purple does. Its focus shade
+// keeps the rule -- same hue and lightness, saturation to 100%.
+val PROFILE_SEAT_ADMIN_COLOR         = Color(0xFFD19814)   // amber,  83% sat
+val PROFILE_SEAT_ADMIN_FOCUS_COLOR   = Color(0xFFE5A000)   // amber, 100% sat
+val PROFILE_SEAT_MEMBER_COLOR        = Color(0xFFA481E9)   // purple,  70% sat
+val PROFILE_SEAT_MEMBER_FOCUS_COLOR  = Color(0xFF9D6BFF)   // purple, 100% sat
+
+/** Triangle colour for a seat in a given focus state, or null for no triangle. */
+fun profileSeatColor(seat: String?, focused: Boolean): Color? = when (seat) {
+    "owner"  -> if (focused) PROFILE_SEAT_ADMIN_FOCUS_COLOR  else PROFILE_SEAT_ADMIN_COLOR
+    "member" -> if (focused) PROFILE_SEAT_MEMBER_FOCUS_COLOR else PROFILE_SEAT_MEMBER_COLOR
+    else     -> null
+}
+
+/**
+ * The seat triangle itself, for any card that shows one: a right triangle in
+ * the top-left corner of the box it is placed in, [side] along each leg, in the
+ * seat's colour -- resting, or full saturation while [focused], easing between
+ * the two on the cards' 200ms focus tween. Nothing at all for a null seat.
+ *
+ * Place it INSIDE the card's clip, so the card's rounded corner shapes it, and
+ * outside anything that dims the avatar, so the seat reads at full strength on
+ * an unfocused card too -- both as on the profile picker.
+ */
+@Composable
+internal fun SeatTriangle(
+    seat:     String?,
+    focused:  Boolean,
+    side:     Dp,
+    modifier: Modifier = Modifier,
+) {
+    val target = profileSeatColor(seat, focused) ?: return
+    val color by androidx.compose.animation.animateColorAsState(
+        targetValue   = target,
+        animationSpec = tween(durationMillis = 200),
+        label         = "seatTriangle",
+    )
+    androidx.compose.foundation.Canvas(modifier = modifier.size(side)) {
+        val leg = size.width
+        drawPath(
+            path = androidx.compose.ui.graphics.Path().apply {
+                moveTo(0f, 0f)
+                lineTo(leg, 0f)
+                lineTo(0f, leg)
+                close()
+            },
+            color = color,
+        )
+    }
+}
+
+// ROW Y, MEASURED AGAINST THE ARTWORK RATHER THAN CHOSEN.
+//
+// The blue card behind this screen is painted into the profile_screen drawable,
+// not laid out in code, so nothing here knows where its edges are and the two
+// drifted apart as the grid grew. Measured off a 1920x1080 capture (exactly 2px
+// per dp) on 2026-09-20:
+//
+//     panel        40 .. 504      title 81 .. 108.5     subtitle 112 .. 123.5
+//
+// A card column is 133.6dp tall (106.6 card + 5 padding + 22 name) and THE FOCUS
+// GLOW REACHES 23dp ABOVE IT -- which is the measurement that actually sets this
+// number. The card art at 160 looks a comfortable 36dp clear of the subtitle,
+// but the glow that appears the moment a top-row card takes focus starts at 137,
+// and it was the glow crowding the subtitle at 148 (1.5dp) that read as "too
+// close to the text" on the panel.
+//
+// Now: 13.5dp from the subtitle to the glow, 15.9dp from the row-2 name to the
+// button strip, 8.5dp from the strip's own bloom to the panel edge.
+//
+// The 145dp pitch between the rows is not a free number -- it is the card block
+// plus an 11.4dp breather -- so both rows move together and only the pair's
+// position is tuned.
+val GRID_OFFSET_Y_TOP_ROW: Dp    = 160.dp
+val GRID_OFFSET_Y_BOTTOM_ROW: Dp = 305.dp
+
+/**
+ * Y of the Sign Out / Manage strip.
+ *
+ * IT USED TO HANG OFF THE BOTTOM OF THE PANEL. At 490 the button faces ran from
+ * 496 to 528 while the artwork's card ends at 504, so the strip straddled the
+ * edge and the lower half sat on bare background -- visible in any screenshot,
+ * and the thing this was moved to fix.
+ *
+ * 448 puts the whole control inside: the faces occupy 448..486 and even the
+ * focus bloom, which extends 41dp from +7, stops at 496, leaving 8.5dp to the
+ * panel edge.
+ *
+ * TIED TO THE GRID, SO CHECK BOTH TOGETHER. The row-2 cards now end at 438.6,
+ * so the gap above this strip is 15.9dp and it is the first thing consumed by
+ * moving GRID_OFFSET_Y_BOTTOM_ROW down again. There is about 10dp of headroom
+ * left here before the bloom starts touching the panel edge.
+ */
+val BOTTOM_STRIP_Y: Dp = 448.dp
 
 
 // ── "Signed in as <email>" label ─────────────────────────────────────────────
@@ -158,7 +460,9 @@ val PROFILE_CARD_GLOW_OFFSET_Y: Dp = (-23).dp
 // ── Profile name label config ─────────────────────────────────────────────────
 val PROFILE_NAME_COLOR: Color         = Color(0xFF555566)
 val PROFILE_NAME_FOCUSED_COLOR: Color = Color.White
-const val PROFILE_NAME_FONT_SIZE_SP   = 11f
+// 9sp: taken down 2sp from 11 on request, to sit quieter under the cards now
+// that a seat triangle carries part of the identification the name used to.
+const val PROFILE_NAME_FONT_SIZE_SP   = 9f
 val PROFILE_NAME_PADDING_TOP: Dp      = 5.dp
 val PROFILE_NAME_HEIGHT: Dp           = 22.dp
 
@@ -282,16 +586,88 @@ fun ProfileScreen(
 
     val scope   = rememberCoroutineScope()
     val context = LocalContext.current
+    val density = LocalDensity.current
 
     val profiles        = remember { mutableStateListOf<ProfileResponse>() }
+
+    // Profiles belonging to OTHER accounts on the same subscription licence.
+    // A separate list from `profiles` on purpose: every existing rule here reads
+    // that one as "mine" -- the quota, the create ceiling, the focus targeting
+    // and the sign-out focus fallback are all counted in own profiles and must
+    // not start counting the household's.
+    val peerProfiles        = remember { mutableStateListOf<ProfileResponse>() }
+    val peerFocusRequesters = remember { mutableStateListOf<FocusRequester>() }
+    val gridScroll          = rememberScrollState()
+
+    // The page the grid was last sent to: 0 is this account's own, then the
+    // household's, twelve to a page. The TARGET of the last flip rather than
+    // the scroll position, so the hint below the grid changes as a flip starts
+    // instead of halfway through it.
+    var gridPage by remember { mutableStateOf(0) }
+
+    /**
+     * Turn the grid to [page].
+     *
+     * Every cell calls this as it takes focus, so the page follows the focus:
+     * down from the last row of one page lands on the first row of the next,
+     * and the window turns with it. The pages are exactly the window's height
+     * (GRID_PAGE_HEIGHT), so page N starts at N window-heights and the flip
+     * always comes to rest on a whole page. A flip still running when another
+     * is asked for is cancelled by it, so the last request wins.
+     */
+    fun flipGridTo(page: Int) {
+        val target = page * with(density) { GRID_PAGE_HEIGHT.roundToPx() }
+        if (page == gridPage && (gridScroll.value == target || gridScroll.isScrollInProgress)) return
+        gridPage = page
+        scope.launch {
+            gridScroll.animateScrollTo(
+                target,
+                tween(durationMillis = GRID_PAGE_FLIP_MS, easing = FastOutSlowInEasing),
+            )
+        }
+    }
     var isLoadingGrid   by remember { mutableStateOf(true) }
     var showRetryBanner by remember { mutableStateOf(false) }
+
+    // WHY THE SCREEN ASKS THE SERVER INSTEAD OF COUNTING CARDS. The profile list
+    // is account-wide, so its size says nothing about whether THIS device has
+    // used up its own share — a TV that created three of the account's profiles
+    // is full while the grid still looks half empty. Only the server knows the
+    // per-device figure, and the button has to be gone BEFORE the user picks an
+    // avatar and types a name to find out.
+    //
+    // THE WHOLE RESPONSE, not just can_create: when a press is refused the
+    // message has to name which ceiling was hit and what its number is, and a
+    // boolean can say neither. null means "not answered yet" and is treated as
+    // permission — a timed-out quota lookup should not be able to take profile
+    // creation away, and a real attempt still answers 409.
+    var quota by remember { mutableStateOf<ProfileQuotaResponse?>(null) }
+
+    // Set when a blocked press needs explaining; null the rest of the time.
+    var limitNotice by remember { mutableStateOf<NoticeContent?>(null) }
+
+    // Its own function because the quota has to be re-read after a creation as
+    // well as on load — see creationLauncher. A failure leaves it null, which
+    // creationBlockedBy() reads as "unknown, let them try".
+    suspend fun fetchQuota(): ProfileQuotaResponse? =
+        runCatching { ApiClient.bluehiveApi.getProfileQuota() }
+            .onFailure { Log.w("ProfileScreen", "quota lookup failed: ${it.message}") }
+            .getOrNull()
 
     suspend fun reloadProfiles() {
         isLoadingGrid   = true
         showRetryBanner = false
         try {
-            val fetched = ApiClient.bluehiveApi.listProfiles()
+            // HOUSEHOLD FIRST, OWN-ONLY AS THE FALLBACK. /profiles/household is
+            // newer than some backends this APK will meet, and a 404 there has
+            // to degrade to the picker working as it always did rather than to
+            // an empty screen.
+            val household = runCatching { ApiClient.bluehiveApi.getHousehold() }
+                .onFailure { Log.w("ProfileScreen", "household unavailable: ${it.message}") }
+                .getOrNull()
+            val fetched = household?.own ?: ApiClient.bluehiveApi.listProfiles()
+            peerProfiles.clear()
+            peerProfiles.addAll(household?.others.orEmpty())
             Log.d("ProfileScreen", "✅ Fetched ${fetched.size} profiles: ${fetched.map { it.display_name }}")
 
             // LOCAL-ONLY ordering: the profile last selected ON THIS DEVICE leads
@@ -307,6 +683,10 @@ fun ProfileScreen(
 
             profiles.clear()
             profiles.addAll(ordered)
+
+            // Its own runCatching: a failed quota lookup must not throw away the
+            // grid that was just fetched successfully.
+            quota = fetchQuota()
         } catch (e: Exception) {
             Log.e("ProfileScreen", "❌ Failed to load profiles: ${e.message}")
             // Only surface the retry banner when the device is genuinely offline.
@@ -341,6 +721,14 @@ fun ProfileScreen(
             val newName      = data.getStringExtra(EXTRA_NEW_PROFILE_NAME) ?: ""
             val newAvatarRes = data.getStringExtra(EXTRA_NEW_AVATAR_RES_NAME) ?: ""
             if (newId != -1 && newName.isNotEmpty()) {
+                // THE SEAT COMES WITH IT. The card is patched in from the
+                // creation screen's result rather than fetched, and that result
+                // says nothing about seats -- so a new profile used to arrive
+                // with none, and no triangle until the next reload. Every
+                // profile on an account shares the account's seat, so it is
+                // copied from a sibling; an account's very first profile has
+                // none to copy, and asks the server just below.
+                val accountSeat = profiles.firstNotNullOfOrNull { it.seat }
                 profiles.add(
                     ProfileResponse(
                         id                   = newId,
@@ -352,8 +740,30 @@ fun ProfileScreen(
                         last_login_at        = "",
                         created_at           = "",
                         updated_at           = "",
+                        seat                 = accountSeat,
                     )
                 )
+
+                // RE-READ THE QUOTA, do not just add the card.
+                //
+                // The grid is patched locally here to avoid a round trip, and
+                // for the profile list that is fine. The quota is a different
+                // thing: it was fetched on load and creating a profile is
+                // precisely what invalidates it. Left stale, a user who creates
+                // their first three profiles in one sitting still holds
+                // device_used = 0, so the button stays armed, creationBlockedBy()
+                // returns null, and the fourth attempt is refused only after an
+                // avatar has been picked and a name typed — the exact outcome
+                // the quota endpoint exists to prevent.
+                scope.launch {
+                    quota = fetchQuota()
+                    if (accountSeat == null) {
+                        val seat = runCatching { ApiClient.bluehiveApi.getHousehold() }
+                            .getOrNull()?.own?.firstOrNull { it.id == newId }?.seat
+                        val i = profiles.indexOfFirst { it.id == newId }
+                        if (seat != null && i >= 0) profiles[i] = profiles[i].copy(seat = seat)
+                    }
+                }
             }
         }
     }
@@ -417,6 +827,46 @@ fun ProfileScreen(
     // what guarantees that focus event has already been delivered.
     var navSoundArmed by remember { mutableStateOf(false) }
 
+    // ── Where focus goes when a child screen closes ────────────────────────
+    // Set by the button that leaves, consumed by whichever effect below sees
+    // the screen come back. Compose keeps no focus history — when a focused
+    // node is removed, or an Activity is resumed over the top of one, the focus
+    // is simply gone — so the intent has to be recorded at the press or it
+    // cannot be recovered afterwards.
+    var returnFocusTo by remember { mutableStateOf(ReturnFocus.None) }
+
+    // ── Focus after the sign-out overlay closes ─────────────────────────
+    //
+    // ITS OWN EFFECT BECAUSE DISMISSING AN OVERLAY RELOADS NOTHING. The Manage
+    // path is repaired inside the targeting effect below, which only runs when
+    // isLoadingGrid moves; closing this overlay moves nothing, so that effect
+    // never re-runs and the restore has to hang off the overlay's own flag.
+    //
+    // ConfirmationOverlay pulls focus onto its Cancel button when it mounts
+    // (Overlays.kt) and both dismissal routes — the BackHandler and onCancel —
+    // only flip this Boolean. The focused node then leaves the composition with
+    // nothing focusable above it, so focus is dropped entirely and the next
+    // D-pad press restarts the search from the top of the tree.
+    //
+    // Guarded on returnFocusTo rather than a separate "was open" latch: the
+    // token is only ever SignOut because the user pressed Sign Out, so it
+    // doubles as the record that there is something to restore. On first
+    // composition it is None and this does nothing.
+    LaunchedEffect(showSignOutConfirm) {
+        if (showSignOutConfirm || returnFocusTo != ReturnFocus.SignOut) {
+            return@LaunchedEffect
+        }
+        returnFocusTo = ReturnFocus.None
+        // Silenced across the move: the nav sound means "you moved between
+        // profiles", and focus landing back where it started is not a move.
+        val wasArmed = navSoundArmed
+        navSoundArmed = false
+        kotlinx.coroutines.android.awaitFrame()   // let the overlay finish leaving
+        runCatching { signOutFocusRequester.requestFocus() }
+        kotlinx.coroutines.android.awaitFrame()
+        navSoundArmed = wasArmed
+    }
+
     LaunchedEffect(isLoadingGrid) {
         if (isLoadingGrid) {
             navSoundArmed = false
@@ -432,6 +882,36 @@ fun ProfileScreen(
     LaunchedEffect(isLoadingGrid, profiles.size) {
         if (isLoadingGrid) return@LaunchedEffect
         navSoundArmed = false
+
+        // ── Coming back from a child screen beats the opening focus ────────
+        //
+        // RETURNING FROM MANAGE PROFILES IS NOT A MISSING RESTORE, IT IS A
+        // THEFT, and this is the thief. The launcher reloads unconditionally on
+        // return, which flips isLoadingGrid and re-runs this effect, and the
+        // effect's job on a first launch is to put focus on slot 0 so the OK
+        // button means "continue as me". On a return that same line drags focus
+        // off the Manage button and onto the first card.
+        //
+        // Checked BEFORE the empty-grid branch on purpose: if the reload came
+        // back empty, or failed and raised the retry banner, the user still
+        // pressed Manage and should still land on Manage.
+        val returning = returnFocusTo
+        if (returning != ReturnFocus.None) {
+            returnFocusTo = ReturnFocus.None
+            // One frame so this pass of the composition has placed the buttons;
+            // both are drawn unconditionally, so there is nothing else to wait
+            // for and no risk of requesting focus on a detached node.
+            kotlinx.coroutines.android.awaitFrame()
+            when (returning) {
+                ReturnFocus.Manage  -> runCatching { manageFocusRequester.requestFocus() }
+                ReturnFocus.SignOut -> runCatching { signOutFocusRequester.requestFocus() }
+                ReturnFocus.None    -> Unit
+            }
+            focusParked = false          // release the parking spot
+            kotlinx.coroutines.android.awaitFrame()
+            navSoundArmed = true
+            return@LaunchedEffect
+        }
 
         if (profiles.isEmpty()) {
             createFocusRequester.requestFocus()
@@ -458,29 +938,218 @@ fun ProfileScreen(
 
 
 
-    // Button stays on row 1 until there are 5+ profiles (slots 0-4 = row 1 including button)
-    val createButtonInRow1 = profiles.size <= PROFILE_CARDS_PER_ROW
-    val createCol          = if (createButtonInRow1) profiles.size.coerceAtMost(PROFILE_CARDS_PER_ROW)
-    else profiles.size % PROFILE_CARDS_PER_ROW
-    val createRow          = if (createButtonInRow1) 0 else profiles.size / PROFILE_CARDS_PER_ROW
+    // VISIBILITY IS THE GRID'S BUSINESS, NOT THE QUOTA'S.
+    //
+    // This also required the server's can_create, and so the button simply
+    // vanished once this TV had used its three profiles — no message, no trace,
+    // nothing left to press to find out why. A control that disappears teaches
+    // nothing; it reads as broken. It now stays wherever the grid has a cell to
+    // draw it in, and a press that cannot succeed explains itself.
+    //
+    // At PROFILE_GRID_CAPACITY there is genuinely nowhere to put it: both rows
+    // are full of cards and the button has no cell of its own.
+    // HIDES ON THE ACCOUNT'S OWN CEILING, which is not the same number for
+    // everyone: an owner seat pairs 4 devices at 3 profiles each and so tops out
+    // at 12, a member seat pairs 1 and tops out at 3. The server does that
+    // arithmetic and hands back account_limit; the client must not assume 12.
+    //
+    // Read against profiles.size rather than quota.account_used so the button
+    // goes the instant the last card appears, without waiting for the quota
+    // refetch that follows a creation. The two agree -- the profile list is
+    // account-wide -- but only one of them is already on screen.
+    //
+    // Falls back to the grid's own capacity while the quota is unknown, which
+    // is the behaviour that shipped before the ceiling was per-account.
+    val accountCeiling   = quota?.account_limit ?: PROFILE_GRID_CAPACITY
+    val canCreateProfile = profiles.size < PROFILE_GRID_CAPACITY &&
+                           profiles.size < accountCeiling
 
-    // Total items in the first row = profiles in row 1 + create button position
-    val firstRowProfileCount = profiles.size.coerceAtMost(PROFILE_CARDS_PER_ROW)
-    val createButtonWidth    = 77.25.dp
-
-    // Row 1 width always includes the create button when it's on row 1
-    val totalRowWidth = if (createButtonInRow1) {
-        (firstRowProfileCount * (PROFILE_CARD_SIZE + PROFILE_CARD_GAP)) + 13.dp + createButtonWidth
-    } else {
-        firstRowProfileCount * (PROFILE_CARD_SIZE + PROFILE_CARD_GAP) - PROFILE_CARD_GAP
+    /** Null when creation is possible, otherwise the reason it is not. */
+    fun creationBlockedBy(): NoticeContent? {
+        val q = quota ?: return null                      // unknown — let them try
+        if (q.can_create) return null
+        return if (q.device_used >= q.device_limit)
+                   profileLimitNotice(ProfileLimit.Device,  q.device_limit)
+               else
+                   profileLimitNotice(ProfileLimit.Account, q.account_limit)
     }
 
-    val screenWidth  = 960.dp
-    val dynamicGridX = (screenWidth - totalRowWidth) / 2
+    // ── The grid as rows, for the pages and the D-pad ───────────────────────
+    //
+    // Own cells first -- the profiles, then the create button when there is
+    // one -- then the household's, each run cut into rows of six. The own rows
+    // are page 0; the household's rows follow, two to a page. Row numbers run
+    // straight through both, so "the row below" means the same thing whether
+    // or not it is on the next page.
+    val ownCells      = profiles.size + (if (canCreateProfile) 1 else 0)
+    val ownRowCount   = (ownCells + PROFILE_CARDS_PER_ROW - 1) / PROFILE_CARDS_PER_ROW
+    val peerRowCount  = (peerProfiles.size + PROFILE_CARDS_PER_ROW - 1) / PROFILE_CARDS_PER_ROW
+    val gridRowCount  = ownRowCount + peerRowCount
+    val ownPageCount  = if (ownRowCount > 0) 1 else 0
 
-    val createButtonX = dynamicGridX + (createCol * (PROFILE_CARD_SIZE + PROFILE_CARD_GAP)) + 18.dp
-    val createButtonY = (if (createRow == 0) GRID_OFFSET_Y_TOP_ROW else GRID_OFFSET_Y_BOTTOM_ROW) +
-            (PROFILE_CARD_SIZE / 2) - (77.25.dp / 2)
+    // THE HOUSEHOLD'S FIRST ROW JOINS PAGE 0 WHEN THIS ACCOUNT'S FIT ON ONE ROW.
+    // Page 0 has room for two rows. Leaving the second empty and pushing every
+    // member profile a whole page down made the household look missing when
+    // there was room for it; so it only gets a page of its own once this
+    // account's second row has something in it -- a profile or the create
+    // button.
+    val sharedFirstPage   = ownRowCount == 1 && peerRowCount > 0
+    // The household rows that are paged, and their pages.
+    val firstPagedPeerRow = if (sharedFirstPage) 1 else 0
+    val peerPageCount     = (peerRowCount - firstPagedPeerRow + 1) / 2
+    val shownPage         = gridPage.coerceIn(0, (ownPageCount + peerPageCount - 1).coerceAtLeast(0))
+
+    fun rowSize(row: Int): Int =
+        if (row < ownRowCount) minOf(PROFILE_CARDS_PER_ROW, ownCells - row * PROFILE_CARDS_PER_ROW)
+        else minOf(PROFILE_CARDS_PER_ROW, peerProfiles.size - (row - ownRowCount) * PROFILE_CARDS_PER_ROW)
+
+    fun pageOfRow(row: Int): Int {
+        if (row < ownRowCount) return 0
+        val peerRow = row - ownRowCount
+        return if (peerRow < firstPagedPeerRow) 0
+               else ownPageCount + (peerRow - firstPagedPeerRow) / 2
+    }
+
+    // How many of the household's profiles are on pages 0..[page] -- for the
+    // "more below" count, and for which card Sign Out's left lands on.
+    fun peersThrough(page: Int): Int {
+        val rows = if (page < ownPageCount) firstPagedPeerRow
+                   else firstPagedPeerRow + (page - ownPageCount + 1) * 2
+        return minOf(peerProfiles.size, rows * PROFILE_CARDS_PER_ROW)
+    }
+
+    fun cellRequester(row: Int, col: Int): FocusRequester {
+        if (row < ownRowCount) {
+            val i = row * PROFILE_CARDS_PER_ROW + col
+            return if (i < profiles.size) focusRequesters.getOrNull(i) ?: FocusRequester.Default
+                   else createFocusRequester
+        }
+        val j = (row - ownRowCount) * PROFILE_CARDS_PER_ROW + col
+        return peerFocusRequesters.getOrNull(j) ?: FocusRequester.Default
+    }
+
+    // The same column one row up or down, or that row's last cell when it is
+    // shorter. Off either end of the grid, Default: nothing above the first
+    // row, and the Sign Out strip below the last.
+    fun cellAbove(row: Int, col: Int): FocusRequester =
+        if (row <= 0) FocusRequester.Default
+        else cellRequester(row - 1, minOf(col, rowSize(row - 1) - 1))
+
+    fun cellBelow(row: Int, col: Int): FocusRequester =
+        if (row >= gridRowCount - 1) FocusRequester.Default
+        else cellRequester(row + 1, minOf(col, rowSize(row + 1) - 1))
+
+    // RIGHT OFF THE END OF ANY ROW GOES TO SIGN OUT -- this account's rows, the
+    // household's row that shares page 0, and every row on a household page --
+    // the way the create button, which always ends its row, already did.
+    //
+    // Named rather than left to Compose's geometric search, which looked for
+    // the nearest card to the right and often found one on a page OFF screen
+    // (the own page hidden above the window, dragging the grid back to it) or,
+    // with both sections on one page, diagonally across into the other.
+    fun endOfRow(row: Int, col: Int): Boolean = col == rowSize(row) - 1
+
+    // One row of the household's profiles -- household row [peerRow], which is
+    // grid row ownRowCount + peerRow. Shared by page 0 (when the first one
+    // joins it) and the household's own pages.
+    @Composable
+    fun PeerRow(peerRow: Int) {
+        val row = ownRowCount + peerRow
+        Row(horizontalArrangement = Arrangement.spacedBy(PROFILE_CARD_GAP)) {
+            for (col in 0 until rowSize(row)) {
+                val index = peerRow * PROFILE_CARDS_PER_ROW + col
+                val profile = peerProfiles[index]
+                val avatarResId = remember(profile.avatar_url) {
+                    resolveAvatarDrawable(profile.avatar_url)
+                }
+                val requester = if (index < peerFocusRequesters.size) {
+                    peerFocusRequesters[index]
+                } else {
+                    remember { FocusRequester() }
+                        .also { peerFocusRequesters.add(it) }
+                }
+                Box(modifier = Modifier.width(PROFILE_CARD_SIZE)) {
+                    ProfileCard(
+                        profile        = profile,
+                        avatarResId    = avatarResId,
+                        focusRequester = requester,
+                        seat           = profile.seat,
+                        modifier       = Modifier.focusProperties {
+                            up   = cellAbove(row, col)
+                            down = cellBelow(row, col)
+                            if (endOfRow(row, col)) right = signOutFocusRequester
+                        },
+                        // IDENTICAL TO AN OWN PROFILE, because on this
+                        // subscription it is one. The household shares a
+                        // licence and a bill, so a profile made on any of its
+                        // TVs is watchable from any other. The heading above
+                        // still earns its place: deleting is what stays with
+                        // the owning account.
+                        onPressStart   = { inputLocked = true },
+                        onClick        = {
+                            enteringProfileName = profile.display_name
+                            onProfileSelected(
+                                profile.id, profile.display_name, avatarResId,
+                            )
+                        },
+                        onFocusGained  = {
+                            flipGridTo(pageOfRow(row))
+                            if (navSoundArmed) {
+                                BlueHiveApplication.playProfileSwapSound()
+                            }
+                        },
+                    )
+                }
+            }
+        }
+    }
+
+    // ── Where the grid sits across the screen ───────────────────────────────
+    //
+    // ONE GRID, ONE SET OF COLUMNS, CENTRED AS A WHOLE. Every page shares the
+    // same left edge, so the household's cards stand in the columns this
+    // account's stand in -- Priya directly under the first own card, not
+    // centred on a line of her own -- and the whole grid is centred on the
+    // widest row any page has. On an owner's TV that is usually their own first
+    // row; on a member's TV, usually the owner's page of six, so a member's own
+    // three sit in that grid's first three columns with the owner's below them.
+    //
+    // Tried and dropped, in order: squaring the grid up to the full six-card
+    // width whenever there was a household (four cards pinned left of an empty
+    // panel), then centring each page on its own first row (every column
+    // shifted sideways on each flip, and the pages no longer lined up).
+    //
+    // Only first rows can be the widest: an own second row exists only once the
+    // first is full, and each household page's rows fill in order.
+    //
+    // MEASURED ON WHAT IS DRAWN, not on the cells. The create button is a
+    // CREATE_TILE_SIZE tile set CREATE_TILE_INSET into a card-wide cell, so a
+    // row ending in it ends 11.35dp short of its last cell, and a grid that is
+    // only the button starts 18dp in. The formula this replaces (a 13dp gap
+    // plus the tile) came out 5dp short, leaving every such row 2.5dp right of
+    // centre, and it counted the button even when there was none -- a member
+    // at their three-profile ceiling sat 55dp left of centre.
+    val screenWidth = 960.dp
+    val cardPitch   = PROFILE_CARD_SIZE + PROFILE_CARD_GAP
+
+    // Drawn right edge of a row of [cards] profile cards, measured from the
+    // grid's left edge, with the create tile after them when [thenCreate].
+    fun rowEnd(cards: Int, thenCreate: Boolean): Dp =
+        if (thenCreate) cards * cardPitch + CREATE_TILE_INSET + CREATE_TILE_SIZE
+        else            cards * cardPitch - PROFILE_CARD_GAP
+
+    val gridX: Dp = run {
+        val ownCards  = minOf(profiles.size, PROFILE_CARDS_PER_ROW)
+        val ownCreate = canCreateProfile && profiles.size < PROFILE_CARDS_PER_ROW
+        val ownEnd    = if (ownRowCount > 0) rowEnd(ownCards, ownCreate) else 0.dp
+        val peerEnd   = if (peerProfiles.isEmpty()) 0.dp
+                        else rowEnd(minOf(peerProfiles.size, PROFILE_CARDS_PER_ROW), thenCreate = false)
+        // Drawn from the first card's left edge -- unless the only thing in
+        // the whole grid is the create button, which is inset into its cell.
+        val start     = if (ownCards == 0 && peerProfiles.isEmpty()) CREATE_TILE_INSET else 0.dp
+        val end       = maxOf(ownEnd, peerEnd)
+        (screenWidth - (end - start)) / 2 - start
+    }
 
     // AFTER
     Box(
@@ -551,92 +1220,219 @@ fun ProfileScreen(
             )
         }
 
-        // Profile grid
+        // ── Profile grid ──────────────────────────────────────────────────────
+        //
+        // PAGES IN A FIXED WINDOW. The picker shows the whole subscription,
+        // which can run to four times what a 960x540 panel can hold, so the
+        // rows live in a window exactly one page tall and the grid turns a whole
+        // page at a time: page 0 this account's own, then the household's,
+        // twelve to a page (GRID_PAGE_HEIGHT has the why). An account with no
+        // peers has one page and looks exactly as it did before.
+        //
+        // EAGERLY COMPOSED, NOT LAZY, and that is a focus decision rather than a
+        // performance one. This screen's machinery -- the parking box, the
+        // targeting effect, the return-focus tokens, the sign-out left target --
+        // all hold FocusRequesters and assume the node behind one is attached. A
+        // lazy grid recycles, so a requester for a scrolled-off tile detaches
+        // and those all break. At a ceiling of 15 seats x 3 profiles the whole
+        // household is ~45 small cards, which is nothing to compose at once.
+        //
+        // UP AND DOWN ARE WIRED, NOT SEARCHED (cellAbove / cellBelow). Left to
+        // Compose's geometric search, down from the two right-hand columns of
+        // the last own row went to Sign Out, which is nearer than a household
+        // page sitting below the fold -- so from there the household could not
+        // be reached at all.
         if (!isLoadingGrid) {
             Box(
                 modifier = Modifier
                     .align(Alignment.TopStart)
-                    .offset(x = dynamicGridX, y = GRID_OFFSET_Y_TOP_ROW),
+                    // Lifted by the page header so the first row still sits on
+                    // GRID_OFFSET_Y_TOP_ROW. Every page shares this left edge.
+                    .offset(x = gridX, y = GRID_OFFSET_Y_TOP_ROW - GRID_PAGE_HEADER)
+                    .width(GRID_ROW_WIDTH)
+                    .height(GRID_PAGE_HEIGHT),
             ) {
-                profiles.forEachIndexed { index, profile ->
-                    val row = index / PROFILE_CARDS_PER_ROW
-                    val col = index % PROFILE_CARDS_PER_ROW
+                WithoutFocusScroll {
+                    Column(modifier = Modifier.verticalScroll(gridScroll)) {
 
-                    val cardX = col * (PROFILE_CARD_SIZE + PROFILE_CARD_GAP)
-                    val cardY = if (row == 0) 0.dp
-                    else (GRID_OFFSET_Y_BOTTOM_ROW - GRID_OFFSET_Y_TOP_ROW)
+                        // ── Page 0: this account's own ───────────────────────
+                        //
+                        // No heading. The own section is the default and reads
+                        // as such by coming first and holding the create button;
+                        // the boundary worth labelling is the one where the
+                        // rules change.
+                        if (ownRowCount > 0) GridPage(heading = null) {
+                            for (row in 0 until ownRowCount) {
+                                if (row > 0) Spacer(Modifier.height(PROFILE_ROW_SPACING))
+                                Row(horizontalArrangement = Arrangement.spacedBy(PROFILE_CARD_GAP)) {
+                                    for (col in 0 until rowSize(row)) {
+                                        val index = row * PROFILE_CARDS_PER_ROW + col
+                                        Box(modifier = Modifier.width(PROFILE_CARD_SIZE)) {
+                                            if (index < profiles.size) {
+                                                val profile = profiles[index]
+                                                val avatarResId = remember(profile.avatar_url) {
+                                                    resolveAvatarDrawable(profile.avatar_url)
+                                                }
+                                                val requester = if (index < focusRequesters.size) {
+                                                    focusRequesters[index]
+                                                } else {
+                                                    remember { FocusRequester() }
+                                                        .also { focusRequesters.add(it) }
+                                                }
+                                                ProfileCard(
+                                                    profile        = profile,
+                                                    avatarResId    = avatarResId,
+                                                    focusRequester = requester,
+                                                    seat           = profile.seat,
+                                                    modifier       = Modifier.focusProperties {
+                                                        up   = cellAbove(row, col)
+                                                        down = cellBelow(row, col)
+                                                        if (endOfRow(row, col)) right = signOutFocusRequester
+                                                    },
+                                                    onPressStart   = { inputLocked = true },
+                                                    onClick        = {
+                                                        enteringProfileName = profile.display_name
+                                                        onProfileSelected(
+                                                            profile.id, profile.display_name, avatarResId,
+                                                        )
+                                                    },
+                                                    onFocusGained  = {
+                                                        flipGridTo(pageOfRow(row))
+                                                        if (navSoundArmed) {
+                                                            BlueHiveApplication.playProfileSwapSound()
+                                                        }
+                                                    },
+                                                )
+                                            } else {
+                                                CreateProfileButton(
+                                                    focusRequester = createFocusRequester,
+                                                    onClick        = {
+                                                        val blocked = creationBlockedBy()
+                                                        if (blocked != null) limitNotice = blocked
+                                                        else                 onCreateProfile(creationLauncher)
+                                                    },
+                                                    onFocusGained  = {
+                                                        flipGridTo(pageOfRow(row))
+                                                        if (navSoundArmed) BlueHiveApplication.playNavClickSound()
+                                                    },
+                                                    modifier       = Modifier
+                                                        // UNBOUNDED, SO THE GLOW KEEPS ITS SHAPE.
+                                                        // The glow image is 109.3dp wide and this
+                                                        // cell 106.6, and an image with a
+                                                        // requiredSize that does not fit is
+                                                        // centred on its slot rather than placed
+                                                        // where its offset says -- 1.35dp left,
+                                                        // which left 3.7dp of glow on the tile's
+                                                        // left and 1.2 on its right. Measured
+                                                        // loose, as it was when the button sat
+                                                        // directly on the screen: 2.4 and 2.6.
+                                                        .wrapContentSize(align = Alignment.TopStart, unbounded = true)
+                                                        .offset(x = CREATE_TILE_INSET, y = 14.7.dp)
+                                                        .focusProperties {
+                                                            up    = cellAbove(row, col)
+                                                            down  = cellBelow(row, col)
+                                                            right = signOutFocusRequester
+                                                        },
+                                                    dimensions = ProfileButtonDimensions(
+                                                        imageSize          = CREATE_TILE_SIZE,
+                                                        imageCornerRadius  = 6.dp,
+                                                        plinthWidth        = CREATE_TILE_SIZE,
+                                                        plinthHeight       = 60.dp,
+                                                        plinthOffsetX      = 0.dp,
+                                                        plinthOffsetY      = (-54).dp,
+                                                        plinthCornerRadius = 15f,
+                                                    ),
+                                                    glowConfig = CreateProfileGlowConfig(
+                                                        width                 = 109.3.dp,
+                                                        height                = 90.dp,
+                                                        offsetX               = (-15.8).dp,
+                                                        offsetY               = 8.dp,
+                                                        fadeOutDurationMillis = 200,
+                                                        fadeOutDelayMillis    = 200,
+                                                    ),
+                                                    animConfig = ProfileButtonAnimationConfig(
+                                                        pressOffset           = 5.dp,
+                                                        durationMillis        = 100,
+                                                        bounceBackDelayMillis = 80L,
+                                                    ),
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
 
-                    // Compile-time safe — no reflection, no getIdentifier warning
-                    val avatarResId = remember(profile.avatar_url) {
-                        resolveAvatarDrawable(profile.avatar_url)
+                            // ── The household's first row, in the room left ────
+                            //
+                            // NO HEADING HERE, on request: it sits exactly where an
+                            // own second row would, and the purple seat triangles
+                            // are what set it apart. The heading is kept for pages
+                            // that are the household's alone.
+                            if (sharedFirstPage) {
+                                Spacer(Modifier.height(PROFILE_ROW_SPACING))
+                                PeerRow(peerRow = 0)
+                            }
+                        }
+
+                        // ── The rest of the household's, twelve to a page ─────
+                        for (page in 0 until peerPageCount) {
+                            GridPage(heading = "Others on your subscription") {
+                                for (pageRow in 0 until 2) {
+                                    val peerRow = firstPagedPeerRow + page * 2 + pageRow
+                                    if (peerRow >= peerRowCount) break
+                                    if (pageRow > 0) Spacer(Modifier.height(PROFILE_ROW_SPACING))
+                                    PeerRow(peerRow)
+                                }
+                            }
+                        }
                     }
-
-                    val requester = if (index < focusRequesters.size) {
-                        focusRequesters[index]
-                    } else {
-                        remember { FocusRequester() }.also { focusRequesters.add(it) }
-                    }
-
-                    ProfileCard(
-                        profile        = profile,
-                        avatarResId    = avatarResId,
-                        focusRequester = requester,
-                        modifier       = Modifier.offset(x = cardX, y = cardY),
-                        // Fires on the key press itself, ahead of the animation.
-                        onPressStart   = { inputLocked = true },
-                        onClick        = {
-                            // Raised BEFORE the activity launch, so the loading
-                            // screen is already up when the press animation
-                            // ends rather than 1.4s later.
-                            enteringProfileName = profile.display_name
-                            onProfileSelected(profile.id, profile.display_name, avatarResId)
-                        },
-                        // No edge check is needed: at the leftmost card a Left
-                        // press moves focus nowhere, so no card ever gains it and
-                        // nothing plays. The silence at the ends is the absence
-                        // of an event, not a special case.
-                        onFocusGained  = {
-                            if (navSoundArmed) BlueHiveApplication.playProfileSwapSound()
-                        },
-                    )
                 }
             }
         }
 
-        // ── Create Profile button ─────────────────────────────────────────────
-        if (profiles.size < 8) CreateProfileButton(
-            focusRequester = createFocusRequester,
-            onClick        = { onCreateProfile(creationLauncher) },
-            onFocusGained  = { if (navSoundArmed) BlueHiveApplication.playNavClickSound() },
-            modifier       = Modifier
+        // ── "More below" hint ─────────────────────────────────────────────────
+        //
+        // THE WINDOW HOLDS ONE PAGE, SO THE NEXT ONE IS INVISIBLE UNTIL YOU GO
+        // TO IT. With twelve profiles of your own the household's page sits
+        // entirely below the fold and nothing on screen said it existed. This
+        // says it: bottom-left, on the Sign Out strip's baseline, counting the
+        // profiles on the pages below the one showing. It goes once there is
+        // nothing further down.
+        //
+        // A LABEL, NOT A CONTROL. Down from the last row turns the page, which
+        // is the way down this screen already has; a focusable hint would only
+        // add a stop between the grid and the buttons.
+        //
+        // Left-aligned with the grid above it.
+        //
+        // A Crossfade rather than a visibility toggle so the outgoing count is
+        // the one that fades: the hint leaving on "3 more" must not flash
+        // "0 more" on its way out.
+        val profilesBelow =
+            if (isLoadingGrid) 0
+            else (peerProfiles.size - peersThrough(shownPage)).coerceAtLeast(0)
+        Crossfade(
+            targetState   = profilesBelow,
+            animationSpec = tween(durationMillis = 200),
+            label         = "gridMoreHint",
+            modifier      = Modifier
                 .align(Alignment.TopStart)
-                // Sign Out now sits between Create and Manage, so right-from-Create
-                // lands there first rather than skipping it.
-                .offset(x = createButtonX, y = createButtonY)
-                .focusProperties { right = signOutFocusRequester },
-            dimensions = ProfileButtonDimensions(
-                imageSize          = 77.25.dp,
-                imageCornerRadius  = 6.dp,
-                plinthWidth        = 77.25.dp,
-                plinthHeight       = 60.dp,
-                plinthOffsetX      = 0.dp,
-                plinthOffsetY      = (-54).dp,
-                plinthCornerRadius = 15f,
-            ),
-            glowConfig = CreateProfileGlowConfig(
-                width                 = 109.3.dp,
-                height                = 90.dp,
-                offsetX               = (-15.8).dp,
-                offsetY               = 8.dp,
-                fadeOutDurationMillis = 200,
-                fadeOutDelayMillis    = 200,
-            ),
-            animConfig = ProfileButtonAnimationConfig(
-                pressOffset           = 5.dp,
-                durationMillis        = 100,
-                bounceBackDelayMillis = 80L,
-            ),
-        )
+                .offset(x = gridX, y = GRID_MORE_HINT_Y),
+        ) { count ->
+            if (count > 0) GridMoreHint(count)
+        }
+
+
+        // Same overlay, and the same words the creation screen would have
+        // used had the press been let through to fail over there instead.
+        limitNotice?.let { notice ->
+            NoticeOverlay(notice) {
+                limitNotice = null
+                // Focus is handed back deliberately: the overlay took it from
+                // the button, and nothing else claims it on dismissal.
+                runCatching { createFocusRequester.requestFocus() }
+            }
+        }
 
         // ── Sign Out button ───────────────────────────────────────────────────
         // Sits immediately left of Manage Profiles on the same row: x 678..780,
@@ -654,15 +1450,36 @@ fun ProfileScreen(
             fontFamily     = AppTypography.interBold,
             focusRequester = signOutFocusRequester,
             onFocusGained  = { if (navSoundArmed) BlueHiveApplication.playNavClickSound() },
-            onClick        = { showSignOutConfirm = true },
+            onClick        = {
+                returnFocusTo      = ReturnFocus.SignOut
+                showSignOutConfirm = true
+            },
             modifier       = Modifier
                 .align(Alignment.TopStart)
-                .offset(x = 678.dp, y = 445.dp)
+                .offset(x = 678.dp, y = BOTTOM_STRIP_Y)
                 .focusProperties {
                     // Inherits the left-target Manage used to own; Manage now
                     // points here instead.
-                    left  = if (profiles.size < 8) createFocusRequester
-                            else focusRequesters.getOrNull(7) ?: FocusRequester.Cancel
+                    // Falls back to the LAST card rather than a fixed index 7:
+                    // the button now hides for two different reasons, and at a
+                    // device quota the grid can be far shorter than full.
+                    //
+                    // WHEN THE PAGE SHOWING HAS HOUSEHOLD CARDS, ITS LAST ONE:
+                    // they are its bottom row, the one level with this strip.
+                    // On a household page the create button and the own cards
+                    // are a page away, and focusing one would turn the grid
+                    // back underneath you.
+                    left  = run {
+                        val through = peersThrough(shownPage)
+                        val before  = if (shownPage == 0) 0 else peersThrough(shownPage - 1)
+                        when {
+                            through > before -> peerFocusRequesters.getOrNull(through - 1)
+                                                ?: FocusRequester.Cancel
+                            canCreateProfile -> createFocusRequester
+                            else -> focusRequesters.getOrNull(profiles.size - 1)
+                                    ?: FocusRequester.Cancel
+                        }
+                    }
                     right = manageFocusRequester
                 },
             dimensions = ModularButtonDimensions(
@@ -717,10 +1534,13 @@ fun ProfileScreen(
             fontFamily     = com.example.bluehive.utilities.AppTypography.interBold,
             focusRequester = manageFocusRequester,
             onFocusGained  = { if (navSoundArmed) BlueHiveApplication.playNavClickSound() },
-            onClick        = { onManageProfiles(manageLauncher) },
+            onClick        = {
+                returnFocusTo = ReturnFocus.Manage
+                onManageProfiles(manageLauncher)
+            },
             modifier       = Modifier
                 .align(Alignment.TopStart)
-                .offset(x = 790.dp, y = 445.dp)
+                .offset(x = 790.dp, y = BOTTOM_STRIP_Y)
                 .focusProperties { left = signOutFocusRequester },
             dimensions = ModularButtonDimensions(
                 mainWidth          = 102.dp,
@@ -880,6 +1700,108 @@ private fun performSignOut(activity: Activity) {
 //  ProfileCard
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * A section heading inside the scrolling grid.
+ *
+ * Quiet on purpose. It is a signpost for the delete rule -- what is above it
+ * you own, what is below you may only rename -- not a piece of chrome that
+ * should compete with the twelve faces underneath it.
+ */
+@Composable
+private fun GridSectionHeading(text: String) {
+    Text(
+        text       = text,
+        color      = GRID_SECTION_LABEL_COLOR,
+        fontFamily = AppTypography.interBold,
+        fontSize   = 9.sp,
+        maxLines   = 1,
+        overflow   = TextOverflow.Ellipsis,
+        // Held off the cards below by what a focused card's glow actually
+        // reaches -- measured, not the glow image's full 23dp. See
+        // GRID_HEADING_CLEARANCE.
+        modifier   = Modifier.padding(bottom = GRID_HEADING_CLEARANCE),
+    )
+}
+
+/**
+ * One page of the profile grid: exactly GRID_PAGE_HEIGHT tall whatever it
+ * holds, so page N always starts at N page-heights and a flip lands on it
+ * exactly -- a page with one row keeps the second row's space empty rather
+ * than letting the next page ride up into it.
+ *
+ * The band across the top is the first row's glow headroom and, on a
+ * household page, the section heading, which sits at the band's bottom.
+ */
+@Composable
+private fun GridPage(heading: String?, rows: @Composable ColumnScope.() -> Unit) {
+    Column(modifier = Modifier.height(GRID_PAGE_HEIGHT)) {
+        Box(
+            contentAlignment = Alignment.BottomStart,
+            modifier         = Modifier
+                .height(GRID_PAGE_HEADER)
+                .fillMaxWidth(),
+        ) {
+            if (heading != null) GridSectionHeading(heading)
+        }
+        rows()
+    }
+}
+
+/**
+ * "▾ 3 more on your subscription" -- see the hint at its call site.
+ *
+ * The chevron is drawn rather than typed: a ▾ glyph would come from whatever
+ * fallback font the TV has instead of Inter, at that font's size and on that
+ * font's baseline.
+ */
+@Composable
+private fun GridMoreHint(count: Int) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        androidx.compose.foundation.Canvas(
+            modifier = Modifier.size(width = 7.dp, height = 4.5.dp),
+        ) {
+            drawPath(
+                path = androidx.compose.ui.graphics.Path().apply {
+                    moveTo(0f, 0f)
+                    lineTo(size.width, 0f)
+                    lineTo(size.width / 2f, size.height)
+                    close()
+                },
+                color = GRID_SECTION_LABEL_COLOR,
+            )
+        }
+        Spacer(Modifier.width(6.dp))
+        Text(
+            text       = "$count more on your subscription",
+            color      = GRID_SECTION_LABEL_COLOR,
+            fontFamily = AppTypography.interBold,
+            fontSize   = 9.sp,
+            maxLines   = 1,
+        )
+    }
+}
+
+/**
+ * Tells the profile grid's scroll container NOT to move when something in it
+ * takes focus, because the grid moves itself: flipGridTo() turns a whole page.
+ *
+ * Every scroll container answers "bring this into view" when a child takes
+ * focus, and on a TV Compose's answer is to pivot that child to 30% of the
+ * container (PivotBringIntoViewSpec) -- the half-rows this replaces. Answering
+ * zero turns that off for this one container and nothing else on the screen.
+ */
+@OptIn(ExperimentalFoundationApi::class)
+private val NoGridFocusScroll = object : BringIntoViewSpec {
+    override fun calculateScrollDistance(offset: Float, size: Float, containerSize: Float): Float = 0f
+}
+
+// Internal: Manage Profiles pages its grid the same way.
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+internal fun WithoutFocusScroll(content: @Composable () -> Unit) {
+    CompositionLocalProvider(LocalBringIntoViewSpec provides NoGridFocusScroll, content = content)
+}
+
 @Composable
 fun ProfileCard(
     profile:        ProfileResponse,
@@ -893,6 +1815,11 @@ fun ProfileCard(
     // Fired on the key press, BEFORE the animation starts — as opposed to
     // onClick, which fires when it finishes. The caller locks input here.
     onPressStart:   () -> Unit = {},
+    // Seat of the profile's account ("owner" / "member"), or null for no
+    // triangle. The caller decides WHETHER to show one -- it knows whether there
+    // is a household to tell apart -- and the card decides the colour, because
+    // that depends on focus and only the card knows its focus state.
+    seat:           String? = null,
 ) {
     var isFocused by remember { mutableStateOf(false) }
 
@@ -1018,7 +1945,7 @@ fun ProfileCard(
                     }
                     .then(
                         if (!isFocused) Modifier.border(
-                            width = 1.5.dp,
+                            width = PROFILE_CARD_EDGE_WIDTH,
                             color = Color(0xB9555566),
                             shape = RoundedCornerShape(PROFILE_CARD_CORNER),
                         ) else Modifier
@@ -1058,6 +1985,16 @@ fun ProfileCard(
                     modifier = Modifier
                         .matchParentSize()
                         .background(Color(0xFF000000).copy(alpha = tintAlpha))
+                )
+
+                // Seat triangle, top-left. After the tint so it is not dimmed with
+                // the avatar, and inside the clipped box so it follows the card's
+                // rounded corner -- both exactly as the watched fold does.
+                SeatTriangle(
+                    seat     = seat,
+                    focused  = isFocused,
+                    side     = PROFILE_SEAT_TRIANGLE_SIZE,
+                    modifier = Modifier.align(Alignment.TopStart),
                 )
             }
         }

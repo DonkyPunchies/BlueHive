@@ -2237,221 +2237,20 @@ fun TVShowsDetailsScreenContent(
         // ========================================================================================================================================= >
 
 
-        // ========================================================================================================================================= > logo parsing - it's already a full URL
-        val fullLogoUrl = remember(logoUrl) {
-            when {
-                logoUrl.isNullOrBlank() -> {
-                    Log.d("LogoDebug", "❌ Logo URL is null or blank")
-                    null
-                }
-                logoUrl == "N/A" -> {
-                    Log.d("LogoDebug", "❌ Logo URL is N/A")
-                    null
-                }
-                else -> {
-                    Log.d("LogoDebug", "✅ Logo URL: $logoUrl")
-                    logoUrl // It's already a complete URL!
-                }
-            }
-        }
-
-        if (fullLogoUrl != null) {
-            Log.d("LogoDebug", "🖼️ Rendering logo: $fullLogoUrl")
-            AsyncImage(
-                model = fullLogoUrl,
-                contentDescription = "Logo",
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .padding(top = 25.dp, start = 40.dp)
-                    .size(width = 180.dp, height = 100.dp),
-                contentScale = ContentScale.Fit,
-                onLoading = {
-                    Log.d("LogoDebug", "⏳ Logo loading...")
-                },
-                onSuccess = {
-                    Log.d("LogoDebug", "✅ Logo loaded successfully!")
-                },
-                onError = { error ->
-                    Log.e("LogoDebug", "❌ Logo failed to load: ${error.result.throwable.message}")
-                }
-            )
-        } else {
-            Log.d("LogoDebug", "❌ No logo to display — rendering title instead")
-            val titleFontSize = remember(mediaTitle) {
-                when {
-                    mediaTitle.length <= 20 -> 41.sp
-                    mediaTitle.length <= 23 -> 35.sp
-                    mediaTitle.length <= 33 -> 32.sp
-                    mediaTitle.length <= 40 -> 30.sp
-                    else -> 25.sp
-                }
-            }
-            val wrappedTitle = remember(mediaTitle) {
-                val words = mediaTitle.split(" ")
-                val lines = mutableListOf<String>()
-                var currentLine = ""
-                for (word in words) {
-                    val candidate = if (currentLine.isEmpty()) word else "$currentLine $word"
-                    if (candidate.length <= 10) {
-                        currentLine = candidate
-                    } else {
-                        if (currentLine.isNotEmpty()) lines.add(currentLine)
-                        currentLine = word
-                    }
-                }
-                if (currentLine.isNotEmpty()) lines.add(currentLine)
-                lines.joinToString("\n")
-            }
-
-            val lineCount = remember(wrappedTitle) { wrappedTitle.count { it == '\n' } + 1 }
-            val titleTopPadding = remember(lineCount) {
-                when (lineCount) {
-                    1 -> 40.dp
-                    2 -> 25.dp
-                    else -> 8.dp
-                }
-            }
-
-            Text(
-                text = wrappedTitle,
-                color = Color.White.copy(alpha = 0.88f),
-                fontSize = titleFontSize,
-                lineHeight = titleFontSize * 0.87f,
-                fontFamily = AppTypography.lalezarRegular,
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .padding(top = titleTopPadding, start = 30.dp)
-                    .width(200.dp),
-                textAlign = TextAlign.Center,
-                maxLines = 6,
-                overflow = TextOverflow.Clip
-            )
-        }
-        // ========================================================================================================================================= >
-
-
-
-        // ========================================================================================================================================= > // Revenue
-        Text(
-            text = seasonsLabel,
-            color = Color(0xFF8B8B8B),
-            fontSize = 17.sp,
-            fontFamily = dongleRegular,
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .padding(start = 258.25.dp, top = 34.dp)
+        // Logo (or the wrapped title when there is no logo), the four metadata
+        // labels, genres and the overview. Lives in TvDetailsInfoBlock -- see
+        // there for why it was moved out of this function.
+        TvDetailsInfoBlock(
+            logoUrl          = logoUrl,
+            mediaTitle       = mediaTitle,
+            seasonsLabel     = seasonsLabel,
+            statusLabel      = statusLabel,
+            releaseDateLabel = releaseDateLabel,
+            languageLabel    = languageLabel,
+            genres           = genres,
+            overview         = overview,
+            dongleRegular    = dongleRegular,
         )
-        // ========================================================================================================================================= >
-
-
-        // ========================================================================================================================================= > // Budget
-        Text(
-            text = statusLabel,
-            color = Color(0xFF8B8B8B),
-            fontSize = 17.sp,
-            fontFamily = dongleRegular,
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .padding(start = 258.25.dp, top = 48.dp)
-        )
-        // ========================================================================================================================================= >
-
-
-        // ========================================================================================================================================= > // release_date
-        Text(
-            text = releaseDateLabel,
-            color = Color(0xFF8B8B8B),
-            fontSize = 16.sp,
-            fontFamily = dongleRegular,
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .padding(start = 258.25.dp, top = 63.dp)
-        )
-
-        // ========================================================================================================================================= >
-
-
-        // ========================================================================================================================================= > // original language
-        Text(
-            text = languageLabel,
-            color = Color(0xFF8B8B8B),
-            fontSize = 17.sp,
-            fontFamily = dongleRegular,
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .padding(start = 258.25.dp, top = 75.dp)
-        )
-        // ========================================================================================================================================= >
-
-
-        // ========================================================================================================================================= > // Genres
-        if (!genres.isNullOrBlank() && genres != "N/A") {
-            Text(
-                text = genres,
-                color = Color(0xFF8B8B8B),
-                fontSize = 16.sp,
-                fontFamily = dongleRegular,
-                lineHeight = 12.sp,
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .padding(start = 258.25.dp, top = 96.dp)
-                    .width(160.dp)  // Add width constraint so it wraps nicely
-            )
-        }else {
-            Log.d("GenresDebug", "❌ Not rendering genres - value: '$genres'")
-        }
-        // ========================================================================================================================================= >
-
-
-
-        // ========================================================================================================================================= > Overview text display with dynamic font sizing
-        if (!overview.isNullOrBlank()) {
-            var fontSize by remember { mutableStateOf(18.sp) }
-            var lineHeight by remember { mutableStateOf(14.sp) }
-
-            // Measure text to determine if we need smaller font
-            val textMeasurer = rememberTextMeasurer()
-
-            LaunchedEffect(overview) {
-                val textLayoutResult = textMeasurer.measure(
-                    text = androidx.compose.ui.text.AnnotatedString(overview),
-                    style = androidx.compose.ui.text.TextStyle(
-                        fontSize = 18.sp,
-                        fontFamily = dongleRegular,
-                        lineHeight = 14.sp  // Include line height in measurement
-                    ),
-                    constraints = androidx.compose.ui.unit.Constraints(
-                        maxWidth = (400 * 2.75).toInt(), // dp to px approximation
-                        maxHeight = (105.75 * 2.75).toInt() // Add height constraint!
-                    )
-                )
-
-                // Check if text overflows OR doesn't fit in the height
-                if (textLayoutResult.lineCount > 5 || textLayoutResult.didOverflowHeight) {
-                    fontSize = 16.sp
-                    lineHeight = 13.7.sp
-                } else {
-                    lineHeight = 14.sp
-                }
-            }
-
-            Text(
-                text = overview,
-                color = Color(0xFF8B8B8B),
-                fontSize = fontSize,
-                fontFamily = dongleRegular,
-                lineHeight = lineHeight,
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .padding(start = 28.25.dp, top = 175.dp)
-                    //.background(Color.Red.copy(alpha = 0.5f))  // Debug background
-                    .height(108.25.dp)
-                    .width(400.dp),
-                overflow = TextOverflow.Ellipsis
-            )
-        }
-        // ========================================================================================================================================= >
-
 
 
         // Favorite Button - Uses internal offset for positioning
@@ -3635,6 +3434,258 @@ fun TVShowsDetailsScreenContent(
         }
 
     }
+}
+
+
+/**
+ * The title block of the TV details screen: the logo -- or, when a show has
+ * none, its title wrapped to fit the same space -- then the seasons, status,
+ * release-date and language labels, the genres, and the overview.
+ *
+ * THE FIRST PIECE CUT OUT OF TVShowsDetailsScreenContent, and why that matters.
+ * That function was a single 2,832-line composable, and on 2026-09-21 R8 turned
+ * it into bytecode ART refused to load ("Verifier rejected class ... type
+ * Conflict unexpected as arg to if-eqz"), so opening any show killed the app.
+ * A -keep rule in proguard-rules.pro guards against that today; splitting the
+ * function is the cure, because what R8 got wrong was allocating registers
+ * across one enormous method. Every block moved out shrinks that method.
+ *
+ * WHY THIS BLOCK FIRST: it is display-only. It reads nine values, writes nothing
+ * outside itself, and owns no focus requesters -- so it could move without
+ * touching any of the D-pad wiring that runs through the rest of the screen.
+ * Every line below is exactly as it was, only re-indented.
+ *
+ * A BoxScope EXTENSION because each element positions itself with
+ * Modifier.align() against the screen's main Box. Called from inside that Box,
+ * its children are emitted straight into it, so every position is unchanged --
+ * a plain composable would wrap them in a layout of its own and move them.
+ */
+@Composable
+private fun BoxScope.TvDetailsInfoBlock(
+    logoUrl:          String?,
+    mediaTitle:       String,
+    seasonsLabel:     String,
+    statusLabel:      String,
+    releaseDateLabel: String,
+    languageLabel:    String,
+    genres:           String?,
+    overview:         String?,
+    dongleRegular:    FontFamily,
+) {
+    // ========================================================================================================================================= > logo parsing - it's already a full URL
+    val fullLogoUrl = remember(logoUrl) {
+        when {
+            logoUrl.isNullOrBlank() -> {
+                Log.d("LogoDebug", "❌ Logo URL is null or blank")
+                null
+            }
+            logoUrl == "N/A" -> {
+                Log.d("LogoDebug", "❌ Logo URL is N/A")
+                null
+            }
+            else -> {
+                Log.d("LogoDebug", "✅ Logo URL: $logoUrl")
+                logoUrl // It's already a complete URL!
+            }
+        }
+    }
+
+    if (fullLogoUrl != null) {
+        Log.d("LogoDebug", "🖼️ Rendering logo: $fullLogoUrl")
+        AsyncImage(
+            model = fullLogoUrl,
+            contentDescription = "Logo",
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(top = 25.dp, start = 40.dp)
+                .size(width = 180.dp, height = 100.dp),
+            contentScale = ContentScale.Fit,
+            onLoading = {
+                Log.d("LogoDebug", "⏳ Logo loading...")
+            },
+            onSuccess = {
+                Log.d("LogoDebug", "✅ Logo loaded successfully!")
+            },
+            onError = { error ->
+                Log.e("LogoDebug", "❌ Logo failed to load: ${error.result.throwable.message}")
+            }
+        )
+    } else {
+        Log.d("LogoDebug", "❌ No logo to display — rendering title instead")
+        val titleFontSize = remember(mediaTitle) {
+            when {
+                mediaTitle.length <= 20 -> 41.sp
+                mediaTitle.length <= 23 -> 35.sp
+                mediaTitle.length <= 33 -> 32.sp
+                mediaTitle.length <= 40 -> 30.sp
+                else -> 25.sp
+            }
+        }
+        val wrappedTitle = remember(mediaTitle) {
+            val words = mediaTitle.split(" ")
+            val lines = mutableListOf<String>()
+            var currentLine = ""
+            for (word in words) {
+                val candidate = if (currentLine.isEmpty()) word else "$currentLine $word"
+                if (candidate.length <= 10) {
+                    currentLine = candidate
+                } else {
+                    if (currentLine.isNotEmpty()) lines.add(currentLine)
+                    currentLine = word
+                }
+            }
+            if (currentLine.isNotEmpty()) lines.add(currentLine)
+            lines.joinToString("\n")
+        }
+
+        val lineCount = remember(wrappedTitle) { wrappedTitle.count { it == '\n' } + 1 }
+        val titleTopPadding = remember(lineCount) {
+            when (lineCount) {
+                1 -> 40.dp
+                2 -> 25.dp
+                else -> 8.dp
+            }
+        }
+
+        Text(
+            text = wrappedTitle,
+            color = Color.White.copy(alpha = 0.88f),
+            fontSize = titleFontSize,
+            lineHeight = titleFontSize * 0.87f,
+            fontFamily = AppTypography.lalezarRegular,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(top = titleTopPadding, start = 30.dp)
+                .width(200.dp),
+            textAlign = TextAlign.Center,
+            maxLines = 6,
+            overflow = TextOverflow.Clip
+        )
+    }
+    // ========================================================================================================================================= >
+
+
+
+    // ========================================================================================================================================= > // Revenue
+    Text(
+        text = seasonsLabel,
+        color = Color(0xFF8B8B8B),
+        fontSize = 17.sp,
+        fontFamily = dongleRegular,
+        modifier = Modifier
+            .align(Alignment.TopStart)
+            .padding(start = 258.25.dp, top = 34.dp)
+    )
+    // ========================================================================================================================================= >
+
+
+    // ========================================================================================================================================= > // Budget
+    Text(
+        text = statusLabel,
+        color = Color(0xFF8B8B8B),
+        fontSize = 17.sp,
+        fontFamily = dongleRegular,
+        modifier = Modifier
+            .align(Alignment.TopStart)
+            .padding(start = 258.25.dp, top = 48.dp)
+    )
+    // ========================================================================================================================================= >
+
+
+    // ========================================================================================================================================= > // release_date
+    Text(
+        text = releaseDateLabel,
+        color = Color(0xFF8B8B8B),
+        fontSize = 16.sp,
+        fontFamily = dongleRegular,
+        modifier = Modifier
+            .align(Alignment.TopStart)
+            .padding(start = 258.25.dp, top = 63.dp)
+    )
+
+    // ========================================================================================================================================= >
+
+
+    // ========================================================================================================================================= > // original language
+    Text(
+        text = languageLabel,
+        color = Color(0xFF8B8B8B),
+        fontSize = 17.sp,
+        fontFamily = dongleRegular,
+        modifier = Modifier
+            .align(Alignment.TopStart)
+            .padding(start = 258.25.dp, top = 75.dp)
+    )
+    // ========================================================================================================================================= >
+
+
+    // ========================================================================================================================================= > // Genres
+    if (!genres.isNullOrBlank() && genres != "N/A") {
+        Text(
+            text = genres,
+            color = Color(0xFF8B8B8B),
+            fontSize = 16.sp,
+            fontFamily = dongleRegular,
+            lineHeight = 12.sp,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(start = 258.25.dp, top = 96.dp)
+                .width(160.dp)  // Add width constraint so it wraps nicely
+        )
+    }else {
+        Log.d("GenresDebug", "❌ Not rendering genres - value: '$genres'")
+    }
+    // ========================================================================================================================================= >
+
+
+
+    // ========================================================================================================================================= > Overview text display with dynamic font sizing
+    if (!overview.isNullOrBlank()) {
+        var fontSize by remember { mutableStateOf(18.sp) }
+        var lineHeight by remember { mutableStateOf(14.sp) }
+
+        // Measure text to determine if we need smaller font
+        val textMeasurer = rememberTextMeasurer()
+
+        LaunchedEffect(overview) {
+            val textLayoutResult = textMeasurer.measure(
+                text = androidx.compose.ui.text.AnnotatedString(overview),
+                style = androidx.compose.ui.text.TextStyle(
+                    fontSize = 18.sp,
+                    fontFamily = dongleRegular,
+                    lineHeight = 14.sp  // Include line height in measurement
+                ),
+                constraints = androidx.compose.ui.unit.Constraints(
+                    maxWidth = (400 * 2.75).toInt(), // dp to px approximation
+                    maxHeight = (105.75 * 2.75).toInt() // Add height constraint!
+                )
+            )
+
+            // Check if text overflows OR doesn't fit in the height
+            if (textLayoutResult.lineCount > 5 || textLayoutResult.didOverflowHeight) {
+                fontSize = 16.sp
+                lineHeight = 13.7.sp
+            } else {
+                lineHeight = 14.sp
+            }
+        }
+
+        Text(
+            text = overview,
+            color = Color(0xFF8B8B8B),
+            fontSize = fontSize,
+            fontFamily = dongleRegular,
+            lineHeight = lineHeight,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(start = 28.25.dp, top = 175.dp)
+                //.background(Color.Red.copy(alpha = 0.5f))  // Debug background
+                .height(108.25.dp)
+                .width(400.dp),
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+    // ========================================================================================================================================= >
 }
 
 

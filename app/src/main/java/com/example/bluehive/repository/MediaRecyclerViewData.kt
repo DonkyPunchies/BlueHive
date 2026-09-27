@@ -114,7 +114,15 @@ class MediaRecyclerViewData {
                 listType = listType,
                 limit = pageSize,
                 offset = offset,
-                sortBy = if (listType == "top_rated") "vote_average" else "popularity",
+                // "rating", NOT "vote_average". The backend's sort map never had a
+                // "vote_average" key, so this silently fell through to its default
+                // and the Top Rated shelf was ordered by POPULARITY. It looked
+                // right - the titles were good films - which is why it survived.
+                //
+                // The backend now accepts both, so shipping this is not urgent for
+                // correctness; it is here so the wire value matches the documented
+                // one and the alias can eventually be retired.
+                sortBy = if (listType == "top_rated") "rating" else "popularity",
                 watchProvider = watchProvider?.toIntOrNull()
             )
             Log.d(

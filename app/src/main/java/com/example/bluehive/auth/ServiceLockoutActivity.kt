@@ -7,7 +7,6 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
-import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,7 +27,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
@@ -329,9 +327,24 @@ private fun RetryButton(
         isToggleable = false,
         fontFamily = FontFamily.Monospace,
         focusRequester = focusRequester,
-        modifier = Modifier
-            .focusable()
-            .focusRequester(focusRequester),
+        // NO .focusable() HERE, AND NO SECOND .focusRequester().
+        //
+        // BACK USED TO TAKE TWO PRESSES on this screen: one to drop the glow,
+        // another to leave the app. This was why. ModularButton is already a
+        // focus target of its own — it applies this same focusRequester and a
+        // clickable internally — and the caller's modifier is applied to its
+        // OUTER Box, so .focusable() wrapped the button in a SECOND focus
+        // target. D-pad landed on the inner one; BACK moved focus out to the
+        // outer one and was consumed doing it, which is the press that only
+        // removed the glow. The dispatcher callback in onCreate never saw it.
+        //
+        // Binding one FocusRequester to two nodes was wrong on its own terms as
+        // well, and .focusRequester() after .focusable() is the wrong order to
+        // bind anything: the requester attaches to the focus target that FOLLOWS
+        // it in the chain, and nothing followed it.
+        //
+        // No other ModularButton in this app passes a focusable modifier. This
+        // screen was the only one, and the only one needing two presses.
         dimensions = ModularButtonDimensions(
             mainWidth = BTN_W,
             mainHeight = 24.dp,

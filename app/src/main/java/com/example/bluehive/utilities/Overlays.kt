@@ -59,6 +59,8 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.ExperimentalComposeUiApi
+import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.graphics.Color
@@ -68,6 +70,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.bluehive.R
 import kotlinx.coroutines.android.awaitFrame
+import kotlinx.coroutines.delay
+import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -76,12 +80,14 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import com.example.bluehive.BlueHiveApplication
 import androidx.compose.ui.graphics.Brush
@@ -1475,3 +1481,269 @@ fun UpdateRequiredOverlay(
         }
     }
 }
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. Notice overlay
+//    The app-wide "this went wrong, here is why, press OK" dialog.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Which kind of notice is on screen. Only the accents move — card, typography,
+ * button and spacing are shared, so an error and a plain confirmation of fact
+ * read as the same family seen twice rather than two different dialogs.
+ */
+enum class NoticeTone { Error, Info }
+
+/**
+ * One notice, as a value a screen can hold in state and hand to [NoticeOverlay].
+ *
+ * WHY A TYPE AND NOT THREE PARAMETERS. The message usually has to be composed
+ * somewhere other than where it is drawn — from an error body, from a quota
+ * response, from a failed precondition two functions up. Passing it as one value
+ * keeps that composition at the point that has the facts, lets two screens share
+ * the same wording, and makes `null` the natural way to say "nothing to show".
+ */
+data class NoticeContent(
+    val title:   String,
+    val message: String?    = null,
+    val tone:    NoticeTone = NoticeTone.Error,
+)
+
+/**
+ * Card fill for a notice.
+ *
+ * DELIBERATELY NOT [overlayCardBackgroundColor]. A notice interrupts — it
+ * appears because something the user just tried did not happen — while the
+ * confirmation dialogs are something they asked for. Two shades apart is enough
+ * for the eye to register "different kind of thing" before a word is read, and
+ * close enough that it is plainly the same app.
+ */
+fun noticeCardBackgroundColor(): Color = Color(0xFF191920)
+
+/** Border, tinted by tone. The standard card uses a flat 0xFF3A3737. */
+fun noticeCardBorderColor(tone: NoticeTone): Color = when (tone) {
+    NoticeTone.Error -> Color(0xFF5E3435)
+    NoticeTone.Info  -> Color(0xFF34405E)
+}
+
+/** Title colour and the short rule under it. */
+fun noticeAccentColor(tone: NoticeTone): Color = when (tone) {
+    NoticeTone.Error -> Color(0xFFFF5A52)
+    NoticeTone.Info  -> Color(0xFF7FA6FF)
+}
+
+/** Body copy. Same grey as the update card's body — one voice for prose. */
+fun noticeBodyTextColor(): Color = Color(0xFFB8B8C0)
+
+/**
+ * Wider than [OVERLAY_CARD_WIDTH]'s 360.
+ *
+ * A confirmation asks one short question; a notice often has to explain a rule,
+ * and at 360dp that explanation stacks into five or six cramped lines. 430 of
+ * the 960dp design space holds about nine words a line at 11sp and still leaves
+ * a wide margin on either side of a television.
+ */
+val NOTICE_CARD_WIDTH = 430.dp
+
+
+/**
+ * NoticeOverlay
+ *
+ * One dismissible message, used anywhere in the app. Title, optional body, and
+ * a single button the user presses to say they have read it.
+ *
+ * NOTHING HERE DISAPPEARS ON A TIMER, on purpose. The overlays this replaces
+ * faded after four seconds, which sets up a race between reading and
+ * comprehending: miss it and the only way back to the text is to repeat the
+ * action that failed. A rule worth explaining is worth leaving on screen until
+ * the person says they are done with it.
+ *
+ * IT IS A TRUE MODAL. Three things keep the screen underneath inert while it is
+ * up, and all three are needed — a Compose overlay drawn inside another
+ * screen's tree does not get focus merely by being painted on top of it:
+ *   1. the button asks for focus for several frames, because the screen behind
+ *      may re-assert its own focus on the same frame this appears;
+ *   2. the button's four directions are [FocusRequester.Cancel], so a D-pad
+ *      press cannot walk the focus search out into the content below;
+ *   3. the root swallows every key it does not use, so even if focus somehow
+ *      sits elsewhere in this subtree, nothing reaches what is behind.
+ * BACK is deliberately let through to the [BackHandler], which dismisses.
+ *
+ * @param title      The headline. One line, said plainly.
+ * @param message    The rule, the cause, or what to do about it. Optional.
+ * @param tone       Accent colours. [NoticeTone.Error] by default.
+ * @param buttonText Label of the acknowledge button.
+ * @param onDismiss  Called on OK and on BACK. Clear the caller's state here.
+ */
+@Composable
+fun NoticeOverlay(
+    title:      String,
+    message:    String?    = null,
+    tone:       NoticeTone = NoticeTone.Error,
+    buttonText: String     = "OK, Understood",
+    onDismiss:  () -> Unit,
+) {
+    val ok = remember { FocusRequester() }
+
+    // GUARD 4 — a select KeyUp only dismisses if THIS overlay saw its KeyDown.
+    //
+    // WITHOUT IT THE OVERLAY EATS THE RELEASE OF THE PRESS THAT OPENED IT.
+    // Measured on the profile screen: ProfileButtonBase fires its onClick
+    // inline on KeyDown (ProfileUtilities.kt) and returns true, leaving the
+    // KeyUp unconsumed; the caller sets its notice state in that same dispatch;
+    // this composable mounts on the next frame and GUARD 1 pulls focus in
+    // within one or two more. The release of that same physical press — 60 to
+    // 200ms later, for any human — then arrives HERE, and a handler that
+    // dismissed on a bare KeyUp read it as the acknowledgement. The notice was
+    // on screen for the length of a button press.
+    //
+    // It is the shape Modifier.clickable itself uses: arm on the down, act on
+    // the up. A plain holder rather than mutableStateOf because arming must not
+    // schedule a recomposition.
+    val selectArmed = remember { booleanArrayOf(false) }
+
+    // GUARD 1 — win the focus race, then check once more after it settles.
+    LaunchedEffect(Unit) {
+        repeat(NOTICE_FOCUS_ATTEMPTS) {
+            if (noticeTakeFocus(ok)) return@LaunchedEffect
+            withFrameNanos { }
+        }
+        delay(NOTICE_FOCUS_SETTLE_MS)
+        noticeTakeFocus(ok)
+    }
+
+    BackHandler(enabled = true) { onDismiss() }
+
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier
+            .fillMaxSize()
+            .background(overlayScrimColor())
+            .focusGroup()
+            // GUARD 3 — swallow everything. BACK and ESCAPE pass through so the
+            // BackHandler above sees them; OK/ENTER dismisses from anywhere,
+            // but only a press that BEGAN while this overlay was up (GUARD 4).
+            .onPreviewKeyEvent { e ->
+                if (e.key == Key.Back || e.key == Key.Escape) return@onPreviewKeyEvent false
+                val select = e.key == Key.Enter || e.key == Key.DirectionCenter ||
+                        e.key == Key.NumPadEnter
+                if (select) {
+                    when (e.type) {
+                        // repeatCount 0 only. Android re-sends ACTION_DOWN for a
+                        // key held past ~400ms, and counting those would arm the
+                        // latch from the opening press after all — the exact hole
+                        // this guard exists to close, reopened on long holds.
+                        KeyEventType.KeyDown ->
+                            if (e.nativeKeyEvent.repeatCount == 0) selectArmed[0] = true
+                        KeyEventType.KeyUp ->
+                            if (selectArmed[0]) {
+                                selectArmed[0] = false
+                                onDismiss()
+                            }
+                        else -> {}
+                    }
+                }
+                true
+            },
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier
+                .background(color = noticeCardBackgroundColor(), shape = overlayCardShape())
+                .border(1.dp, noticeCardBorderColor(tone), overlayCardShape())
+                .padding(
+                    horizontal = OVERLAY_CARD_PADDING_HORIZONTAL,
+                    vertical   = OVERLAY_CARD_PADDING_VERTICAL,
+                )
+                .width(NOTICE_CARD_WIDTH),
+        ) {
+
+            Text(
+                text       = title,
+                color      = noticeAccentColor(tone),
+                fontFamily = AppTypography.interBold,
+                fontWeight = FontWeight.Bold,
+                fontSize   = 16.sp,
+                lineHeight = 21.sp,
+                textAlign  = TextAlign.Center,
+                modifier   = Modifier.fillMaxWidth(),
+            )
+
+            // A short rule rather than a full-width divider: it reads as an
+            // underline belonging to the title, not as a section break.
+            Spacer(Modifier.height(10.dp))
+            Box(
+                Modifier
+                    .width(54.dp)
+                    .height(2.dp)
+                    .background(
+                        noticeAccentColor(tone).copy(alpha = 0.55f),
+                        RoundedCornerShape(1.dp),
+                    )
+            )
+
+            if (!message.isNullOrBlank()) {
+                Spacer(Modifier.height(14.dp))
+                // Inter at 11sp, not the condensed display face: this is a
+                // paragraph read from a sofa, not a headline.
+                Text(
+                    text       = message,
+                    color      = noticeBodyTextColor(),
+                    fontFamily = AppTypography.interSemiBold,
+                    fontSize   = 11.sp,
+                    lineHeight = 17.sp,
+                    textAlign  = TextAlign.Center,
+                    modifier   = Modifier.fillMaxWidth(),
+                )
+            }
+
+            Spacer(Modifier.height(22.dp))
+
+            ModularButton(
+                textConfig      = ModularButtonTextConfig(text = buttonText, fontSize = 10f),
+                isToggleable    = false,
+                fontFamily      = AppTypography.interBold,
+                focusRequester  = ok,
+                onClick         = onDismiss,
+                // GUARD 2 — nowhere to go. Cancel ends the focus search instead
+                // of letting it reach the screen behind the scrim.
+                modifier        = Modifier.focusProperties {
+                    up    = FocusRequester.Cancel
+                    down  = FocusRequester.Cancel
+                    left  = FocusRequester.Cancel
+                    right = FocusRequester.Cancel
+                },
+                dimensions      = overlayButtonDimensions(),
+                colors          = overlayCancelButtonColors(),
+                glowConfig      = overlayButtonGlowConfig(),
+                animationConfig = overlayButtonAnimationConfig(),
+            )
+        }
+    }
+}
+
+private const val NOTICE_FOCUS_ATTEMPTS  = 6
+private const val NOTICE_FOCUS_SETTLE_MS = 150L
+
+/** requestFocus() returns Unit and no-ops when the target is detached rather
+ *  than throwing, so use the overload that reports whether focus actually moved. */
+@OptIn(ExperimentalComposeUiApi::class)
+private fun noticeTakeFocus(requester: FocusRequester): Boolean =
+    runCatching { requester.requestFocus(FocusDirection.Enter) }.getOrDefault(false)
+
+
+/** [NoticeOverlay] taking a prepared [NoticeContent]. The usual call shape:
+ *  `notice?.let { NoticeOverlay(it) { notice = null } }`. */
+@Composable
+fun NoticeOverlay(
+    content:    NoticeContent,
+    buttonText: String = "OK, Understood",
+    onDismiss:  () -> Unit,
+) = NoticeOverlay(
+    title      = content.title,
+    message    = content.message,
+    tone       = content.tone,
+    buttonText = buttonText,
+    onDismiss  = onDismiss,
+)

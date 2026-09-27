@@ -6,6 +6,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
@@ -82,6 +84,10 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.ui.platform.LocalDensity
+import com.example.bluehive.utilities.NoticeContent
+import com.example.bluehive.utilities.NoticeOverlay
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Avatar resource map
@@ -113,6 +119,66 @@ private val MANAGE_GRID_OFFSET_Y_ROW1: Dp = 155.dp
 private val MANAGE_GRID_OFFSET_Y_ROW2: Dp = 170.dp
 
 private val MANAGE_CHECKMARK_SIZE: Dp = 48.dp
+
+// ── The profile panel ─────────────────────────────────────────────────────
+//
+// THE DARK PANEL BEHIND THE GRID IS PAINTED INTO manage_profiles_screen, not
+// laid out, so these are measurements of the artwork -- a 1920x1080 capture,
+// exactly 2px per dp, 2026-09-21: x 52..579, y 155..458.5, corners ~6dp. The
+// grid's window is cut to exactly this box, which is what keeps every card
+// inside the panel however many there are. (Before, the grid was laid straight
+// onto the screen, and a third row would have run out of the panel's bottom.)
+private val MANAGE_PANEL_X: Dp      = 52.dp
+private val MANAGE_PANEL_Y: Dp      = 155.dp
+private val MANAGE_PANEL_WIDTH: Dp  = 527.dp
+private val MANAGE_PANEL_HEIGHT: Dp = 303.5.dp
+
+// TWO ROWS A PAGE: what the panel holds with the rows where they always sat
+// (card tops 177.5 and 319.6), the second row's names and focus glow still
+// clear of the panel's bottom edge. A page is the panel's own height, so a page
+// flip always comes to rest on whole rows.
+private const val MANAGE_ROWS_PER_PAGE = 2
+private val MANAGE_ROW_PITCH: Dp get() =
+    MANAGE_CARD_SIZE + MANAGE_CARD_GAP + (MANAGE_GRID_OFFSET_Y_ROW2 - MANAGE_GRID_OFFSET_Y_ROW1)
+
+// A cell's left edge inside the window: the grid's screen x less the panel's.
+// Negative, because a cell is its card plus 23dp of focus glow on each side.
+private val MANAGE_CELL_X: Dp get() = MANAGE_GRID_OFFSET_X - MANAGE_PANEL_X
+
+// ── The scroll bar ────────────────────────────────────────────────────────
+//
+// A slim track in the panel's LEFT margin -- the 18.5dp between the panel's
+// edge and the first column -- centred in it, and running exactly the height of
+// the two rows of cards, top of the first to bottom of the second. The thumb is
+// one page long and slides with the page flip, on the flip's own clock. Shown
+// only when there is more than one page.
+private val MANAGE_SCROLLBAR_WIDTH: Dp        = 3.dp
+private val MANAGE_SCROLLBAR_X: Dp            = 59.75.dp
+private val MANAGE_SCROLLBAR_TOP: Dp get()    = MANAGE_GRID_OFFSET_Y_ROW1 + 22.5.dp
+private val MANAGE_SCROLLBAR_HEIGHT: Dp get() = MANAGE_ROW_PITCH + MANAGE_CARD_SIZE
+private val MANAGE_SCROLLBAR_MIN_THUMB: Dp    = 24.dp
+private val MANAGE_SCROLLBAR_TRACK            = Color(0x14FFFFFF)
+// The picker's section-label blue-grey: the same quiet "there is more" colour.
+private val MANAGE_SCROLLBAR_THUMB: Color get() = GRID_SECTION_LABEL_COLOR
+
+// The seat triangle on the detail panel's 74dp picture, in the cards'
+// proportion (20dp on a 106.6dp card).
+private val DETAIL_SEAT_TRIANGLE_SIZE: Dp = 14.dp
+
+// Change-picture and Delete on ANOTHER ACCOUNT'S profile: still focusable -- a
+// press explains why it cannot be done -- but drained of the blue and red that
+// say "this will act".
+private val RESTRICTED_ACTION_COLORS = ModularButtonColors(
+    mainDefault          = Color(0xFF181A24),
+    mainToggled          = Color(0xFF282C3E),
+    mainFocused          = Color(0xFF282C3E),
+    secondDefault        = Color(0xFF111219),
+    secondFocused        = Color(0xFF1C1F2C),
+    textFocused          = Color(0xFF9A9A9A),
+    textUnfocused        = Color(0xFF4C4C4C),
+    textUnfocusedToggled = Color(0xFF4C4C4C),
+    textToggledFocus     = Color(0xFF9A9A9A),
+)
 
 private val MANAGE_NAME_LABEL_OFFSET_Y_UNFOCUSED: Dp = 132.5.dp
 private val MANAGE_NAME_LABEL_OFFSET_Y_FOCUSED: Dp   = 139.dp
@@ -225,23 +291,84 @@ class ProfileManageActivity : ComponentActivity() {
 fun ProfileManageScreen(
     onBack: () -> Unit = {},
 ) {
+    // This account's profiles -- the ones every action on this screen can reach.
     val profiles = remember { mutableStateListOf<ProfileResponse>() }
+
+    // THE REST OF THE SUBSCRIPTION'S, listed after them. Anyone on the licence
+    // can rename one of these -- an unsuitable name is on everyone's screen --
+    // so they belong here; the picture and deleting stay with the account that
+    // made them. A separate list, as on the picker, because every rule here
+    // that means "mine" reads `profiles`.
+    val peerProfiles = remember { mutableStateListOf<ProfileResponse>() }
 
     LaunchedEffect(Unit) {
         try {
-            val fetched = ApiClient.bluehiveApi.listProfiles()
-            Log.d(TAG, "✅ Fetched ${fetched.size} profiles")
+            // Household first, own-only as the fallback, as on the picker: a
+            // backend without /profiles/household still gets a working screen,
+            // just without the household.
+            val household = runCatching { ApiClient.bluehiveApi.getHousehold() }
+                .onFailure { Log.w(TAG, "household unavailable: ${it.message}") }
+                .getOrNull()
+            val fetched = household?.own ?: ApiClient.bluehiveApi.listProfiles()
+            Log.d(TAG, "✅ Fetched ${fetched.size} profiles, " +
+                       "${household?.others?.size ?: 0} more on the subscription")
             profiles.clear()
             profiles.addAll(fetched)
+            peerProfiles.clear()
+            peerProfiles.addAll(household?.others.orEmpty())
         } catch (e: Exception) {
             Log.e(TAG, "❌ Failed to load profiles: ${e.message}")
         }
     }
 
+    // ONE INDEX SPACE ACROSS BOTH LISTS -- own first, then the household's --
+    // shared by the grid, its focus requesters and the selection.
+    fun profileAt(i: Int): ProfileResponse? =
+        if (i < profiles.size) profiles.getOrNull(i) else peerProfiles.getOrNull(i - profiles.size)
+    fun isOwn(i: Int): Boolean = i >= 0 && i < profiles.size
+
     val focusRequesters = remember { mutableStateListOf<FocusRequester>() }
     var focusedIndex by remember { mutableIntStateOf(-1) }
     var selectedIndex by remember { mutableIntStateOf(0) }
     val scope = rememberCoroutineScope()
+
+    // ── Paging the grid ─────────────────────────────────────────────────────
+    val density      = LocalDensity.current
+    val manageScroll = rememberScrollState()
+    var managePage   by remember { mutableIntStateOf(0) }
+
+    /**
+     * Turn the grid to [page]. Each card calls this as it takes focus, so the
+     * page follows the focus -- the picker's flipGridTo, on this screen's panel.
+     */
+    fun flipManageTo(page: Int) {
+        val target = page * with(density) { MANAGE_PANEL_HEIGHT.roundToPx() }
+        if (page == managePage && (manageScroll.value == target || manageScroll.isScrollInProgress)) return
+        managePage = page
+        scope.launch {
+            manageScroll.animateScrollTo(
+                target,
+                tween(durationMillis = GRID_PAGE_FLIP_MS, easing = FastOutSlowInEasing),
+            )
+        }
+    }
+
+    // ── Refusals on another account's profile ─────────────────────────────
+    // Set when Change-picture or Delete is pressed on a profile this account
+    // does not own; the button it came from takes focus back when it closes.
+    var notYours          by remember { mutableStateOf<NoticeContent?>(null) }
+    var notYoursReturn    by remember { mutableStateOf<FocusRequester?>(null) }
+    var notYoursWasOpened by remember { mutableStateOf(false) }
+    val deleteFocus       = remember { FocusRequester() }
+
+    LaunchedEffect(notYours) {
+        if (notYours != null) {
+            notYoursWasOpened = true
+        } else if (notYoursWasOpened) {
+            awaitFrame()
+            runCatching { notYoursReturn?.requestFocus() }
+        }
+    }
 
     // ── Overlay state ─────────────────────────────────────────────────────────
     var showAvatarPicker    by remember { mutableStateOf(false) }
@@ -325,16 +452,18 @@ fun ProfileManageScreen(
 
     // ── Delete ────────────────────────────────────────────────────────────────
     fun deleteSelectedProfile() {
-        if (selectedIndex < 0 || selectedIndex >= profiles.size) return
+        // This account's profiles only; the button refuses anything else first.
+        if (!isOwn(selectedIndex)) return
         val profileToDelete = profiles[selectedIndex]
         scope.launch {
             try {
                 ApiClient.bluehiveApi.deleteProfile(profileToDelete.id)
                 Log.d(TAG, "🗑️ Deleted profile: ${profileToDelete.display_name}")
                 profiles.removeAt(selectedIndex)
+                val remaining = profiles.size + peerProfiles.size
                 selectedIndex = when {
-                    profiles.isEmpty() -> -1
-                    selectedIndex >= profiles.size -> profiles.size - 1
+                    remaining == 0 -> -1
+                    selectedIndex >= remaining -> remaining - 1
                     else -> selectedIndex
                 }
             } catch (e: Exception) {
@@ -345,8 +474,10 @@ fun ProfileManageScreen(
 
     // ── Update avatar ─────────────────────────────────────────────────────────
     fun changeSelectedAvatar(newAvatarRes: Int) {
-        if (selectedIndex < 0 || selectedIndex >= profiles.size) return
-        val profile = profiles[selectedIndex]
+        // This account's profiles only; the button refuses anything else first.
+        if (!isOwn(selectedIndex)) return
+        val index   = selectedIndex
+        val profile = profiles[index]
         val resName = MANAGE_AVATAR_DRAWABLE_MAP.entries
             .firstOrNull { it.value == newAvatarRes }?.key ?: return
         scope.launch {
@@ -355,7 +486,9 @@ fun ProfileManageScreen(
                     profile.id,
                     ProfileUpdateRequest(display_name = profile.display_name, avatar_url = resName)
                 )
-                profiles[selectedIndex] = updated
+                // The PATCH answer carries no seat -- only /profiles/household
+                // attaches one -- so keep the card's, or its triangle vanishes.
+                profiles[index] = updated.copy(seat = profile.seat)
                 Log.d(TAG, "✅ Avatar updated to $resName")
             } catch (e: Exception) {
                 Log.e(TAG, "❌ Failed to update avatar: ${e.message}")
@@ -366,8 +499,9 @@ fun ProfileManageScreen(
 
     // ── Update name ───────────────────────────────────────────────────────────
     fun changeSelectedName(newName: String) {
-        if (selectedIndex < 0 || selectedIndex >= profiles.size) return
-        val profile = profiles[selectedIndex]
+        val index   = selectedIndex
+        val profile = profileAt(index) ?: return
+        val own     = isOwn(index)
         val trimmed = newName.trim().take(15)
         if (trimmed.isEmpty()) {
             showNameEditor = false; return
@@ -376,9 +510,16 @@ fun ProfileManageScreen(
             try {
                 val updated = ApiClient.bluehiveApi.updateProfile(
                     profile.id,
-                    ProfileUpdateRequest(display_name = trimmed, avatar_url = profile.avatar_url)
-                )
-                profiles[selectedIndex] = updated
+                    // Another account's profile takes the NAME ONLY. The server
+                    // refuses any other field on one -- even the avatar it
+                    // already has (403 profile_not_yours) -- so it goes as null.
+                    ProfileUpdateRequest(
+                        display_name = trimmed,
+                        avatar_url   = if (own) profile.avatar_url else null,
+                    )
+                ).copy(seat = profile.seat)   // the PATCH answer carries no seat
+                if (own) profiles[index] = updated
+                else     peerProfiles[index - profiles.size] = updated
                 Log.d(TAG, "✅ Name updated to $trimmed")
             } catch (e: Exception) {
                 Log.e(TAG, "❌ Failed to update name: ${e.message}")
@@ -386,6 +527,48 @@ fun ProfileManageScreen(
             showNameEditor = false
         }
     }
+
+    // ANY OVERLAY UP. The cards ask this in their own focusProperties, because
+    // the background's canFocus switch below does not reach them -- the grid's
+    // scroll container is a focus group of its own, and the switch stops at it.
+    //
+    // A FUNCTION, READ AT THE MOMENT OF ASKING, not a value taken at
+    // composition, and that is the whole fix. Opening an overlay flips the
+    // background's switch the instant the state changes, before anything
+    // recomposes; the focused button drops focus, Android hands focus straight
+    // back into the screen, and Compose looks for somewhere to put it. Asked
+    // then, a composition-time value still said "no overlay", so a card took
+    // focus and turned the grid to its page -- page one, behind the notice
+    // (seen in a logged stack, 2026-09-21).
+    fun overlayOpen(): Boolean = showAvatarPicker || showNameEditor || showDeleteConfirm ||
+                                 showRecoverOverlay || notYours != null
+
+    // ── The grid as rows ─────────────────────────────────────────────────────
+    // Own profiles cut into rows of four, then the household's, from a fresh
+    // row. Row numbers run straight through both.
+    val ownRows   = (profiles.size + MANAGE_CARDS_PER_ROW - 1) / MANAGE_CARDS_PER_ROW
+    val peerRows  = (peerProfiles.size + MANAGE_CARDS_PER_ROW - 1) / MANAGE_CARDS_PER_ROW
+    val rowCount  = ownRows + peerRows
+    val pageCount = (rowCount + MANAGE_ROWS_PER_PAGE - 1) / MANAGE_ROWS_PER_PAGE
+
+    fun rowStart(row: Int): Int =
+        if (row < ownRows) row * MANAGE_CARDS_PER_ROW
+        else profiles.size + (row - ownRows) * MANAGE_CARDS_PER_ROW
+
+    fun rowLength(row: Int): Int =
+        if (row < ownRows) minOf(MANAGE_CARDS_PER_ROW, profiles.size - row * MANAGE_CARDS_PER_ROW)
+        else minOf(MANAGE_CARDS_PER_ROW, peerProfiles.size - (row - ownRows) * MANAGE_CARDS_PER_ROW)
+
+    // The same column one row up or down, or that row's last card when it is
+    // shorter; nothing above the first row, and Compose's own search below the
+    // last.
+    fun cellAt(row: Int, col: Int): FocusRequester =
+        focusRequesters.getOrNull(rowStart(row) + minOf(col, rowLength(row) - 1))
+            ?: FocusRequester.Default
+    fun cellAbove(row: Int, col: Int): FocusRequester =
+        if (row <= 0) FocusRequester.Default else cellAt(row - 1, col)
+    fun cellBelow(row: Int, col: Int): FocusRequester =
+        if (row >= rowCount - 1) FocusRequester.Default else cellAt(row + 1, col)
 
     LaunchedEffect(profiles.size) {
         if (profiles.isNotEmpty() && focusRequesters.isNotEmpty()) {
@@ -429,68 +612,127 @@ fun ProfileManageScreen(
                 .fillMaxSize()
                 .focusProperties {
                     canFocus =
-                        !showAvatarPicker && !showNameEditor && !showDeleteConfirm && !showRecoverOverlay
+                        !showAvatarPicker && !showNameEditor && !showDeleteConfirm &&
+                        !showRecoverOverlay && notYours == null
                 }
         ) {
+            // ── Profile grid: pages inside the panel ──────────────────────────
+            //
+            // A window cut to the painted panel's exact bounds, turning two rows
+            // at a time -- see MANAGE_PANEL_* and MANAGE_ROWS_PER_PAGE. This
+            // account's profiles come first, then the household's, which start on
+            // a row of their own; the seat triangles tell the two apart.
+            //
+            // UP AND DOWN ARE WIRED, NOT SEARCHED, and the end of a row goes to
+            // the actions: left to Compose's geometric search, a move could land
+            // on a card on a page that is not showing.
             Box(
                 modifier = Modifier
                     .align(Alignment.TopStart)
-                    .offset(x = MANAGE_GRID_OFFSET_X, y = MANAGE_GRID_OFFSET_Y_ROW1),
+                    .offset(x = MANAGE_PANEL_X, y = MANAGE_PANEL_Y)
+                    .size(width = MANAGE_PANEL_WIDTH, height = MANAGE_PANEL_HEIGHT),
             ) {
-                profiles.forEachIndexed { index, profile ->
-                    val row = index / MANAGE_CARDS_PER_ROW
-                    val col = index % MANAGE_CARDS_PER_ROW
-
-                    val cardX = col * (MANAGE_CARD_SIZE + MANAGE_CARD_GAP)
-                    val rowOffsetY =
-                        if (row == 0) MANAGE_GRID_OFFSET_Y_ROW1 else MANAGE_GRID_OFFSET_Y_ROW2
-                    val cardY =
-                        (row * (MANAGE_CARD_SIZE + MANAGE_CARD_GAP)) + (rowOffsetY - MANAGE_GRID_OFFSET_Y_ROW1)
-
-                    val avatarResId = remember(profile.avatar_url) {
-                        resolveManageAvatarDrawable(profile.avatar_url)
-                    }
-
-                    val requester = if (index < focusRequesters.size) {
-                        focusRequesters[index]
-                    } else {
-                        remember { FocusRequester() }.also { focusRequesters.add(it) }
-                    }
-
-                    ManageProfileCard(
-                        profile = profile,
-                        avatarResId = avatarResId,
-                        focusRequester = requester,
-                        modifier = Modifier.offset(x = cardX, y = cardY),
-                        anyCardFocused = focusedIndex >= 0,
-                        isSelected = selectedIndex == index,
-                        onFocusChanged = { focused -> focusedIndex = if (focused) index else -1 },
-                        onSelect = {
-                            if (selectedIndex != index) {
-                                selectedIndex = index
-                                BlueHiveApplication.playClickSound()
-                                Log.d(TAG, "Selected profile: ${profile.display_name}")
+                WithoutFocusScroll {
+                    Column(modifier = Modifier.verticalScroll(manageScroll)) {
+                        for (page in 0 until pageCount) {
+                            Box(modifier = Modifier.height(MANAGE_PANEL_HEIGHT).fillMaxWidth()) {
+                                for (pageRow in 0 until MANAGE_ROWS_PER_PAGE) {
+                                    val row = page * MANAGE_ROWS_PER_PAGE + pageRow
+                                    if (row >= rowCount) break
+                                    for (col in 0 until rowLength(row)) {
+                                        val index   = rowStart(row) + col
+                                        val profile = profileAt(index) ?: continue
+                                        val avatarResId = remember(profile.avatar_url) {
+                                            resolveManageAvatarDrawable(profile.avatar_url)
+                                        }
+                                        val requester = if (index < focusRequesters.size) {
+                                            focusRequesters[index]
+                                        } else {
+                                            remember { FocusRequester() }.also { focusRequesters.add(it) }
+                                        }
+                                        ManageProfileCard(
+                                            profile        = profile,
+                                            avatarResId    = avatarResId,
+                                            focusRequester = requester,
+                                            seat           = profile.seat,
+                                            modifier       = Modifier
+                                                .offset(
+                                                    x = MANAGE_CELL_X +
+                                                        col * (MANAGE_CARD_SIZE + MANAGE_CARD_GAP),
+                                                    y = pageRow * MANAGE_ROW_PITCH,
+                                                )
+                                                .focusProperties {
+                                                    canFocus = !overlayOpen()
+                                                    up   = cellAbove(row, col)
+                                                    down = cellBelow(row, col)
+                                                    if (col == rowLength(row) - 1) right = changeImageFocus
+                                                },
+                                            anyCardFocused = focusedIndex >= 0,
+                                            isSelected     = selectedIndex == index,
+                                            onFocusChanged = { focused ->
+                                                focusedIndex = if (focused) index else -1
+                                                if (focused)                                                if (focused) flipManageTo(row / MANAGE_ROWS_PER_PAGE)
+                                            },
+                                            onSelect = {
+                                                if (selectedIndex != index) {
+                                                    selectedIndex = index
+                                                    BlueHiveApplication.playClickSound()
+                                                    Log.d(TAG, "Selected profile: ${profile.display_name}")
+                                                }
+                                            },
+                                        )
+                                    }
+                                }
                             }
-                        },
-                    )
+                        }
+                    }
                 }
             }
 
-            if (selectedIndex >= 0 && selectedIndex < profiles.size) {
-                val selectedProfile = profiles[selectedIndex]
-                val selectedResId   = resolveManageAvatarDrawable(selectedProfile.avatar_url)
+            // Where the grid is among its pages -- only when it has more than one.
+            if (pageCount > 1) {
+                ManageScrollbar(
+                    page      = managePage.coerceIn(0, pageCount - 1),
+                    pageCount = pageCount,
+                    modifier  = Modifier
+                        .align(Alignment.TopStart)
+                        .offset(x = MANAGE_SCROLLBAR_X, y = MANAGE_SCROLLBAR_TOP),
+                )
+            }
+
+            val selectedProfile = profileAt(selectedIndex)
+            if (selectedProfile != null) {
+                val selectedIsOwn = isOwn(selectedIndex)
+                val selectedResId = resolveManageAvatarDrawable(selectedProfile.avatar_url)
                 SelectedProfileDetailPanel(
                     profile          = selectedProfile,
                     avatarResId      = selectedResId,
+                    isOwn            = selectedIsOwn,
                     changeImageFocus = changeImageFocus,
                     changeNameFocus  = changeNameFocus,
                     recoverBtnFocus  = recoverBtnFocus,
-                    onChangeImage    = { showAvatarPicker = true },
+                    deleteFocus      = deleteFocus,
+                    gridFocus        = focusRequesters.getOrNull(selectedIndex) ?: FocusRequester.Default,
+                    // Picture and delete stay with the account that made the
+                    // profile; on anyone else's, say so rather than attempt it.
+                    onChangeImage    = {
+                        if (selectedIsOwn) showAvatarPicker = true
+                        else {
+                            notYoursReturn = changeImageFocus
+                            notYours       = profileNotYoursNotice(NotYours.Picture)
+                        }
+                    },
                     onChangeName     = {
                         nameEditorText = selectedProfile.display_name
                         showNameEditor = true
                     },
-                    onDelete         = { showDeleteConfirm = true },
+                    onDelete         = {
+                        if (selectedIsOwn) showDeleteConfirm = true
+                        else {
+                            notYoursReturn = deleteFocus
+                            notYours       = profileNotYoursNotice(NotYours.Delete)
+                        }
+                    },
                     onRecover        = {
                         scope.launch {
                             try {
@@ -508,7 +750,7 @@ fun ProfileManageScreen(
                     },
                     onReturn         = { onBack() },
                 )
-            } else if (profiles.isEmpty()) {
+            } else if (profiles.isEmpty() && peerProfiles.isEmpty()) {
                 // No profiles — show minimal panel with just recover and return
                 EmptyProfileActionPanel(
                     recoverBtnFocus = recoverBtnFocus,
@@ -973,7 +1215,21 @@ fun ProfileManageScreen(
                                                 scope.launch {
                                                     try {
                                                         val recovered = ApiClient.bluehiveApi.recoverProfile(deleted.id)
-                                                        profiles.add(recovered)
+                                                        // Own again, so it wears the
+                                                        // account's seat; and a household
+                                                        // selection stays on the same card
+                                                        // as the own run grows by one.
+                                                        // (With no own profile left to copy
+                                                        // a seat from, ask the server.)
+                                                        val accountSeat = profiles.firstNotNullOfOrNull { it.seat }
+                                                        if (selectedIndex >= profiles.size) selectedIndex += 1
+                                                        profiles.add(recovered.copy(seat = accountSeat))
+                                                        if (accountSeat == null) {
+                                                            val seat = runCatching { ApiClient.bluehiveApi.getHousehold() }
+                                                                .getOrNull()?.own?.firstOrNull { it.id == recovered.id }?.seat
+                                                            val i = profiles.indexOfFirst { it.id == recovered.id }
+                                                            if (seat != null && i >= 0) profiles[i] = profiles[i].copy(seat = seat)
+                                                        }
                                                         deletedProfiles.removeAt(index)
                                                         recoverFocusedIndex = minOf(recoverFocusedIndex, deletedProfiles.size - 1).coerceAtLeast(0)
                                                         Log.d(TAG, "✅ Recovered: ${recovered.display_name}")
@@ -1036,9 +1292,46 @@ fun ProfileManageScreen(
             } // end center Box
         } // end if (showRecoverOverlay)
 
+        // ── Refused on another account's profile ─────────────────────────────
+        notYours?.let { notice ->
+            NoticeOverlay(notice) { notYours = null }
+        }
+
     } // end outer Box
 } // end ProfileManageScreen
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ManageScrollbar
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Where the grid is among its pages: a track the height of the two rows on
+ * screen, and a thumb one page long that slides to the page showing, on the
+ * page flip's own clock so the two move as one.
+ */
+@Composable
+private fun ManageScrollbar(page: Int, pageCount: Int, modifier: Modifier = Modifier) {
+    val thumb  = maxOf(MANAGE_SCROLLBAR_MIN_THUMB, MANAGE_SCROLLBAR_HEIGHT / pageCount)
+    val travel = MANAGE_SCROLLBAR_HEIGHT - thumb
+    val thumbY by animateDpAsState(
+        targetValue   = if (pageCount > 1) travel * page / (pageCount - 1) else 0.dp,
+        animationSpec = tween(durationMillis = GRID_PAGE_FLIP_MS, easing = FastOutSlowInEasing),
+        label         = "manageScrollThumb",
+    )
+    Box(
+        modifier = modifier
+            .size(width = MANAGE_SCROLLBAR_WIDTH, height = MANAGE_SCROLLBAR_HEIGHT)
+            .background(MANAGE_SCROLLBAR_TRACK, RoundedCornerShape(percent = 50)),
+    ) {
+        Box(
+            modifier = Modifier
+                .offset(y = thumbY)
+                .size(width = MANAGE_SCROLLBAR_WIDTH, height = thumb)
+                .background(MANAGE_SCROLLBAR_THUMB, RoundedCornerShape(percent = 50)),
+        )
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ManageProfileCard
@@ -1054,6 +1347,8 @@ fun ManageProfileCard(
     isSelected:     Boolean,
     onFocusChanged: (Boolean) -> Unit,
     modifier:       Modifier = Modifier,
+    // "owner" / "member", or null for no triangle -- as on the picker.
+    seat:           String?  = null,
 ) {
     var isFocused by remember { mutableStateOf(false) }
 
@@ -1166,6 +1461,26 @@ fun ManageProfileCard(
             )
         }
 
+        // Seat triangle. A layer of its own that takes the card's focus scale
+        // and rounded clip but NOT its dimming (the avatar rests at 40%), so
+        // the seat reads at full strength on every card, as on the picker.
+        Box(
+            modifier = Modifier
+                .size(MANAGE_CARD_SIZE)
+                .graphicsLayer {
+                    scaleX = scale
+                    scaleY = scale
+                }
+                .clip(RoundedCornerShape(MANAGE_CARD_CORNER)),
+        ) {
+            SeatTriangle(
+                seat     = seat,
+                focused  = isFocused,
+                side     = PROFILE_SEAT_TRIANGLE_SIZE,
+                modifier = Modifier.align(Alignment.TopStart),
+            )
+        }
+
         Text(
             text       = profile.display_name.take(13),
             color      = nameLabelColor,
@@ -1190,29 +1505,47 @@ fun ManageProfileCard(
 fun SelectedProfileDetailPanel(
     profile:          ProfileResponse,
     avatarResId:      Int,
+    // False for a profile belonging to another account on the subscription:
+    // its picture and Delete buttons are drawn restricted, and the screen
+    // answers a press on either with a notice instead of acting.
+    isOwn:            Boolean,
     changeImageFocus: FocusRequester,
     changeNameFocus:  FocusRequester,
     recoverBtnFocus:  FocusRequester,
+    deleteFocus:      FocusRequester,
+    // The selected card: left from these buttons goes back to it, even when
+    // it is on a page that is not showing (the grid turns to it).
+    gridFocus:        FocusRequester,
     onChangeImage:    () -> Unit,
     onChangeName:     () -> Unit,
     onDelete:         () -> Unit,
     onRecover:        () -> Unit,
     onReturn:         () -> Unit,
 ) {
-    val deleteFocus = remember { FocusRequester() }
     val returnFocus = remember { FocusRequester() }
+    val backToGrid  = Modifier.focusProperties { left = gridFocus }
 
     Box(
         modifier = Modifier.offset(x = DETAIL_PANEL_OFFSET_X, y = DETAIL_PANEL_OFFSET_Y)
     ) {
-        Image(
-            painter            = painterResource(id = avatarResId),
-            contentDescription = null,
-            contentScale       = ContentScale.Crop,
-            modifier           = Modifier
+        Box(
+            modifier = Modifier
                 .size(DETAIL_AVATAR_SIZE)
                 .clip(RoundedCornerShape(DETAIL_AVATAR_CORNER)),
-        )
+        ) {
+            Image(
+                painter            = painterResource(id = avatarResId),
+                contentDescription = null,
+                contentScale       = ContentScale.Crop,
+                modifier           = Modifier.fillMaxSize(),
+            )
+            SeatTriangle(
+                seat     = profile.seat,
+                focused  = false,
+                side     = DETAIL_SEAT_TRIANGLE_SIZE,
+                modifier = Modifier.align(Alignment.TopStart),
+            )
+        }
 
         Text(
             text       = profile.display_name.take(13),
@@ -1268,11 +1601,16 @@ fun SelectedProfileDetailPanel(
             modifier   = Modifier.offset(x = DETAIL_CREATED_VALUE_OFFSET_X, y = DETAIL_CREATED_VALUE_OFFSET_Y),
         )
 
-        DetailBtnChangeImage(focusRequester = changeImageFocus, onClick = onChangeImage)
-        DetailBtnChangeName(focusRequester = changeNameFocus,   onClick = onChangeName)
-        DetailBtnDelete(focusRequester = deleteFocus,           onClick = onDelete)
-        DetailBtnRecoverProfile(focusRequester = recoverBtnFocus, onClick = onRecover)
-        DetailBtnReturn(focusRequester = returnFocus,           onClick = onReturn)
+        DetailBtnChangeImage(focusRequester = changeImageFocus, onClick = onChangeImage,
+                             restricted = !isOwn, modifier = backToGrid)
+        DetailBtnChangeName(focusRequester = changeNameFocus,   onClick = onChangeName,
+                            modifier = backToGrid)
+        DetailBtnDelete(focusRequester = deleteFocus,           onClick = onDelete,
+                        restricted = !isOwn)
+        DetailBtnRecoverProfile(focusRequester = recoverBtnFocus, onClick = onRecover,
+                                modifier = backToGrid)
+        DetailBtnReturn(focusRequester = returnFocus,           onClick = onReturn,
+                        modifier = backToGrid)
     }
 }
 
@@ -1319,6 +1657,8 @@ fun EmptyProfileActionPanel(
 private fun DetailBtnChangeImage(
     focusRequester: FocusRequester,
     onClick: () -> Unit,
+    restricted: Boolean = false,
+    modifier: Modifier = Modifier,
 ) {
     val offsetY = 90.dp
     val width   = 200.dp
@@ -1334,7 +1674,7 @@ private fun DetailBtnChangeImage(
         fontFamily      = AppTypography.interBold,
         focusRequester  = focusRequester,
         onClick         = onClick,
-        modifier        = Modifier.offset(x = 0.dp, y = offsetY),
+        modifier        = Modifier.offset(x = 0.dp, y = offsetY).then(modifier),
         dimensions      = ModularButtonDimensions(
             mainWidth          = width,
             mainHeight         = 27.dp,
@@ -1348,7 +1688,7 @@ private fun DetailBtnChangeImage(
             glowWidth          = width + 26.dp,
             glowHeight         = 41.dp,
         ),
-        colors          = ModularButtonColors(
+        colors          = if (restricted) RESTRICTED_ACTION_COLORS else ModularButtonColors(
             mainDefault          = mainDefault,
             mainToggled          = mainFocused,
             mainFocused          = mainFocused,
@@ -1382,6 +1722,7 @@ private fun DetailBtnChangeImage(
 private fun DetailBtnChangeName(
     focusRequester: FocusRequester,
     onClick: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val offsetY = 130.dp
     val width   = 200.dp
@@ -1397,7 +1738,7 @@ private fun DetailBtnChangeName(
         fontFamily      = AppTypography.interBold,
         focusRequester  = focusRequester,
         onClick         = onClick,
-        modifier        = Modifier.offset(x = 0.dp, y = offsetY),
+        modifier        = Modifier.offset(x = 0.dp, y = offsetY).then(modifier),
         dimensions      = ModularButtonDimensions(
             mainWidth          = width,
             mainHeight         = 27.dp,
@@ -1447,6 +1788,7 @@ private fun DetailBtnChangeName(
 private fun DetailBtnReturn(
     focusRequester: FocusRequester,
     onClick: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val width = 132.dp
 
@@ -1461,7 +1803,7 @@ private fun DetailBtnReturn(
         fontFamily      = AppTypography.interBold,
         focusRequester  = focusRequester,
         onClick         = onClick,
-        modifier        = Modifier.offset(x = 0.dp, y = 187.dp),
+        modifier        = Modifier.offset(x = 0.dp, y = 187.dp).then(modifier),
         dimensions      = ModularButtonDimensions(
             mainWidth          = width,
             mainHeight         = 27.dp,
@@ -1511,6 +1853,8 @@ private fun DetailBtnReturn(
 private fun DetailBtnDelete(
     focusRequester: FocusRequester,
     onClick: () -> Unit,
+    restricted: Boolean = false,
+    modifier: Modifier = Modifier,
 ) {
     val offsetY = 187.dp
     val width   = 132.dp
@@ -1526,7 +1870,7 @@ private fun DetailBtnDelete(
         fontFamily      = AppTypography.interBold,
         focusRequester  = focusRequester,
         onClick         = onClick,
-        modifier        = Modifier.offset(x = 140.dp, y = offsetY),
+        modifier        = Modifier.offset(x = 140.dp, y = offsetY).then(modifier),
         dimensions      = ModularButtonDimensions(
             mainWidth          = width,
             mainHeight         = 27.dp,
@@ -1540,7 +1884,7 @@ private fun DetailBtnDelete(
             glowWidth          = width + 18.dp,
             glowHeight         = 41.dp,
         ),
-        colors          = ModularButtonColors(
+        colors          = if (restricted) RESTRICTED_ACTION_COLORS else ModularButtonColors(
             mainDefault          = mainDefault,
             mainToggled          = mainFocused,
             mainFocused          = mainFocused,
@@ -1575,6 +1919,7 @@ private fun DetailBtnDelete(
 private fun DetailBtnRecoverProfile(
     focusRequester: FocusRequester,
     onClick: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val offsetY = 245.dp
     val width   = 132.dp
@@ -1585,7 +1930,7 @@ private fun DetailBtnRecoverProfile(
         fontFamily      = AppTypography.interBold,
         focusRequester  = focusRequester,
         onClick         = onClick,
-        modifier        = Modifier.offset(x = 140.dp, y = offsetY),
+        modifier        = Modifier.offset(x = 140.dp, y = offsetY).then(modifier),
         dimensions      = ModularButtonDimensions(
             mainWidth          = width,
             mainHeight         = 27.dp,

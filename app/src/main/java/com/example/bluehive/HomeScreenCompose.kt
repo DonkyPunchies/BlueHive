@@ -346,6 +346,12 @@ fun HomeScreenComposeContent(
 
     var isOnFirstShelf by remember { mutableStateOf(true) }
 
+    // Whether this profile has any watch history, as the Continue Watching
+    // panel last reported it: null until its first load answers. Only a known
+    // "no" hides the panel, so a profile with history never sees the layout
+    // change while it loads.
+    var continueWatchingHasHistory by remember { mutableStateOf<Boolean?>(null) }
+
     var sidebarCanFocus by remember { mutableStateOf(false) }
     var requestSidebarFocus by remember { mutableStateOf(false) }
     var requestSidebarReturnFocus by remember { mutableStateOf(false) }
@@ -436,6 +442,29 @@ fun HomeScreenComposeContent(
             Log.d("FOCUS_DEBUG", "🎯 continueWatchingRequester created: ${continueWatchingRequester.hashCode()}")
         }
 
+        // IS THE CONTINUE WATCHING PANEL ON SCREEN? It is composed only on the
+        // first shelf, and draws nothing when the profile has no watch history.
+        // Everything that moves focus INTO it asks this first and goes
+        // elsewhere when the answer is no -- a requester with nothing behind it
+        // swallows the key press and moves focus nowhere. A function, so a
+        // focusProperties lambda or an effect gets the answer at the moment it
+        // asks, not a value captured when it was composed.
+        fun continueWatchingShown(): Boolean =
+            startContent && isOnFirstShelf && continueWatchingHasHistory != false
+
+        // If the panel goes while it holds focus -- history cleared on the
+        // server, noticed by the refresh on returning to this screen -- hand
+        // focus to the shelf instead of letting it drop to the top of the page.
+        LaunchedEffect(continueWatchingHasHistory) {
+            if (continueWatchingHasHistory == false &&
+                lastFocusedTarget == SidebarReturnTarget.CONTINUE_WATCHING &&
+                !isSidebarFocused
+            ) {
+                kotlinx.coroutines.android.awaitFrame()
+                runCatching { tvLazyRowsSingleShelfFocusRequester.requestFocus() }
+            }
+        }
+
         LaunchedEffect(pendingFocusRequester) {
             pendingFocusRequester?.let { requester ->
                 kotlinx.coroutines.android.awaitFrame()
@@ -517,7 +546,9 @@ fun HomeScreenComposeContent(
                     SidebarReturnTarget.SEARCH_BAR -> trailerFrameFocusRequester.requestFocus()
                     SidebarReturnTarget.TRAILER -> trailerFrameFocusRequester.requestFocus()
                     SidebarReturnTarget.TRENDING -> trendingFrameFocusRequester.requestFocus()
-                    SidebarReturnTarget.CONTINUE_WATCHING -> continueWatchingRequester.requestFocus()
+                    SidebarReturnTarget.CONTINUE_WATCHING ->
+                        if (continueWatchingShown()) continueWatchingRequester.requestFocus()
+                        else tvLazyRowsSingleShelfFocusRequester.requestFocus()
                     SidebarReturnTarget.MOVIES -> moviesToggleButtonFocusRequester.requestFocus()
                     SidebarReturnTarget.TV_SHOWS -> tvShowsToggleButtonFocusRequester.requestFocus()
                     SidebarReturnTarget.ANIME -> animeToggleButtonFocusRequester.requestFocus()
@@ -652,7 +683,10 @@ fun HomeScreenComposeContent(
                         .onFocusChanged { if (it.hasFocus) lastFocusedTarget = SidebarReturnTarget.TRENDING }
                         .focusProperties {
                             left = trailerFrameFocusRequester
-                            down = continueWatchingRequester
+                            // Straight down to the shelf when there is no panel --
+                            // the first shelf then runs underneath this frame.
+                            down = if (continueWatchingShown()) continueWatchingRequester
+                                   else tvLazyRowsSingleShelfFocusRequester
                         }
                         .onPreviewKeyEvent { event ->
                             if (event.type == KeyEventType.KeyDown) {
@@ -706,6 +740,11 @@ fun HomeScreenComposeContent(
                         onNavigateLeft = {
                             tvLazyRowsSingleShelfFocusRequester.requestFocus()
                         },
+                        // Composed even when the profile has no history, so it keeps
+                        // loading (and refreshing on every return here) -- it just
+                        // draws nothing, and this is how the screen finds out.
+                        onHistoryKnown = { hasHistory -> continueWatchingHasHistory = hasHistory },
+                        knownHasHistory = continueWatchingHasHistory,
                     )
                 }
             }
@@ -777,7 +816,8 @@ fun HomeScreenComposeContent(
                 // unfocusable, so RIGHT from TV SHOWS must skip it and land on
                 // Continue Watching instead.
                 rightNeighbor = if (selectedTab == CatalogTab.ANIME) {
-                    continueWatchingRequester
+                    // With no panel there is nothing to the right; stay put.
+                    if (continueWatchingShown()) continueWatchingRequester else FocusRequester.Cancel
                 } else {
                     animeToggleButtonFocusRequester
                 },
@@ -802,7 +842,9 @@ fun HomeScreenComposeContent(
                 } else {
                     tvShowsToggleButtonFocusRequester
                 },
-                rightNeighbor = continueWatchingRequester,
+                // With no panel there is nothing to the right; stay put.
+                rightNeighbor = if (continueWatchingShown()) continueWatchingRequester
+                                else FocusRequester.Cancel,
                 onSelect = {
                     radioParkingEnabled = true
                     radioParkingRequester.requestFocus()
@@ -840,6 +882,7 @@ fun HomeScreenComposeContent(
                     },
                     profileId = profileId,
                     onFirstPageReady = { firstShelfDataReady = true },
+                    reserveContinueWatching = continueWatchingHasHistory != false,
                 )
             }
 
@@ -869,6 +912,7 @@ fun HomeScreenComposeContent(
                         Log.d("HOME", "📺 TV first shelf status: $isFirst")
                     },
                     profileId = profileId,
+                    reserveContinueWatching = continueWatchingHasHistory != false,
                 )
             }
 
@@ -898,6 +942,7 @@ fun HomeScreenComposeContent(
                         Log.d("HOME", "🎌 Anime first shelf status: $isFirst")
                     },
                     profileId = profileId,
+                    reserveContinueWatching = continueWatchingHasHistory != false,
                 )
             }
             // ====================================================================================>

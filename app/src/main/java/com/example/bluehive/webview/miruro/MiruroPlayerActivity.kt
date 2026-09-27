@@ -76,6 +76,7 @@ class MiruroPlayerActivity : ComponentActivity() {
 
     private var player: ExoPlayer? = null
     private var playerView: PlayerView? = null
+    private var stallWatchdogJob: kotlinx.coroutines.Job? = null
 
     // Watch history is written from HERE, on confirmed playback, rather than by the
     // details screen when it launched us — see onIsPlayingChanged below. One row per
@@ -411,10 +412,15 @@ class MiruroPlayerActivity : ComponentActivity() {
                 lastExtractedM3u8 = body.m3u8
                 Log.e(sCRAPE, "[recovery] fresh manifest, resuming at ${resumeAt}ms")
                 player?.apply {
+                    // Carry the pause across the swap, the same way resumeAt
+                    // carries the position. Forcing true here restarts an
+                    // episode the user had stopped, purely because its URL
+                    // needed replacing.
+                    val wasPlaying = playWhenReady
                     setMediaSource(buildMediaSource(body.m3u8))
                     prepare()
                     if (resumeAt > 0) seekTo(resumeAt)
-                    playWhenReady = true
+                    playWhenReady = wasPlaying
                 }
             }
         }
@@ -462,7 +468,7 @@ class MiruroPlayerActivity : ComponentActivity() {
             // Same diagnostics + deadlock recovery as HlsPlayerActivity: the
             // wedge is in the box's display stack, so it is not site-specific.
             ExoPlayerConfig.attachPlaybackLog(this, sCRAPE)
-            ExoPlayerConfig.attachStallWatchdog(this, lifecycleScope, sCRAPE)
+            stallWatchdogJob = ExoPlayerConfig.attachStallWatchdog(this, lifecycleScope, sCRAPE)
             addListener(object : Player.Listener {
                 override fun onPlayerError(error: PlaybackException) {
                     Log.e(sCRAPE, "❌ ExoPlayer failed for url=$url", error)
@@ -531,10 +537,14 @@ class MiruroPlayerActivity : ComponentActivity() {
                                 return@launch
                             }
                             player?.apply {
+                                // Same rule as the manifest swap above: a relay
+                                // switch changes where the bytes come from, not
+                                // whether the user wanted to be watching.
+                                val wasPlaying = playWhenReady
                                 setMediaSource(buildMediaSource(granted))
                                 prepare()
                                 if (resumeAt > 0) seekTo(resumeAt)
-                                playWhenReady = true
+                                playWhenReady = wasPlaying
                             }
                         }
                     } else {
@@ -940,14 +950,32 @@ class MiruroPlayerActivity : ComponentActivity() {
         Log.d(sCRAPE, "⏩ channel-key seek: ${current}ms → ${target}ms (Δ${deltaMs}ms)")
     }
 
+    /**
+     * Was playback running when this activity last went to the background?
+     *
+     * onResume used to call play() unconditionally, so any trip through the
+     * background resumed an episode the user had deliberately paused — the
+     * television's ten-minute daydream being the trigger guaranteed to cause
+     * one. Identical defect and identical fix in HlsPlayerActivity; see the
+     * longer note on the field there.
+     *
+     * playWhenReady, NOT isPlaying: isPlaying is briefly false mid-buffer, so
+     * pausing during a stall would leave this false and the episode would stay
+     * paused on return.
+     */
+    private var wasPlayingBeforePause = false
+
     override fun onPause() {
         super.onPause()
+        // Recorded BEFORE pausing, or we would always read false.
+        wasPlayingBeforePause = player?.playWhenReady == true
         player?.pause()
     }
 
     override fun onResume() {
         super.onResume()
-        player?.play()
+        // Only resume what WE paused. An episode the user stopped stays stopped.
+        if (wasPlayingBeforePause) player?.play()
     }
 
     override fun onDestroy() {
@@ -965,6 +993,8 @@ class MiruroPlayerActivity : ComponentActivity() {
     }
 
     private fun releasePlayer() {
+        stallWatchdogJob?.cancel()
+        stallWatchdogJob = null
         playerView?.player = null
         playerView = null
         player?.run {

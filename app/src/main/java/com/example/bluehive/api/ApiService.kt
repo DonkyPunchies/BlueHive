@@ -235,6 +235,16 @@ data class ProfileResponse(
     val created_at:           String,
     val updated_at:           String,
     val last_login_at:        String? = null,
+    // The SUBSCRIPTION seat of the account that owns this profile: "owner",
+    // "member", or null when that account has no seat (a sideload) or has not
+    // reported one. Only /profiles/household fills it in. Drives the frame
+    // colour on the picker, never what the profile may be used for.
+    val seat:                 String? = null,
+    // Which ACCOUNT on the subscription made this profile: 0 is the owner,
+    // members follow in the order they joined. The same number on every TV in
+    // the household, so the same person's profiles get the same colour dot
+    // everywhere. Null outside /profiles/household.
+    val account_key:          Int?    = null,
 )
 
 data class DeletedProfileResponse(
@@ -242,6 +252,41 @@ data class DeletedProfileResponse(
     val display_name: String,
     val avatar_url:   String?,
     val deleted_at:   String,
+)
+
+/**
+ * Whether this TV may create another profile, and which limit stops it.
+ *
+ * TWO LIMITS APPLY AND THEY ARE NOT THE SAME NUMBER. `device_limit` is how many
+ * profiles THIS paired device may create; `account_limit` is the ceiling across
+ * every device on the account. An admin seat pairs up to four devices, a member
+ * seat one, so the same per-device number yields a different account total for
+ * each — which is exactly why the server sends both instead of the client
+ * hardcoding either.
+ *
+ * `can_create` already combines them. Branch on it; use the counts only to
+ * explain WHY, because the remedy differs: an exhausted account needs a profile
+ * deleted, an exhausted device needs a different TV.
+ */
+/**
+ * Every profile on the subscription, split by what this account may do with it.
+ *
+ * TWO LISTS, NOT ONE FLAGGED LIST. `own` can be entered, renamed, re-avatared
+ * and deleted; `others` belong to another account on the same licence and can
+ * only be renamed. Keeping them apart means the UI cannot forget to check a
+ * boolean and offer the wrong thing — the affordances differ, so the shapes do.
+ */
+data class HouseholdProfilesResponse(
+    val own:    List<ProfileResponse>,
+    val others: List<ProfileResponse>,
+)
+
+data class ProfileQuotaResponse(
+    val account_limit: Int,
+    val account_used:  Int,
+    val device_limit:  Int,
+    val device_used:   Int,
+    val can_create:    Boolean,
 )
 
 
@@ -858,6 +903,18 @@ interface BluehiveApiService {
 
     @GET("/api/bluehive/profiles")
     suspend fun listProfiles(): List<ProfileResponse>
+
+    /** Own profiles plus everyone else's on the same subscription licence.
+     *  Separate from [listProfiles], which returns only what this account may
+     *  ENTER — a distinction the picker depends on. 404s against a backend that
+     *  predates it, so callers fall back to [listProfiles]. */
+    @GET("/api/bluehive/profiles/household")
+    suspend fun getHousehold(): HouseholdProfilesResponse
+
+    /** Asked alongside [listProfiles] — the profile list alone cannot tell the
+     *  screen whether THIS device still has room, only how full the account is. */
+    @GET("/api/bluehive/profiles/quota")
+    suspend fun getProfileQuota(): ProfileQuotaResponse
 
     @POST("/api/bluehive/profiles")
     suspend fun createProfile(

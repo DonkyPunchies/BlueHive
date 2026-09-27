@@ -873,6 +873,40 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
         HostEntitlementRelay.init(this)
 
         EntitlementLockBus.register {
+            // RAISE IT OVER OURSELVES ONLY, NEVER OVER THE HOST.
+            //
+            // ServiceLockoutActivity.launch() starts a full-screen activity from
+            // the application context with NEW_TASK|CLEAR_TASK, and nothing about
+            // that is scoped to BlueHive being on screen. The ApiClient
+            // interceptor feeding this bus runs on EVERY response, background
+            // calls included, so a blocked account turned closing BlueHive into a
+            // lock screen thrown over whatever the user opened next.
+            //
+            // MEASURED 2026-09-25: /api/android/background — the call this app
+            // makes as it is being closed — was refused 403 entitlement_inactive
+            // at 23:18:26 and again at 23:20:25, and this lock screen appeared on
+            // top of Off Grid Drive until the host raised its own HostInactive
+            // screen over it. The user saw BlueHive's "Connection trouble" inside
+            // a different app.
+            //
+            // DEFERRING COSTS NOTHING. applyStanding() has already persisted the
+            // verdict before it posts here, AuthActivity gates on isLockedOut()
+            // at launch, and the bus announces on every locked report rather than
+            // only on the transition into it — so the next report made while we
+            // are genuinely on screen puts the lock up. Suppressed here means
+            // delayed until we are the thing being looked at, never dropped. That
+            // also covers the restored-task hole applyStanding documents: a task
+            // restored straight to the home screen HAS a foreground activity, so
+            // it still locks.
+            //
+            // foregroundActivity only — deliberately not the lastKnownActivity
+            // fallback performClose uses, because a remembered activity is
+            // exactly the backgrounded case this has to refuse.
+            if (foregroundActivity?.get() == null) {
+                Log.w(TAG, "🔒 host standing inactive while off screen — " +
+                        "verdict saved, lock deferred to next launch")
+                return@register
+            }
             Log.w(TAG, "🔒 host standing inactive — closing app to the lock screen")
             ServiceLockoutActivity.launch(this@BlueHiveApplication)
         }

@@ -42,14 +42,31 @@ object DeviceIdentity {
     private const val TAG = "DeviceIdentity"
     private const val KEY_ALIAS = "bluehive_device_key"
 
+    // Where the fallback fingerprint is kept once minted. Its own file rather
+    // than the session store, because it has to outlive a sign-out: the whole
+    // point is that the same hardware is recognised as the same device the next
+    // time somebody signs in on it.
+    private const val FALLBACK_PREFS = "bluehive_device_identity"
+    private const val FALLBACK_KEY   = "fallback_fingerprint"
+
     /**
      * Stable per device + per signing key, survives reinstall, changes on factory
      * reset. Scoped to our signing key since Android 8, so no other developer's
      * app sees the same value.
      *
-     * Falls back to a random value only if ANDROID_ID is unreadable — that value
-     * will NOT survive a reinstall, which is a degraded but functional state:
-     * the user simply looks like a new device next time.
+     * Falls back to a random value only if ANDROID_ID is unreadable. That value
+     * is PERSISTED, and the difference is not cosmetic: the fingerprint is what
+     * the backend keys bluehive.devices on, one row per (user, fingerprint), and
+     * a device row is what owns a share of the per-device profile quota. Minting
+     * a fresh UUID per call — which this did until 2026-09-20 — meant a TV with
+     * an unusable ANDROID_ID got a NEW device row on every single sign-in, and
+     * with it a fresh allowance of profiles, without limit. It also scattered
+     * that one television across the account's device list as a pile of
+     * strangers.
+     *
+     * Persisted, the fallback survives sign-out and app restarts and dies with
+     * the app's data — so a reinstall still looks like a new device, which is
+     * the documented and acceptable degradation.
      */
     @SuppressLint("HardwareIds")
     fun fingerprint(context: Context): String {
@@ -61,10 +78,28 @@ object DeviceIdentity {
             // That literal is a well-known buggy constant shipped by a batch of
             // early devices, where every unit reported the same ANDROID_ID.
             // Treating it as unique would merge unrelated TVs into one device row.
-            Log.w(TAG, "ANDROID_ID unusable — falling back to a non-persistent id")
-            return "fallback-" + java.util.UUID.randomUUID().toString()
+            return persistentFallback(context)
         }
         return id
+    }
+
+    /**
+     * The stored fallback id, minted once on first need.
+     *
+     * Not synchronized: two threads racing here would each write a UUID and the
+     * last one wins, which costs one spurious device row exactly once in the
+     * life of an install — far cheaper than holding a lock on a path that runs
+     * during sign-in. Any later read returns whichever value landed.
+     */
+    private fun persistentFallback(context: Context): String {
+        val prefs = context.getSharedPreferences(FALLBACK_PREFS, Context.MODE_PRIVATE)
+        prefs.getString(FALLBACK_KEY, null)?.let { stored ->
+            if (stored.isNotBlank()) return stored
+        }
+        val minted = "fallback-" + java.util.UUID.randomUUID().toString()
+        prefs.edit().putString(FALLBACK_KEY, minted).apply()
+        Log.w(TAG, "ANDROID_ID unusable — minted a persistent fallback id")
+        return minted
     }
 
     /**

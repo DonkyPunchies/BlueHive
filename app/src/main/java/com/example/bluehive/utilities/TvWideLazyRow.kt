@@ -38,6 +38,15 @@ import androidx.compose.ui.graphics.graphicsLayer
 // NEVER DELETE ANY OF MY COMMENTS!!!!
 // You are not actually moving between two separate rows in the focus system. You’re swapping the same TvWideLazyRow() instance between POPULAR and TOP_RATED
 
+/**
+ * The size every shelf row takes: its viewport, and where its right-hand frame
+ * pieces sit. The home screen's first shelf narrows these to leave room for the
+ * Continue Watching panel, and returns to exactly these when that panel is not
+ * shown -- so it is the same width as every row below it.
+ */
+val TV_WIDE_ROW_VIEWPORT_WIDTH: Dp = 850.dp
+val TV_WIDE_ROW_RIGHT_BODY_X: Dp   = 816.dp
+
 @Composable
 fun TvWideLazyRow(
 
@@ -62,7 +71,20 @@ fun TvWideLazyRow(
     onRequestPreviousPage: () -> Unit = {},
     onRequestNextPage: () -> Unit = {},
     onFocusChanged: (absoluteIndex: Int, tmdbId: Int) -> Unit = { _, _ -> },
-    pendingFocusTmdbId: Int = -1,
+    /**
+     * The card to restore focus to, READ LAZILY.
+     *
+     * Was a plain Int. The tracker behind it is a snapshot state map that
+     * ShelfStack writes on every focus change, so passing the value here
+     * subscribed this row's composition to it: every D-pad press recomposed the
+     * whole row. Worse, it keyed the restoration LaunchedEffect below, so each
+     * press also cancelled and relaunched that effect, which scans the item list
+     * and issues a focus request on a card that already has focus.
+     *
+     * As a lambda the read happens inside the effects that actually need it,
+     * where it is not a composition subscription.
+     */
+    pendingFocusTmdbId: () -> Int = { -1 },
     // Bumped by ShelfStack (via the unified tracker) when THIS shelf becomes
     // the focused shelf and should move card focus to its saved card.
     cardFocusEpoch: Int = 0,
@@ -82,7 +104,7 @@ fun TvWideLazyRow(
     sectionHeight: Dp = 250.dp,
     titleOffsetX: Dp = (-29).dp,
     titleOffsetY: Dp = (-48).dp,
-    viewportWidth: Dp = 850.dp,
+    viewportWidth: Dp = TV_WIDE_ROW_VIEWPORT_WIDTH,
     viewportHeight: Dp = 218.dp,
     viewportOffsetX: Dp = (-20).dp,
     viewportOffsetY: Dp = (-40).dp,
@@ -91,11 +113,11 @@ fun TvWideLazyRow(
     contentPaddingEnd: Dp = 15.dp,
     leftLowerBodyOffsetX: Dp = (-7.9).dp,
     leftLowerBodyOffsetY: Dp = (-32.5).dp,
-    rightLowerBodyOffsetX: Dp = (816).dp,
+    rightLowerBodyOffsetX: Dp = TV_WIDE_ROW_RIGHT_BODY_X,
     rightLowerBodyOffsetY: Dp = (-32.5).dp,
     leftUpperBodyOffsetX: Dp = (-31).dp,
     leftUpperBodyOffsetY: Dp = (-46).dp,
-    rightUpperBodyOffsetX: Dp = 816.dp,
+    rightUpperBodyOffsetX: Dp = TV_WIDE_ROW_RIGHT_BODY_X,
     rightUpperBodyOffsetY: Dp = (-46).dp,
 
     navigationCooldownMs: Long = 120L,
@@ -465,7 +487,11 @@ fun TvWideLazyRow(
 
 
 
-    LaunchedEffect(pendingFocusTmdbId, items.size) {
+    // KEYED ON THE LIST, NOT THE FOCUSED CARD. The comment below says what this
+    // effect is for: putting focus back after pagination changes the list. The
+    // focused card was never a reason to re-run it, and keying on it made it fire
+    // on every press instead of on the rare event it was written for.
+    LaunchedEffect(items.size) {
         // If this row is not the focused shelf, do nothing.  This guard is
         // essential for the POPULAR row specifically: when navigating DOWN
         // from POPULAR, onFirstShelfChanged(false) flips showContinueWatching
@@ -477,11 +503,12 @@ fun TvWideLazyRow(
         // in-session pagination restoration while the row is already focused.
         if (!isFocusedShelf) return@LaunchedEffect
 
-        if (pendingFocusTmdbId > 0 && items.isNotEmpty()) {
-            val targetIndex = items.indexOfFirst { it.tmdbId == pendingFocusTmdbId }
+        val pending = pendingFocusTmdbId()
+        if (pending > 0 && items.isNotEmpty()) {
+            val targetIndex = items.indexOfFirst { it.tmdbId == pending }
             if (targetIndex >= 0) {
                 pendingReentryFix = false
-                Log.d("PAGING", "🎯 Restoring focus to tmdbId $pendingFocusTmdbId at new index $targetIndex")
+                Log.d("PAGING", "🎯 Restoring focus to tmdbId $pending at new index $targetIndex")
 
                 kotlinx.coroutines.android.awaitFrame()
                 kotlinx.coroutines.android.awaitFrame()
@@ -511,8 +538,9 @@ fun TvWideLazyRow(
         // Which card: the saved one (by tmdbId, survives pagination), else
         // the current focusedIndex, else card 0.
         val target = run {
-            if (pendingFocusTmdbId > 0) {
-                val byTmdb = items.indexOfFirst { it.tmdbId == pendingFocusTmdbId }
+            val pending = pendingFocusTmdbId()
+            if (pending > 0) {
+                val byTmdb = items.indexOfFirst { it.tmdbId == pending }
                 if (byTmdb >= 0) return@run byTmdb
             }
             focusedIndex.coerceAtLeast(0).coerceAtMost(items.lastIndex)
@@ -579,8 +607,9 @@ fun TvWideLazyRow(
         // tracker's tmdbId is the trustworthy source — the ShelfStack
         // restoration lock guarantees it wasn't corrupted during handoff.
         val target = run {
-            if (pendingFocusTmdbId > 0) {
-                val byTmdbId = items.indexOfFirst { it.tmdbId == pendingFocusTmdbId }
+            val pending = pendingFocusTmdbId()
+            if (pending > 0) {
+                val byTmdbId = items.indexOfFirst { it.tmdbId == pending }
                 if (byTmdbId >= 0) return@run byTmdbId
             }
             focusedIndex.coerceIn(0, items.lastIndex)

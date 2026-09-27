@@ -14,6 +14,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
@@ -64,6 +65,8 @@ import com.example.bluehive.utilities.ModularButtonColors
 import com.example.bluehive.utilities.ModularButtonDimensions
 import com.example.bluehive.utilities.ModularButtonGlowConfig
 import com.example.bluehive.utilities.ModularButtonTextConfig
+import com.example.bluehive.utilities.NoticeContent
+import com.example.bluehive.utilities.NoticeOverlay
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import retrofit2.HttpException
@@ -76,7 +79,8 @@ import retrofit2.HttpException
 //  On success: POSTs to /api/bluehive/profiles and calls setResult(RESULT_OK)
 //  so ProfileScreenActivity knows to refresh its profile grid.
 //
-//  On failure: shows a red overlay error message with a blurred background.
+//  On failure: raises the shared NoticeOverlay, which states the rule behind
+//  the refusal and stays up until the user dismisses it.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── Intent result extras — read by ProfileScreenActivity ─────────────────────
@@ -114,6 +118,61 @@ private val NAME_FIELD_GLOW_OFFSET_Y: Dp = (-22.8).dp
 
 /** Hard cap enforced both here and on the backend. */
 private const val PROFILE_NAME_MAX_CHARS = 20
+
+/**
+ * What the user reads when POST /api/bluehive/profiles fails.
+ *
+ * MATCHES ON THE SERVER'S `code`, NEVER ON ITS PROSE. Checked against
+ * `bluehive_plugin/profiles.py`:
+ *
+ *  - **409 means a limit, never a name clash.** On create it is the only failure
+ *    the handler raises itself, and it arrives as an object carrying a stable
+ *    code — `account_profile_cap` or `device_profile_quota` — plus the `limit`
+ *    that was hit. `create_profile` does not check for a duplicate display_name
+ *    at all, only `update_profile` does, and no unique index backs it. The old
+ *    code mapped a bare 409 to "A profile with that name already exists.", so it
+ *    fired precisely when the account was FULL and told the user to rename when
+ *    the remedy was to delete. Matching on the code is what stops that
+ *    recurring the next time the sentence changes.
+ *  - **403 is never a profile limit.** It is `entitlement_inactive` from
+ *    `bh_auth.require_user` — suspended account, revoked device, locked host.
+ *    ApiClient's interceptor normally catches it first and opens the lockout
+ *    screen; this is the wording for when this screen sees it anyway.
+ *
+ * The two limit messages come from [profileLimitNotice] rather than being
+ * written here, because ProfileScreen refuses the same two limits from the
+ * other direction — up front, off the quota endpoint — and the user should
+ * not get different words depending on which way they arrived.
+ */
+private fun createProfileError(e: HttpException): NoticeContent {
+    // errorBody() is a one-shot stream — read it once, here, or the second
+    // caller gets an empty body and every 409 collapses into one message.
+    val raw = runCatching { e.response()?.errorBody()?.string().orEmpty() }.getOrDefault("")
+    // FastAPI wraps the payload in "detail". The limits answer with an object
+    // carrying `code`; older handlers answer with a bare string.
+    val body  = runCatching { org.json.JSONObject(raw).opt("detail") }.getOrNull()
+                    as? org.json.JSONObject
+    val code  = body?.optString("code").orEmpty()
+    val limit = body?.optInt("limit", 0) ?: 0          // 0 reads as "don't quote a number"
+
+    return when {
+        code == "device_profile_quota" -> profileLimitNotice(ProfileLimit.Device, limit)
+        code == "account_profile_cap"  -> profileLimitNotice(ProfileLimit.Account, limit)
+
+        raw.contains("already exists", ignoreCase = true) ->
+            NoticeContent("A profile with that name already exists.")
+
+        e.code() == 403 -> NoticeContent(
+            title   = "This account isn't active right now.",
+            message = "Profiles can't be added while the subscription or this device is " +
+                      "inactive. Open the host app on this TV to check its status.",
+        )
+
+        else -> NoticeContent(
+            "Connection to the servers not available, please try again later...",
+        )
+    }
+}
 
 // ── Action button config ──────────────────────────────────────────────────────
 
@@ -301,7 +360,7 @@ fun ProfileCreationScreen() {
 
     // ── Submission state ──────────────────────────────────────────────────────
     var isSubmitting    by remember { mutableStateOf(false) }
-    var errorMessage    by remember { mutableStateOf<String?>(null) }
+    var errorMessage    by remember { mutableStateOf<NoticeContent?>(null) }
 
     // ── Focus requesters ──────────────────────────────────────────────────────
     val standardFocusRequester  = remember { FocusRequester() }
@@ -336,19 +395,28 @@ fun ProfileCreationScreen() {
     //   3. POST to /api/bluehive/profiles via platformApi (Bearer token auth).
     //   4. On HTTP 201: setResult(RESULT_OK) with the new profile extras, then finish().
     //      ProfileScreenActivity's onActivityResult refreshes its grid automatically.
-    //   5. On any failure (network, 409 name conflict, 403 device cap):
-    //      show the red error overlay — never silently swallow errors.
+    //   5. On any failure: show the red error overlay — never silently swallow
+    //      errors. The wording comes from [createProfileErrorMessage], which
+    //      maps the codes the backend ACTUALLY sends (see its doc comment).
     fun submitProfile() {
         if (isSubmitting) return
 
         // Client-side validation
         val trimmedName = profileName.trim()
         if (trimmedName.isEmpty()) {
-            errorMessage = "Please enter a profile name."
+            errorMessage = NoticeContent(
+                title   = "Please enter a profile name.",
+                message = "Up to 20 characters. You can rename the profile later "
+                          + "under Manage Profiles.",
+            )
             return
         }
         if (selectedAvatarRes == null) {
-            errorMessage = "Please choose a profile picture."
+            errorMessage = NoticeContent(
+                title   = "Please choose a profile picture.",
+                message = "Pick any avatar from the panel on the left. This can be "
+                          + "changed later under Manage Profiles.",
+            )
             return
         }
 
@@ -380,14 +448,12 @@ fun ProfileCreationScreen() {
 
             } catch (e: HttpException) {
                 isSubmitting = false
-                errorMessage = when (e.code()) {
-                    409  -> "A profile with that name already exists."
-                    403  -> "This device has reached the maximum number of profiles."
-                    else -> "Connection to the servers not available, please try again later..."
-                }
+                errorMessage = createProfileError(e)
             } catch (e: Exception) {
                 isSubmitting = false
-                errorMessage = "Connection to the servers not available, please try again later..."
+                errorMessage = NoticeContent(
+                    "Connection to the servers not available, please try again later...",
+                )
             }
         }
     }
@@ -733,35 +799,18 @@ fun ProfileCreationScreen() {
             )
 
             // ── Error overlay ─────────────────────────────────────────────────
-            // Shown on any backend or network failure.
-            // Semi-opaque dark background + bright red message, auto-dismisses
-            // after 4 seconds or when the user presses a button.
-            errorMessage?.let { msg ->
-                LaunchedEffect(msg) {
-                    delay(4_000)
-                    errorMessage = null
-                }
-
-                Box(
-                    contentAlignment = Alignment.Center,
-                    modifier         = Modifier
-                        .fillMaxSize()
-                        .background(Color(0xCC000000)), // 80% black scrim
-                ) {
-                    Text(
-                        text       = msg,
-                        color      = Color(0xFFFF2020),
-                        fontSize   = 18.sp,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = AppTypography.dongleBold,
-                        modifier   = Modifier
-                            .background(
-                                color  = Color(0x99000000),
-                                shape  = androidx.compose.foundation.shape.RoundedCornerShape(12.dp),
-                            )
-                            .padding(horizontal = 32.dp, vertical = 16.dp),
-                    )
-                }
+            // Every refusal on this screen, from an empty name field to a
+            // server limit, goes through the app-wide NoticeOverlay.
+            //
+            // IT USED TO BE A BARE Text THAT FADED AFTER FOUR SECONDS, and both
+            // halves of that were wrong. The Text had no width bound, so any
+            // message longer than a few words ran the full width of the screen
+            // and into overscan. The timer set up a race between reading and
+            // understanding: miss it and the only way back to the words was to
+            // repeat the action that failed. It now stays until the user
+            // dismisses it, with OK or with BACK.
+            errorMessage?.let { err ->
+                NoticeOverlay(err) { errorMessage = null }
             }
         }
     }
