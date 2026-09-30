@@ -524,6 +524,35 @@ data class ImdbIdResponse(
 )
 
 
+/**
+ * One English subtitle the backend can serve, WITHOUT its text.
+ *
+ * The cue count and timings are the whole reason this is a separate call from
+ * the .vtt itself. The picker shows "1666 lines · 1:33 … 2:01:55" so a viewer
+ * can spot the one cut for a different release, and those numbers can only be
+ * known by parsing the file — which is exactly what the client used to do to
+ * all eight of them, at a peak of 806MB on a 2GB box. Measured server-side
+ * once per title, it is six integers.
+ */
+data class SubtitleOption(
+    val id:           String = "",
+    val index:        Int    = 0,
+    val label:        String = "",
+    val cue_count:    Int    = 0,
+    val first_cue_ms: Long   = 0,
+    val last_cue_ms:  Long   = 0,
+)
+
+data class SubtitleListResponse(
+    val tmdb_id:    Int?    = null,
+    val media_type: String? = null,
+    val imdb_id:    String? = null,
+    val season:     Int?    = null,
+    val episode:    Int?    = null,
+    val options:    List<SubtitleOption> = emptyList(),
+)
+
+
 data class FavoriteRequest(
     val profile_id:    Int,
     val media_tmdb_id: Int,
@@ -835,6 +864,32 @@ interface BluehiveApiService {
         @Path("tmdb_id")     tmdbId:    Int,
         @Query("media_type") mediaType: String,
     ): ImdbIdResponse
+
+    // Subtitles, listed and converted server-side. The imdb resolution above is
+    // now done inside these two on the backend, so nothing here needs it first.
+    @GET("/api/subtitles")
+    suspend fun listSubtitles(
+        @Query("tmdb_id")    tmdbId:    Int,
+        @Query("media_type") mediaType: String,
+        @Query("season")     season:    Int = 0,
+        @Query("episode")    episode:   Int = 0,
+    ): SubtitleListResponse
+
+    /**
+     * One converted WebVTT, as text/vtt.
+     *
+     * ResponseBody rather than String because the converter on this client is
+     * JSON — handed a String it would try to parse a subtitle file as JSON and
+     * fail on the first cue. ResponseBody is passed through untouched.
+     */
+    @GET("/api/subtitles/vtt")
+    suspend fun getSubtitleVtt(
+        @Query("tmdb_id")    tmdbId:    Int,
+        @Query("id")         id:        String,
+        @Query("media_type") mediaType: String,
+        @Query("season")     season:    Int = 0,
+        @Query("episode")    episode:   Int = 0,
+    ): okhttp3.ResponseBody
 
     @GET("/api/bluehive/profiles/{profileId}/watch-history")
     suspend fun getWatchHistory(

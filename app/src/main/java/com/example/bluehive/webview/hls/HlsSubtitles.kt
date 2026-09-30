@@ -6,27 +6,36 @@ import com.example.bluehive.api.ApiClient
 import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.TimeUnit
 import java.util.zip.GZIPInputStream
 
 /**
- * Fetches an English subtitle for a movie by tmdb id and returns it as a local
- * WebVTT file that ExoPlayer can sideload. vaplayer ships NO captions, so we
- * source them ourselves:
+ * English subtitles for the sideloaded player. vaplayer ships none, so we source
+ * them ourselves — but almost none of that work happens here any more.
  *
- *   1. Our backend resolves the title's imdb_id from TMDB external_ids (keeps the
- *      TMDB key server-side): GET /api/media/{tmdb}/imdb.
- *   2. The keyless Stremio OpenSubtitles v3 addon lists English subs for that
- *      imdb_id (opensubtitles-v3.strem.io); we take the first English entry.
- *   3. Download the SRT (plain UTF-8), strip promo cues, convert SRT→VTT, cache it.
+ *   1. GET /api/subtitles lists the options WITH their cue count and timings.
+ *      A few hundred bytes. The backend resolved the imdb id, called the addon,
+ *      downloaded every candidate, converted SRT→VTT and measured the cues —
+ *      once, for every device that will ever ask.
+ *   2. When the viewer PICKS one, GET /api/subtitles/vtt fetches that single
+ *      file. One download, not eight.
+ *
+ * WHY THIS MOVED. The client used to do all of it, and MEASURED on the onn 4K
+ * box the picker peaked at 806MB (three verified trials, 8 options). The box has
+ * 2GB and the app idles near 200MB; at that peak the kernel starts killing
+ * processes, and on the session that surfaced it BlueHive was the one chosen,
+ * mid-film. The fan-out existed because the picker's metadata can only be known
+ * by parsing each file — so moving the parsing removes the fan-out by
+ * construction rather than by capping it.
+ *
+ * WHAT STAYED LOCAL, and why: the caption the STREAMING SITE ships. That URL
+ * comes out of the extractor per playback session, so no server-side cache can
+ * know it in advance. It is one file rather than eight, and it is the only
+ * reason srtToVtt/measureVtt/downloadSubtitle still exist below.
  *
  * Everything is best-effort: any failure returns null (no captions) and never
  * throws to the caller. Blocking — call from Dispatchers.IO.
- *
- * NOTE: we used OpenSubtitles' legacy REST first — it started 302-redirecting to a
- * broken host ("_") for everyone (they killed it), hence the Stremio addon.
  */
 object HlsSubtitles {
 
@@ -44,102 +53,6 @@ object HlsSubtitles {
             .build()
     }
 
-    /**
-     * Best-effort English subtitle for [tmdbId]. Returns the absolute path of a
-     * cached .vtt, or null if none could be found/built. Blocking (IO).
-     */
-    fun fetchEnglishVtt(
-        context: Context,
-        tmdbId: Int,
-        mediaType: String = "movie",
-        season: Int = 0,
-        episode: Int = 0,
-    ): String? {
-        val isSeries = mediaType.equals("tv", true) && season > 0 && episode > 0
-        // Cache key MUST include season/episode. It used to be tmdb-only, and for a
-        // series the tmdb id is the SHOW — so the first episode you ever watched
-        // cached its subtitle and every later episode was served that same file.
-        val key = if (isSeries) "${tmdbId}_s${season}e${episode}" else "$tmdbId"
-        // Reuse this session's cached VTT — avoids re-hitting OpenSubtitles (which
-        // is IP rate-limited) when the same title is replayed.
-        val cached = File(context.cacheDir, "vidapi_sub_${key}_en.vtt")
-        if (cached.exists() && cached.length() > 32) {
-            Log.d(TAG, "subs: cache hit → ${cached.absolutePath}")
-            return cached.absolutePath
-        }
-        return try {
-            val imdb = resolveImdbId(tmdbId, if (isSeries) "tv" else "movie")
-            if (imdb == null) { Log.w(TAG, "subs: no imdb for tmdb=$tmdbId"); return null }
-
-            val subUrl = findEnglishSubtitleUrl(imdb, isSeries, season, episode)
-            if (subUrl == null) { Log.w(TAG, "subs: no English sub for $imdb"); return null }
-
-            val srt = downloadSubtitle(subUrl)
-            if (srt.isNullOrBlank()) { Log.w(TAG, "subs: subtitle download failed"); return null }
-
-            val vtt = srtToVtt(srt)
-            val file = File(context.cacheDir, "vidapi_sub_${key}_en.vtt")
-            file.writeText(vtt, Charsets.UTF_8)
-            Log.d(TAG, "subs: cached English VTT (${vtt.length} chars) → ${file.absolutePath}")
-            file.absolutePath
-        } catch (e: Exception) {
-            Log.w(TAG, "subs: fetch failed: ${e.message}")
-            null
-        }
-    }
-
-    /**
-     * Cache a subtitle the EXTRACTOR captured from the streaming site itself.
-     *
-     * Preferred over [fetchEnglishVtt]: it's the caption the site ships for this
-     * exact release, so it's already in sync, and it needs no imdb lookup and no
-     * OpenSubtitles round-trip (which is IP rate-limited and, for episodes, often
-     * has nothing at all).
-     *
-     * Handles either format — VidFast serves WebVTT, but a site could hand us SRT,
-     * so we sniff the body rather than trusting the extension. Returns the absolute
-     * path of a cached .vtt, or null. Blocking (IO).
-     *
-     * @param key a stable per-title cache key (tmdb id + season/episode).
-     */
-    fun cacheStreamSubtitle(context: Context, url: String, key: String): String? {
-        val file = File(context.cacheDir, "stream_sub_${key}_en.vtt")
-        if (file.exists() && file.length() > 32) {
-            Log.d(TAG, "subs: stream-sub cache hit → ${file.absolutePath}")
-            return file.absolutePath
-        }
-        return try {
-            val body = downloadSubtitle(url)
-            if (body.isNullOrBlank()) { Log.w(TAG, "subs: stream subtitle download failed"); return null }
-            // WEBVTT header ⇒ already VTT; anything else we treat as SRT.
-            val vtt = if (body.trimStart().startsWith("WEBVTT")) body else srtToVtt(body)
-            file.writeText(vtt, Charsets.UTF_8)
-            Log.d(TAG, "subs: cached STREAM VTT (${vtt.length} chars) → ${file.absolutePath}")
-            file.absolutePath
-        } catch (e: Exception) {
-            Log.w(TAG, "subs: stream subtitle failed: ${e.message}")
-            null
-        }
-    }
-
-    /** imdb_id ("tt1979376") for a tmdb id, resolved by our backend (TMDB
-     *  external_ids server-side). Goes through the SAME Retrofit client that
-     *  fetches media details, so it reuses the app's working base URL + auth
-     *  rather than a hand-built URL. runBlocking is fine — we're on Dispatchers.IO. */
-    private fun resolveImdbId(tmdbId: Int, mediaType: String): String? = try {
-        // Was hardcoded to "movie". Asking TMDB for a MOVIE with a SERIES tmdb id
-        // returns someone else's title entirely — that is how a TV episode ended up
-        // looking up tt0030257, a 1938 film, and finding no subtitles.
-        val imdb = runBlocking {
-            ApiClient.bluehiveApi.getMediaImdb(tmdbId, mediaType).imdb_id
-        }?.trim()
-        Log.d(TAG, "subs: imdb for tmdb=$tmdbId → ${imdb ?: "none"}")
-        imdb?.takeIf { it.startsWith("tt") }
-    } catch (e: Exception) {
-        Log.w(TAG, "subs: imdb resolve failed for tmdb=$tmdbId — ${e.message}")
-        null
-    }
-
     // ── Choosing between several English subtitles ───────────────────────────
     //
     // OpenSubtitles lists MULTIPLE English subtitles per title (5 for a typical
@@ -153,38 +66,151 @@ object HlsSubtitles {
     //     23.976fps. In sync at the start, over a minute out by the end. NOT
     //     fixable with an offset; the only fix is picking a different subtitle.
     //
-    // The addon gives us no release name to choose by — an entry is just
-    // {id, url, lang, SubEncoding} — so we download the candidates and let the
-    // user pick from what they actually contain (cue count and time span, which
-    // is enough to spot a mistimed one against the episode's real runtime).
+    // The addon gives no release name to choose by, so the choice is made on what
+    // the files actually CONTAIN — cue count and time span, enough to spot a
+    // mistimed one against the episode's real runtime. That measurement is now
+    // the backend's job; what arrives here is already three integers per option.
 
-    /** One English subtitle as listed by the addon, before it's been downloaded. */
+    /** One English subtitle as offered by the backend. */
     data class EnglishOption(
         /** 1-based position in the English list — the only stable label available. */
         val index: Int,
+        /** The backend's id for this option; "stream" for the site's own caption. */
         val id: String,
+        /** Only set for the stream caption, which we fetch ourselves. */
         val url: String,
     )
 
-    /** An [EnglishOption] downloaded, converted to VTT and measured. */
+    /**
+     * An option with its measurements.
+     *
+     * [path] IS NULL UNTIL THE VIEWER PICKS IT. That is the whole point: a listed
+     * option costs nothing but a row, and only the chosen one is ever downloaded.
+     * The stream caption is the exception — it arrives already on disk, because
+     * fetching it is the only way to know whether it has any cues at all.
+     */
     data class SubtitleChoice(
         val option: EnglishOption,
         val label: String,
-        val path: String,
+        val path: String?,
         val cueCount: Int,
         val firstCueMs: Long,
         val lastCueMs: Long,
     )
 
     /**
-     * The caption the STREAMING SITE ships for this exact release, offered as
-     * index 0 so it sorts above the OpenSubtitles entries. It's the only one
-     * guaranteed to match the video frame-for-frame, so when a site gives us one
-     * it should always be the default pick. Blocking (IO).
+     * Every English subtitle the backend can offer, with metadata and no bodies.
+     * Empty on any failure. Blocking (IO).
+     *
+     * runBlocking is fine — callers are already on Dispatchers.IO, same as the
+     * imdb lookup this replaced.
      */
-    fun streamChoice(context: Context, url: String, key: String): SubtitleChoice? {
-        val path = cacheStreamSubtitle(context, url, key) ?: return null
-        val (count, first, last) = measureVtt(File(path).readText(Charsets.UTF_8))
+    fun listChoices(
+        tmdbId: Int,
+        mediaType: String,
+        season: Int = 0,
+        episode: Int = 0,
+    ): List<SubtitleChoice> = try {
+        val isSeries = mediaType.equals("tv", true) && season > 0 && episode > 0
+        val resp = runBlocking {
+            ApiClient.bluehiveApi.listSubtitles(
+                tmdbId = tmdbId,
+                mediaType = if (isSeries) "tv" else "movie",
+                season = if (isSeries) season else 0,
+                episode = if (isSeries) episode else 0,
+            )
+        }
+        val out = resp.options.map { o ->
+            SubtitleChoice(
+                option = EnglishOption(index = o.index, id = o.id, url = ""),
+                label = o.label.ifBlank { "English ${o.index}" },
+                path = null,
+                cueCount = o.cue_count,
+                firstCueMs = o.first_cue_ms,
+                lastCueMs = o.last_cue_ms,
+            )
+        }
+        Log.d(TAG, "subs: backend listed ${out.size} option(s) for tmdb=$tmdbId")
+        out
+    } catch (e: Exception) {
+        Log.w(TAG, "subs: backend listing failed for tmdb=$tmdbId — ${e.message}")
+        emptyList()
+    }
+
+    /**
+     * The local .vtt path for [choice], fetching it from the backend on first use.
+     *
+     * Called when the viewer picks an option, NOT when the picker opens. Streamed
+     * straight to disk rather than read into a String first — the file is small,
+     * but holding it in memory is the habit that made the old picker cost 806MB.
+     *
+     * @param key a stable per-title cache key (tmdb id + season/episode).
+     */
+    fun ensureVtt(
+        context: Context,
+        choice: SubtitleChoice,
+        tmdbId: Int,
+        mediaType: String,
+        season: Int,
+        episode: Int,
+        key: String,
+    ): String? {
+        choice.path?.let { return it }          // stream caption, already on disk
+
+        val safeId = choice.option.id.filter { it.isLetterOrDigit() }.take(40)
+        val file = File(context.cacheDir, "sub_${key}_$safeId.vtt")
+        if (file.exists() && file.length() > 32) {
+            Log.d(TAG, "subs: vtt cache hit → ${file.name}")
+            return file.absolutePath
+        }
+
+        return try {
+            val isSeries = mediaType.equals("tv", true) && season > 0 && episode > 0
+            runBlocking {
+                ApiClient.bluehiveApi.getSubtitleVtt(
+                    tmdbId = tmdbId,
+                    id = choice.option.id,
+                    mediaType = if (isSeries) "tv" else "movie",
+                    season = if (isSeries) season else 0,
+                    episode = if (isSeries) episode else 0,
+                ).byteStream().use { input ->
+                    file.outputStream().use { output -> input.copyTo(output) }
+                }
+            }
+            if (file.length() <= 32) {
+                Log.w(TAG, "subs: backend vtt was empty for ${choice.option.id}")
+                file.delete()
+                null
+            } else {
+                Log.d(TAG, "subs: fetched vtt ${file.length()} bytes → ${file.name}")
+                file.absolutePath
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "subs: vtt fetch failed for ${choice.option.id} — ${e.message}")
+            runCatching { file.delete() }
+            null
+        }
+    }
+
+    // ── The streaming site's own caption ─────────────────────────────────────
+    //
+    // Everything below exists ONLY for this one option. It is the caption the
+    // site ships for this exact release, so it is already in sync and is always
+    // the right default when a site provides one — but its URL is produced by the
+    // extractor per session, so the backend cannot have it in advance.
+
+    /**
+     * Offered as index 0 so it sorts above the backend's entries. Blocking (IO).
+     */
+    fun streamChoice(
+        context: Context,
+        url: String,
+        key: String,
+        sourceTag: String,
+    ): SubtitleChoice? {
+        val path = cacheStreamSubtitle(context, url, key, sourceTag) ?: return null
+        val text = File(path).readText(Charsets.UTF_8)
+        val (count, first, last) = measureVtt(text)
         if (count == 0) return null
         return SubtitleChoice(
             option = EnglishOption(0, "stream", url),
@@ -196,82 +222,92 @@ object HlsSubtitles {
         )
     }
 
-    /** Every English subtitle listed for this title. Empty on any failure. Blocking (IO). */
-    fun listEnglishOptions(
-        tmdbId: Int,
-        mediaType: String,
-        season: Int,
-        episode: Int,
-    ): List<EnglishOption> {
-        val isSeries = mediaType.equals("tv", true) && season > 0 && episode > 0
-        val imdb = resolveImdbId(tmdbId, if (isSeries) "tv" else "movie") ?: return emptyList()
-        val arr = listSubtitlesJson(imdb, isSeries, season, episode) ?: return emptyList()
-        val out = mutableListOf<EnglishOption>()
-        for (i in 0 until arr.length()) {
-            val o = arr.optJSONObject(i) ?: continue
-            if (o.optString("lang").lowercase() !in setOf("eng", "en", "english")) continue
-            val u = o.optString("url")
-            if (u.isNotBlank()) out += EnglishOption(out.size + 1, o.optString("id"), u)
-        }
-        // Cap it. An episode lists ~5 English subtitles, but a popular film can
-        // list dozens, and the picker downloads every option it's given — that
-        // would be a burst of concurrent requests at a service that rate-limits
-        // by IP, to fill a list nobody scrolls to the bottom of.
-        val capped = out.take(MAX_OPTIONS)
-        Log.d(
-            TAG,
-            "subs: ${arr.length()} listed for $imdb → ${out.size} English option(s)" +
-                if (out.size > capped.size) ", showing first ${capped.size}" else ""
-        )
-        return capped
-    }
-
-    private const val MAX_OPTIONS = 8
-
     /**
-     * Download + convert one option and measure it. Cached per option, so
-     * re-opening the picker or switching back is instant. Blocking (IO).
+     * Handles either format — VidFast serves WebVTT, but a site could hand us SRT,
+     * so we sniff the body rather than trusting the extension. Returns the absolute
+     * path of a cached .vtt, or null. Blocking (IO).
      *
-     * @param key the same per-title cache key used by [fetchEnglishVtt].
+     * @param key       a stable per-title cache key (tmdb id + season/episode).
+     * @param sourceTag WHICH SITE this caption came from, and it is not optional.
+     *
+     * The file name used to be "stream_sub_${key}_en.vtt" — per TITLE, with no
+     * site in it. Unlike the backend's entries, which are keyed by a provider id
+     * and really are the same file whoever you asked, this one is a different
+     * file per site: each site hosts its own encode and ships the caption that
+     * was cut for it. Sharing one name meant the cache-hit branch below handed
+     * VidNest the caption VidFast had already saved — a subtitle timed to a
+     * video the viewer was not watching, presented as "From this stream", and
+     * sticky until the cache was cleared. First site opened won, forever.
      */
-    fun downloadChoice(context: Context, option: EnglishOption, key: String): SubtitleChoice? {
-        val file = File(context.cacheDir, "vidapi_sub_${key}_en${option.index}.vtt")
-        val vtt = if (file.exists() && file.length() > 32) {
-            file.readText(Charsets.UTF_8)
-        } else {
-            val body = downloadSubtitle(option.url) ?: return null
-            val converted = if (body.trimStart().startsWith("WEBVTT")) body else srtToVtt(body)
-            file.writeText(converted, Charsets.UTF_8)
-            converted
+    fun cacheStreamSubtitle(
+        context: Context,
+        url: String,
+        key: String,
+        sourceTag: String,
+    ): String? {
+        val tag = sourceTag.lowercase().filter { it.isLetterOrDigit() }
+            .ifBlank { "src" }.take(24)
+        val file = File(context.cacheDir, "stream_sub_${key}_$tag.vtt")
+        if (file.exists() && file.length() > 32) {
+            Log.d(TAG, "subs: stream-sub cache hit → ${file.absolutePath}")
+            return file.absolutePath
         }
-        val (count, first, last) = measureVtt(vtt)
-        if (count == 0) { Log.w(TAG, "subs: option ${option.index} had no cues"); return null }
-        Log.d(TAG, "subs: option ${option.index} → $count cues, ${first}ms..${last}ms")
-        return SubtitleChoice(
-            option = option,
-            label = "English ${option.index}",
-            path = file.absolutePath,
-            cueCount = count,
-            firstCueMs = first,
-            lastCueMs = last,
-        )
+        return try {
+            val body = downloadSubtitle(url)
+            if (body.isNullOrBlank()) { Log.w(TAG, "subs: stream subtitle download failed"); return null }
+            // WEBVTT header ⇒ already VTT; anything else we treat as SRT.
+            val vtt = if (body.trimStart().startsWith("WEBVTT")) body else srtToVtt(body)
+            file.writeText(vtt, Charsets.UTF_8)
+            // Nothing will ever read the old per-title name again, so drop it as
+            // we pass rather than leaving ~100KB of it per title watched. Guarded
+            // on the name: a source tagged "en" would otherwise delete the file
+            // written on the line above.
+            if (tag != "en") {
+                runCatching { File(context.cacheDir, "stream_sub_${key}_en.vtt").delete() }
+            }
+            Log.d(TAG, "subs: cached STREAM VTT (${vtt.length} chars) → ${file.absolutePath}")
+            file.absolutePath
+        } catch (e: Exception) {
+            Log.w(TAG, "subs: stream subtitle failed: ${e.message}")
+            null
+        }
     }
 
-    private val CUE_TIME = Regex(
-        "(\\d{2}):(\\d{2}):(\\d{2})[.,](\\d{3})\\s*-->\\s*(\\d{2}):(\\d{2}):(\\d{2})[.,](\\d{3})"
-    )
+    // ── NO REGEX BELOW THIS LINE, AND THAT IS THE WHOLE POINT ────────────────
+    //
+    // MEASURED on the onn 4K box with Debug.getNativeHeapAllocatedSize() read
+    // either side of every statement in this path, on a 125KB subtitle:
+    //
+    //     downloadSubtitle  ........      +0KB
+    //     body.bytes()      ........      +0KB
+    //     gunzip branch     ........      +0KB
+    //     String(bytes)     ........      +1KB
+    //     srtToVtt          ........ +103171KB     <-- Regex.replace
+    //     measureVtt        ........  +22137KB     <-- Regex.findAll
+    //
+    // 125MB of native heap to convert and measure 125KB of text. The network was
+    // free; the parsing was not.
+    //
+    // WHY IT WAS NATIVE, which is what made it so hard to find: on Android
+    // java.util.regex is a JNI wrapper over ICU4C, so Kotlin's Regex allocates in
+    // native ICU buffers rather than on the Java heap. Every earlier hunt through
+    // Dalvik, GL mtrack and the codec pools came up empty for exactly that reason
+    // — dumpsys showed Native Heap climbing while every Java-side figure sat flat.
+    //
+    // Both jobs are ordinary character scanning. Neither needs a regex engine,
+    // and a subtitle is the worst possible input for one: a six-figure character
+    // count with thousands of matches.
 
     /** (cue count, first cue start, last cue end) — enough to spot a mistimed file. */
     private fun measureVtt(vtt: String): Triple<Int, Long, Long> {
         var count = 0
         var first = Long.MAX_VALUE
         var last = 0L
-        fun ms(h: String, m: String, s: String, milli: String) =
-            h.toLong() * 3_600_000 + m.toLong() * 60_000 + s.toLong() * 1_000 + milli.toLong()
-        CUE_TIME.findAll(vtt).forEach { mr ->
-            val g = mr.groupValues
-            val start = ms(g[1], g[2], g[3], g[4])
-            val end = ms(g[5], g[6], g[7], g[8])
+        for (line in vtt.lineSequence()) {
+            val arrow = line.indexOf("-->")
+            if (arrow < 0) continue
+            val start = parseTimestamp(line, 0, arrow) ?: continue
+            val end = parseTimestamp(line, arrow + 3, line.length) ?: continue
             count++
             if (start < first) first = start
             if (end > last) last = end
@@ -279,54 +315,31 @@ object HlsSubtitles {
         return Triple(count, if (first == Long.MAX_VALUE) 0L else first, last)
     }
 
-    /** First English subtitle URL from the Stremio OpenSubtitles v3 addon (keyless,
-     *  keyed by full imdb id incl. leading zeros). Returns a direct SRT URL. */
-    private fun findEnglishSubtitleUrl(
-        imdb: String,
-        isSeries: Boolean = false,
-        season: Int = 0,
-        episode: Int = 0,
-    ): String? {
-        val arr = listSubtitlesJson(imdb, isSeries, season, episode) ?: return null
-        var englishUrl: String? = null
-        for (i in 0 until arr.length()) {
-            val o = arr.optJSONObject(i) ?: continue
-            val lang = o.optString("lang").lowercase()
-            if (lang == "eng" || lang == "en" || lang == "english") {
-                val u = o.optString("url")
-                if (u.isNotBlank()) { englishUrl = u; break }
-            }
+    /**
+     * First "HH:MM:SS.mmm" (or ",mmm") in [from, to), as milliseconds, or null.
+     *
+     * Validates the separators as well as the digits so a stray number in a line
+     * of dialogue cannot be mistaken for a cue time — the old regex was strict
+     * about shape, and this has to be too.
+     */
+    private fun parseTimestamp(s: String, from: Int, to: Int): Long? {
+        var i = from
+        while (i < to && (s[i] < '0' || s[i] > '9')) i++
+        if (i + 12 > to) return null
+        if (s[i + 2] != ':' || s[i + 5] != ':') return null
+        val sep = s[i + 8]
+        if (sep != '.' && sep != ',') return null
+        var value = 0L
+        for (offset in intArrayOf(0, 1, 3, 4, 6, 7, 9, 10, 11)) {
+            val c = s[i + offset]
+            if (c < '0' || c > '9') return null
         }
-        Log.d(TAG, "subs: $imdb → ${arr.length()} subs listed, english=${englishUrl != null}")
-        if (englishUrl == null) Log.w(TAG, "subs: no English subtitle among ${arr.length()} for $imdb")
-        return englishUrl
-    }
-
-    /** The addon's raw "subtitles" array for a title, or null. */
-    private fun listSubtitlesJson(
-        imdb: String,
-        isSeries: Boolean,
-        season: Int,
-        episode: Int,
-    ): org.json.JSONArray? {
-        // The addon addresses episodes as series/{imdb}:{season}:{episode}. Asking
-        // the /movie/ endpoint for a series imdb id lists nothing, which is why TV
-        // episodes never had captions even when OpenSubtitles has plenty.
-        val path = if (isSeries) "series/$imdb:$season:$episode" else "movie/$imdb"
-        val body = get("https://opensubtitles-v3.strem.io/subtitles/$path.json", BROWSER_UA, null)
-        if (body == null) {
-            Log.w(TAG, "subs: subtitle listing failed (no body) for $path")
-            return null
-        }
-        val arr = try { JSONObject(body).optJSONArray("subtitles") } catch (e: Exception) {
-            Log.w(TAG, "subs: subtitle listing not parseable for $imdb (${e.message}); starts: ${body.take(120)}")
-            return null
-        }
-        if (arr == null || arr.length() == 0) {
-            Log.w(TAG, "subs: no subtitles listed for $imdb")
-            return null
-        }
-        return arr
+        fun d(k: Int) = (s[i + k] - '0')
+        value += (d(0) * 10 + d(1)) * 3_600_000L
+        value += (d(3) * 10 + d(4)) * 60_000L
+        value += (d(6) * 10 + d(7)) * 1_000L
+        value += (d(9) * 100 + d(10) * 10 + d(11)).toLong()
+        return value
     }
 
     /** Download a subtitle. Stremio serves plain UTF-8 SRT, but we stay defensive
@@ -345,32 +358,43 @@ object HlsSubtitles {
                 catch (e: Exception) { Log.w(TAG, "subs: gunzip failed: ${e.message}"); return null }
             } else raw
             Log.d(TAG, "subs: subtitle downloaded ${bytes.size} bytes")
-            return String(bytes, Charsets.UTF_8)
+            val s = String(bytes, Charsets.UTF_8)
+            return s
         }
     }
 
-    private fun get(url: String, ua: String, referer: String?): String? {
-        val b = Request.Builder().url(url).header("User-Agent", ua)
-        if (referer != null) b.header("Referer", referer)
-        http.newCall(b.build()).execute().use { resp ->
-            if (!resp.isSuccessful) {
-                Log.w(TAG, "subs: GET http=${resp.code} for ${url.take(90)}")
-                return null
-            }
-            return resp.body?.string()
-        }
-    }
-
-    /** Minimal SRT→WebVTT: fix timestamp separators, drop the OpenSubtitles promo cues. */
+    /**
+     * Minimal SRT→WebVTT: fix timestamp separators, drop the OpenSubtitles promo
+     * cues. Same output as the regex version it replaced — see the note above
+     * measureVtt for why that version cost 103MB.
+     *
+     * The comma→dot swap is applied only to lines containing "-->", which is both
+     * cheaper and safer than the old pattern: a line of dialogue can no longer be
+     * rewritten just because it happens to contain something timestamp-shaped.
+     *
+     * String.replace(String, String) and String.split(String) are LITERAL in
+     * Kotlin, not regex, so the three below are ordinary scans and stay.
+     */
     private fun srtToVtt(srt: String): String {
-        val cleaned = srt.replace("﻿", "")                 // strip BOM
+        val cleaned = srt.replace("﻿", "")            // strip BOM
             .replace("\r\n", "\n").replace("\r", "\n")
-        // SRT "00:00:06,000" → VTT "00:00:06.000"
-        val timed = Regex("(\\d{2}:\\d{2}:\\d{2}),(\\d{3})")
-            .replace(cleaned) { "${it.groupValues[1]}.${it.groupValues[2]}" }
-        val blocks = timed.split("\n\n")
-            .map { it.trim() }
-            .filter { it.isNotEmpty() && !it.contains("opensubtitles", ignoreCase = true) }
-        return "WEBVTT\n\n" + blocks.joinToString("\n\n") + "\n"
+
+        val out = StringBuilder(cleaned.length + 16).append("WEBVTT\n\n")
+        var wroteAny = false
+        for (rawBlock in cleaned.split("\n\n")) {
+            val block = rawBlock.trim()
+            if (block.isEmpty()) continue
+            if (block.contains("opensubtitles", ignoreCase = true)) continue
+            if (wroteAny) out.append("\n\n")
+            wroteAny = true
+            var firstLine = true
+            for (line in block.split('\n')) {
+                if (!firstLine) out.append('\n')
+                firstLine = false
+                if (line.contains("-->")) out.append(line.replace(',', '.')) else out.append(line)
+            }
+        }
+        out.append('\n')
+        return out.toString()
     }
 }

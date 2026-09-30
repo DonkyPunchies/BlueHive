@@ -18,6 +18,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.example.bluehive.latestTrailersComponents.trailerViewer.NewPipeExtractorViewer
+import com.example.bluehive.webview.exoplayer_resources.ExoPlayerConfig
 import kotlinx.coroutines.*
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -107,6 +108,8 @@ fun DetailsTrailerPlayer(
             val player = ExoPlayer.Builder(ctx).build().apply {
                 repeatMode = Player.REPEAT_MODE_ONE
                 volume = 1f
+                // No embedded text track ever gets drawn — see the helper.
+                ExoPlayerConfig.disableTextTracks(this)
 
                 addListener(object : Player.Listener {
                     override fun onPlaybackStateChanged(playbackState: Int) {

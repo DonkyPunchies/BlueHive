@@ -185,11 +185,19 @@ fun HomeScreenTrailerNavigationCompose(
                     Key.DirectionLeft -> {
                         val now = System.currentTimeMillis()
                         if (now - lastNavTime < CAROUSEL_NAVIGATION_RATE_MS) return@onKeyEvent true
-                        if (trailers.isNotEmpty() && currentIndex > 0) {
+                        // WRAPS BACKWARDS, mirroring the RIGHT handler below.
+                        // Stopping at the first item left LEFT as a dead press
+                        // in exactly the way RIGHT used to be at the last one:
+                        // consumed, so focus did not move either.
+                        //
+                        // "+ size" before the modulo because Kotlin's % keeps the
+                        // sign of the left operand - (0 - 1) % 20 is -1, not 19,
+                        // and an index of -1 would crash on the next read.
+                        if (trailers.isNotEmpty()) {
                             lastNavTime = now
                             slideDir = -1
                             isManualNavigation = true
-                            currentIndex -= 1
+                            currentIndex = (currentIndex - 1 + trailers.size) % trailers.size
                             BlueHiveApplication.playHoverSound()
                         }
                         true
@@ -198,11 +206,19 @@ fun HomeScreenTrailerNavigationCompose(
                     Key.DirectionRight -> {
                         val now = System.currentTimeMillis()
                         if (now - lastNavTime < CAROUSEL_NAVIGATION_RATE_MS) return@onKeyEvent true
-                        if (trailers.isNotEmpty() && currentIndex < trailers.lastIndex) {
+                        // WRAPS AT THE END, exactly as the auto-advance above does.
+                        // Stopping at the last item made RIGHT a dead press: the
+                        // event was still consumed, so focus did not move either
+                        // and the remote simply did nothing.
+                        //
+                        // Same "% size" and slideDir = 1 as the automatic cycle,
+                        // so the wrap animates identically whether the carousel
+                        // turned itself or the viewer turned it.
+                        if (trailers.isNotEmpty()) {
                             lastNavTime = now
                             slideDir = 1
                             isManualNavigation = true
-                            currentIndex += 1
+                            currentIndex = (currentIndex + 1) % trailers.size
                             BlueHiveApplication.playHoverSound()
                         }
                         true

@@ -71,8 +71,25 @@ fun SubtitlePickerOverlay(
     onTurnOff: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val rows: List<Row> = remember(options, activeIndex) {
-        options.map { Row.Option(it) } + if (activeIndex >= 0) listOf(Row.TurnOff) else emptyList()
+    // Closest end-time to the real runtime: the cheapest signal we have for
+    // "this one was timed to this cut".
+    val best = remember(options, durationMs) {
+        if (durationMs <= 0) null
+        else options.minByOrNull { abs(durationMs - it.lastCueMs) }
+    }
+    val bestIndex = best?.option?.index ?: -1
+    val bestGapMs = remember(best, durationMs) {
+        if (best == null) Long.MAX_VALUE else abs(durationMs - best.lastCueMs)
+    }
+
+    // THE RECOMMENDATION GOES FIRST. The backend offers up to eight candidates
+    // and the panel shows five before it scrolls, so sorting by provider order
+    // could — and did — leave the one option we actually vouch for below the
+    // fold, under four we do not.
+    val rows: List<Row> = remember(options, activeIndex, bestIndex) {
+        val ordered = options.sortedBy { if (it.option.index == bestIndex) 0 else 1 }
+        ordered.map { Row.Option(it) } +
+            if (activeIndex >= 0) listOf(Row.TurnOff) else emptyList()
     }
 
     // One requester per row so traversal can be wired explicitly. Rebuilt only
@@ -83,13 +100,6 @@ fun SubtitlePickerOverlay(
     // inside the panel instead of on the player controls behind it.
     LaunchedEffect(loading, rows.size) {
         if (!loading && rows.isNotEmpty()) runCatching { requesters.first().requestFocus() }
-    }
-
-    // Closest end-time to the real runtime: the cheapest signal we have for
-    // "this one was timed to this cut".
-    val bestIndex = remember(options, durationMs) {
-        if (durationMs <= 0 || options.isEmpty()) -1
-        else options.minByOrNull { abs(durationMs - it.lastCueMs) }?.option?.index ?: -1
     }
 
     // BACK closes the panel instead of leaving the player. A BackHandler rather
@@ -133,7 +143,8 @@ fun SubtitlePickerOverlay(
                     loading -> "Checking what's available for this episode…"
                     error != null -> error
                     options.isEmpty() -> "No English subtitles are listed for this episode."
-                    else -> "Out of sync? Pick another — each is timed to a different release."
+                    else -> "Each one is timed to a different release — " +
+                            "if this one is off, try another."
                 },
                 color = Color.White.copy(alpha = 0.62f),
                 fontSize = 11.sp,
@@ -176,6 +187,7 @@ fun SubtitlePickerOverlay(
                             is Row.Option -> OptionRow(
                                 choice = row.choice,
                                 durationMs = durationMs,
+                                bestGapMs = bestGapMs,
                                 isActive = row.choice.option.index == activeIndex,
                                 isBest = row.choice.option.index == bestIndex,
                                 onClick = { onPick(row.choice) },
@@ -205,6 +217,7 @@ fun SubtitlePickerOverlay(
 private fun OptionRow(
     choice: HlsSubtitles.SubtitleChoice,
     durationMs: Long,
+    bestGapMs: Long,
     isActive: Boolean,
     isBest: Boolean,
     onClick: () -> Unit,
@@ -240,32 +253,26 @@ private fun OptionRow(
                 )
                 if (isBest) {
                     Spacer(Modifier.width(8.dp))
-                    Badge("BEST MATCH", BlueHiveBlue)
+                    // "RECOMMENDED" rather than "BEST MATCH": best-of-what is a
+                    // question the viewer should not have to ask.
+                    Badge("RECOMMENDED", BlueHiveBlue)
                 }
                 if (isActive) {
                     Spacer(Modifier.width(6.dp))
                     Badge("IN USE", Color(0xFF3ECF7B))
                 }
             }
-            Spacer(Modifier.height(2.dp))
-            Text(
-                buildString {
-                    append("${choice.cueCount} lines · ")
-                    append(fmt(choice.firstCueMs))
-                    append(" → ")
-                    append(fmt(choice.lastCueMs))
-                    if (durationMs > 0) {
-                        val gap = durationMs - choice.lastCueMs
-                        // A subtitle that ends WAY before the video, or after it,
-                        // was timed to a different cut. Say so rather than making
-                        // the user infer it from two timestamps.
-                        if (gap < -5_000) append("  ·  runs past the episode")
-                        else if (gap > 180_000) append("  ·  ends ${fmt(gap)} early")
-                    }
-                },
-                color = Color.White.copy(alpha = 0.55f),
-                fontSize = 10.sp,
-            )
+            // A VERDICT, NOT A READOUT. This line used to say
+            // "2103 lines · 0:42 → 1:51:20 · ends 4m early", which asks the
+            // viewer to hold a runtime in their head and do the subtraction
+            // themselves. The numbers are still what decides it — they just do
+            // not belong on a television. Nothing is said when there is nothing
+            // useful to say, so the warnings stand out instead of being one more
+            // grey line among many.
+            verdictFor(choice, durationMs, bestGapMs, isBest)?.let { verdict ->
+                Spacer(Modifier.height(2.dp))
+                Text(verdict, color = Color.White.copy(alpha = 0.55f), fontSize = 10.sp)
+            }
         }
     }
 }
@@ -341,10 +348,29 @@ private fun Spinner() {
     )
 }
 
-private fun fmt(ms: Long): String {
-    val total = ms / 1000
-    val h = total / 3600
-    val m = (total % 3600) / 60
-    val s = total % 60
-    return if (h > 0) String.format("%d:%02d:%02d", h, m, s) else String.format("%d:%02d", m, s)
+/**
+ * One plain sentence about a candidate, or nothing at all.
+ *
+ * JUDGED AGAINST THE OTHER CANDIDATES, not against the runtime. The first
+ * version of this compared each subtitle's last cue to the video length and
+ * warned when it fell more than three minutes short — which, on a 2h09 film
+ * whose subtitles all ended around 2:03, marked every single option "probably
+ * wrong". It was measuring the closing credits.
+ *
+ * Credits are exactly the part with no dialogue, and their length is a property
+ * of the FILM, shared by every candidate. Comparing candidates to each other
+ * cancels it out: the real signal is one subtitle ending minutes away from where
+ * all the others end. Self-calibrating, and it can never condemn the whole list.
+ */
+private fun verdictFor(
+    choice: HlsSubtitles.SubtitleChoice,
+    durationMs: Long,
+    bestGapMs: Long,
+    isBest: Boolean,
+): String? {
+    if (isBest) return "Closest match to this video"
+    if (durationMs <= 0 || bestGapMs == Long.MAX_VALUE) return null
+    val gap = abs(durationMs - choice.lastCueMs)
+    return if (gap - bestGapMs > 120_000)
+        "Probably wrong — timed to a different version" else null
 }

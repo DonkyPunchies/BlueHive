@@ -50,6 +50,7 @@ import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import androidx.core.net.toUri
+import com.example.bluehive.webview.exoplayer_resources.ExoPlayerConfig
 import kotlinx.coroutines.withTimeoutOrNull
 
 private const val LOADING_MIN_DISPLAY_MS = 1_500L   // branding video shows at least this long
@@ -214,6 +215,8 @@ fun LoadingScreen(onLoadingComplete: () -> Unit) {
 
     val exoPlayer = remember {
         ExoPlayer.Builder(context).build().apply {
+            // No embedded text track ever gets drawn — see the helper.
+            ExoPlayerConfig.disableTextTracks(this)
             val videoUri = "android.resource://${context.packageName}/${R.raw.bluehive_loading_4k}".toUri()
             setMediaItem(MediaItem.fromUri(videoUri))
             // LOOP. The clip is 3.0s (90 frames at 30fps) but this screen stays

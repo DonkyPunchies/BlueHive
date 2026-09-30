@@ -19,8 +19,16 @@ import androidx.compose.ui.unit.dp
 // Sits in the TOP-RIGHT so it never collides with the episode-number badge, which
 // is bottom/top-left.
 val WATCHED_FOLD_SIZE         = 34.dp               // leg length on the episode grid
-val WATCHED_FOLD_COLOR        = Color(0xFF34D3C4)   // teal — deliberately NOT the blue focus glow
-val WATCHED_FOLD_TICK_COLOR   = Color(0xFF06342F)   // dark teal, reads against the fold
+val WATCHED_FOLD_COLOR        = Color(0xFF6227B3)   // purple — deliberately NOT the blue focus glow
+// THE TICK FLIPPED WHEN THE FOLD DID, and it had to. The fold used to be a
+// bright teal with a near-black teal tick on top: dark mark on a light patch.
+// The purple is dark enough that the same dark tick would have disappeared into
+// it. This is the other end of the same hue instead -- 0xFF6227B3 is
+// hsl(265, 64%, 43%), this is hsl(265, 60%, 88%) -- which keeps the original
+// relationship (one hue, opposite ends of the lightness scale) rather than
+// dropping in a flat white. Contrast against the fold is ~5.8:1, comfortably
+// legible; go lighter here if the fold is ever lightened further.
+val WATCHED_FOLD_TICK_COLOR   = Color(0xFFDDCEF3)   // pale lavender, reads against the fold
 val WATCHED_FOLD_TICK_STROKE  = 2.4.dp              // thickness of the tick strokes
 // ↕️ Overall size of the tick (its widest span), INDEPENDENT of the fold size —
 // shrink this to get a smaller check without touching the triangle. The tick is

@@ -94,6 +94,16 @@ fun TvWideLazyRow(
     isFocusedShelf: Boolean = false,
     onFocusRestored: () -> Unit = {},
     onNavigateToRightModule: (() -> Unit)? = null,
+    // WHAT HAPPENS AT THE LEFT EDGE OF THE ROW.
+    //
+    // LEFT on the first card used to be consumed and dropped: the handler
+    // returned true either way, so focus could not escape and the remote simply
+    // did nothing. The row now hands the press upwards, and the home screen
+    // opens the sidebar with it - the same thing BACK already did from here.
+    //
+    // Null means "keep the old behaviour", so any other caller of this row is
+    // unaffected.
+    onNavigateToLeftModule: (() -> Unit)? = null,
     onNavigateUp: (() -> Unit)? = null,
     onNavigateDown: (() -> Unit)? = null,
 
@@ -292,14 +302,49 @@ fun TvWideLazyRow(
                             // flips these from a coroutine after this composition.
                             val isPressed = remember { mutableStateOf(false) }
                             val pressBusy = remember { mutableStateOf(false) }
+
                             var titleVisible by remember { mutableStateOf(false) }
+
+                            // ONCE A PRESS COMMITS, THE TITLE IS GONE. Not for the
+                            // dip, not for the press sequence -- gone, until focus
+                            // actually leaves this card and comes back.
+                            //
+                            // pressBusy is not enough on its own, and the reason is
+                            // a one-line ordering detail in runTitleCardPress: it
+                            // does `busy.value = false` and only THEN calls
+                            // onComplete(). Launching the details activity takes
+                            // several hundred ms, so between those two statements
+                            // the card is sitting there un-busy and still on
+                            // screen, and the title happily fades back in. That is
+                            // the pop-back-in a second later.
+                            //
+                            // A latch closes that window. It is reset by the
+                            // LaunchedEffect below on a fresh arrival at this card,
+                            // so returning from the details screen -- where focus
+                            // never left -- keeps the title hidden, and moving away
+                            // and back brings it properly.
+                            var pressDismissedTitle by remember { mutableStateOf(false) }
+
+                            val titleShown =
+                                titleVisible && !pressBusy.value && !pressDismissedTitle
+
                             val titleAlpha by animateFloatAsState(
-                                targetValue = if (titleVisible) 1f else 0f,
-                                animationSpec = androidx.compose.animation.core.tween(durationMillis = 700),
+                                targetValue = if (titleShown) 1f else 0f,
+                                // Slow in, quick out. The fade-in is a settle
+                                // cue after you stop moving and can afford to be
+                                // leisurely; the fade-out is a response to a
+                                // button you just pressed and has to feel
+                                // immediate, or the card reads as laggy.
+                                animationSpec = androidx.compose.animation.core.tween(
+                                    durationMillis = if (titleShown) 700 else 180
+                                ),
                                 label = "titleAlpha"
                             )
 
                             LaunchedEffect(isItemFocused) {
+                                // Arriving at, or leaving, this card is the only
+                                // thing that re-arms the title after a press.
+                                pressDismissedTitle = false
                                 if (isItemFocused) {
                                     titleVisible = false
                                     kotlinx.coroutines.delay(800L)
@@ -318,6 +363,31 @@ fun TvWideLazyRow(
                                 label         = "cardScale",
                             )
 
+                            // THE PRESS SCALE LIVES OUT HERE, ON A WRAPPER, and
+                            // must not go back into the modifier handed to
+                            // MediaCard.
+                            //
+                            // MediaCard forwards its `modifier` to three of its
+                            // own children -- the halo, the card background and
+                            // the poster (it has to; that forwarding is what the
+                            // focusRequester binds through, see MediaCard.kt).
+                            // A graphicsLayer in that modifier therefore lands
+                            // FOUR times: once on the card root and again on each
+                            // of those three children. The art scaled by
+                            // 0.80 x 0.80 = 0.64 while the rating, date and
+                            // runtime text -- which are NOT handed the modifier --
+                            // scaled by only 0.80. The overlays visibly failed to
+                            // shrink with the poster and spilled past the frame.
+                            //
+                            // On a wrapper it applies exactly once, to everything
+                            // inside. This is also how RecommendedMediaSection
+                            // has always done it; this row was the odd one out.
+                            Box(
+                                modifier = Modifier.graphicsLayer {
+                                    scaleX = cardScale
+                                    scaleY = cardScale
+                                }
+                            ) {
                             MediaCard(
                                 mediaItem = mediaItem,
                                 backgroundPainter = backgroundPainter,
@@ -328,10 +398,6 @@ fun TvWideLazyRow(
                                 runTimeText = runTimeText,
                                 rating = mediaItem.voteAverage?.takeIf { it > 0.0 },
                                 modifier = baseCardModifier
-                                    .graphicsLayer {
-                                        scaleX = cardScale
-                                        scaleY = cardScale
-                                    }
                                     .focusRequester(focusRequesters[index])
                                     .onFocusChanged { fs ->
                                         if (fs.isFocused) {
@@ -364,6 +430,11 @@ fun TvWideLazyRow(
                                                 } else if (hasPreviousPage && !isPageLoading) {
                                                     onRequestPreviousPage()
                                                     BlueHiveApplication.playTitleCardNavigation()
+                                                } else if (onNavigateToLeftModule != null) {
+                                                    // First card, nothing to page back to: leave
+                                                    // the row rather than swallowing the press.
+                                                    BlueHiveApplication.playHoverSound()
+                                                    onNavigateToLeftModule.invoke()
                                                 }
                                                 true
                                             }
@@ -418,6 +489,11 @@ fun TvWideLazyRow(
                                                 // Sound now, navigation after the card has
                                                 // shrunk and sprung back — see TitleCardPress.
                                                 BlueHiveApplication.playClickSound()
+                                                // Close the latch before the press
+                                                // even starts, so there is no frame
+                                                // in which the title is still due
+                                                // to be shown.
+                                                pressDismissedTitle = true
                                                 coroutineScope.runTitleCardPress(isPressed, pressBusy) {
                                                     onItemClick(mediaItem)
                                                 }
@@ -428,11 +504,20 @@ fun TvWideLazyRow(
                                         }
                                     }
                             )
+                            }  // end of the press-scale wrapper
 
 
                             var fontSize by remember(mediaItem.title) { mutableStateOf(16.sp) }
 
-                            if (isItemFocused && !isPressed.value) {
+                            // NO isPressed CHECK HERE ANY MORE. It used to read
+                            // `isItemFocused && !isPressed.value`, which tore the
+                            // title out of the composition the instant the button
+                            // went down -- so it vanished in one frame rather than
+                            // fading, then popped straight back when the dip
+                            // ended. Leaving it composed lets titleAlpha above do
+                            // the work, and pressBusy keeps it at zero until the
+                            // details screen takes over.
+                            if (isItemFocused) {
                                 Box(
                                     modifier = Modifier
                                         .width(145.dp)

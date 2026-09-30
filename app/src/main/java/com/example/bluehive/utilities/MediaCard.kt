@@ -71,6 +71,23 @@ fun MediaCard(
         Image(
             painter = haloPainter,
             contentDescription = null,
+            // DO NOT change this to `Modifier`. It looks like a copy-paste slip --
+            // a child being handed its parent's modifier -- and it is load-bearing.
+            //
+            // Every caller of MediaCard builds the card modifier as
+            //     Modifier.focusable() ... .focusRequester(fr).onKeyEvent {}
+            // with focusable() BEFORE focusRequester(). A focusRequester only binds
+            // to a focus target that comes AFTER it in the chain, so it finds none
+            // and falls through to the CHILD layout nodes -- which are focus targets
+            // only because they receive this same modifier. Cut it here and the
+            // requester binds to nothing: requestFocus() fails silently inside
+            // focusAndScrollTo's runCatching, no card ever takes focus, the underglow
+            // never renders and Left/Right/Up/Down all die. That is true on all four
+            // callers -- TvWideLazyRow, MediaCatalog, SidebarFavorites and
+            // RecommendedMediaSection -- since all four order the chain this way.
+            //
+            // Fixing it properly means moving .focusable() to the END of the chain in
+            // all four callers. Worth doing deliberately; not worth doing here.
             modifier = modifier
                 .width(widthValue)
                 .height(heightValue)
@@ -84,6 +101,7 @@ fun MediaCard(
         Image(
             painter = backgroundPainter,
             contentDescription = null,
+            // Parent's modifier on purpose -- see the note on the halo Image above.
             modifier = modifier
                 .width(102.dp)
                 .height(161.25.dp),
@@ -92,6 +110,7 @@ fun MediaCard(
 
         // Poster - normal z-index
         Box(
+            // Parent's modifier on purpose -- see the note on the halo Image above.
             modifier = modifier
                 .padding(bottom = 21.dp)
                 .size(width = posterWidthDp, height = posterHeightDp)

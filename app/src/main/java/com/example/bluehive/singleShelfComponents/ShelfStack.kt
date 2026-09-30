@@ -2,8 +2,10 @@ package com.example.bluehive.singleShelfComponents
 
 import android.os.SystemClock
 import android.util.Log
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
@@ -30,6 +32,7 @@ import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -89,6 +92,103 @@ val SHELF_ROW_SPACING: Dp = 208.dp   // The gap between "What's Popular" and the
 private const val PEEK_ALPHA_ABOVE = 0f
 private const val PEEK_ALPHA_BELOW = 1f
 
+// HOW MANY SHELVES ARE COMPOSED EITHER SIDE OF THE FOCUSED ONE.
+//
+// LEAVE THIS AT 1. Two ways of raising it were built and measured, and both
+// lost to simply doing nothing. The numbers are here so nobody spends the
+// afternoon again.
+//
+// THE PROBLEM THEY WERE AIMED AT IS REAL: a shelf change costs one 250-300ms
+// frame, and that frame is where the incoming row gets composed -- a whole
+// LazyRow and its title cards, built while the stack is already sliding. It is
+// the worst single stutter on the home screen. It is NOT the images; the test
+// below goes six shelves down then six back up, so the return leg re-enters
+// rows whose posters are seconds old in Coil's memory cache and whose pages are
+// still held by the parent's PageWindow, and it stutters exactly as often as
+// the outbound leg does.
+//
+// ATTEMPT 1 -- radius 2, a permanently wider window. Failed because MOVING ONE
+// SHELF BRINGS EXACTLY ONE NEW ROW INTO THE WINDOW NO MATTER WHAT THE RADIUS
+// IS. A wider window does not avoid the cold compose, it only moves the row
+// being composed further from the focus. The stall still landed on the
+// transition frame, now beside an extra row being laid out and another being
+// torn down off the far end.
+//
+// ATTEMPT 2 -- a "warm window": strict +/-1 at all times, widening to +/-2 only
+// after 700ms of stillness, so the extra row was built on a quiet frame and the
+// transition had nothing left to do. The reasoning was sound and it did recover
+// most of what attempt 1 threw away -- but it still lost to the baseline.
+//
+// Four trials each, identical fresh-process warm-up, 6 x DOWN then 6 x UP at
+// 800ms, discarding trial 1 every time because a freshly launched process
+// always reads worse while it is still warming:
+//
+//                      rows      janky        99th pct
+//     radius 1           3        7.9%         ~317ms      <-- what ships
+//     warm window        5       11.9%         ~533ms
+//     radius 2           5       18.7%         ~567ms
+//
+// THE CONCLUSION IS THE ROW COUNT, not the timing. Both attempts hold five rows
+// composed; both are worse than holding three, and the gap between them is
+// exactly what moving the churn off the transition buys you. Pre-building a row
+// and holding a row are the same act, and holding it costs more than the stall
+// it avoids. Anything shaped like "keep the next shelf ready" is on the wrong
+// side of that line, including warming a single row in the direction of travel.
+//
+// ATTEMPT 3 -- make the row cheaper to BUILD rather than building it sooner.
+// Every title card owned a titleVisible state, an animateFloatAsState and a
+// LaunchedEffect for the hover title, although only the focused card ever draws
+// one: two dozen objects per row, all constructed on precisely the frame we
+// were trying to shorten. Hoisting them into a single row-level copy was
+// behaviourally identical -- once the fade-out was snapped instead of tweened,
+// because a shared alpha tweening down makes the card you just moved TO pick it
+// up mid-fall and flash a half-lit title -- and it changed nothing:
+//
+//     hoisted title      3       10.6%         ~333ms
+//
+// The 99th percentile, the number that actually describes the stutter, did not
+// move at all. Reverted: a change to focus-adjacent animation code that buys
+// nothing measurable is not worth the next person's debugging time.
+//
+// WHAT PROFILING DID ESTABLISH. dumpsys gfxinfo framestats breaks a single frame
+// into its phases, and the transition frames said this, averaged over five:
+//
+//     animation (recomposition)    52ms
+//     traversal (measure/layout)  0.1ms
+//     draw recording               212ms   <-- 72% of it
+//
+// Composition is NOT the cost; it is 0.1ms. That is the one durable finding here,
+// and it is why all three attempts above failed: each aimed at a phase that was
+// already free. It also explains the warm window specifically -- HWUI skips a
+// RenderNode at alpha 0 entirely, so a "warmed" row was composed and laid out but
+// never DRAWN, and drawing is where the time actually is.
+//
+// ATTEMPT 4, AND A WARNING ABOUT HOW IT WAS MEASURED. A fourth change looked like
+// the answer: MediaCard was passing the CARD's modifier to three of its own
+// children, so each title card built four RenderNodes, four focus targets and four
+// key handlers instead of one. Cutting that appeared to take draw recording from
+// 212ms to 9ms and the shelf stall from ~294ms to ~93ms.
+//
+// IT WAS NOT REAL, AND THE NUMBER WAS THE TRAP. Every caller builds the card
+// modifier as .focusable() ... .focusRequester(fr), with focusable FIRST. A
+// focusRequester binds only to a focus target AFTER it in the chain, so it was
+// binding to those child nodes -- the duplication was the only thing making cards
+// focusable at all. Cutting it silently killed focus on all four MediaCard screens.
+// A card that never takes focus never runs its focus callbacks and never swaps to
+// the focused halo drawable, so it is genuinely cheaper to draw. The measurement
+// was recording a broken app, not a faster one. Reverted; see MediaCard.kt.
+//
+// A controlled A/B afterwards -- same device, builds interleaved, order flipped,
+// six trials each -- put this build and the pre-work HEAD at the same p99 (350ms,
+// though note gfxinfo quantises p99 to 50ms steps, so that equality is coarse).
+// Nothing in this file's history made shelf navigation faster.
+//
+// THE LESSON, WHICH IS WHY ALL OF THIS IS STILL WRITTEN DOWN. Four hypotheses,
+// four failures, and the most dangerous one was the one with the best numbers.
+// Verify the feature still works before believing the frame counter -- a metric
+// that improves because something stopped happening looks exactly like a win.
+private const val SHELF_WINDOW_RADIUS = 1
+
 // Shelf header (title) animation.
 // REAPPEAR_DELAY: gap after a shelf change before the title fades back in.
 // FADE_IN_DURATION: length of the alpha 0->1 fade once it starts.
@@ -108,8 +208,19 @@ private const val PEEK_ALPHA_BELOW = 1f
 // arrives just after the rows settle rather than exactly with them. Landing
 // together read as abrupt; trailing slightly reads as the title following the
 // move.
-private const val HEADER_REAPPEAR_DELAY_MS   = 220L
-private const val HEADER_FADE_IN_DURATION_MS = 900
+// RE-BUDGETED TO FIT BETWEEN TWO PRESSES. These add up, and the sum is what
+// matters: at 220 + 900 the title needed 1120ms to become legible, while the
+// shelf nav cooldown lets a new press through every 500ms. Moving at any pace at
+// all, the title was snapped back to zero and restarted before it had finished
+// arriving even once -- so a viewer holding UP never saw a row name at all, and
+// a single press made them wait over a second for one.
+//
+// 150 + 300 = 450ms fits inside the 500ms window, so the title now lands between
+// presses instead of chasing them. The delay still does its original job of not
+// flashing a title during a fast scroll; it just no longer outlives the scroll.
+// Keep the sum under shelfNavCooldownMs if that value changes.
+private const val HEADER_REAPPEAR_DELAY_MS   = 150L
+private const val HEADER_FADE_IN_DURATION_MS = 300
 
 
 @Composable
@@ -122,6 +233,10 @@ fun ShelfStack(
     onFirstShelfChanged: (Boolean) -> Unit = {},
     onShelfChanged: (ContentShelf) -> Unit = {},
     profileId: Int = -1,
+    // Invoked when LEFT is pressed on the FIRST card of a shelf. The home screen
+    // turns this into openSidebar(lastFocusedTarget), so the sidebar opens with a
+    // return target and RIGHT comes back to this exact row and card.
+    onExitLeft: () -> Unit = {},
     onFirstPageReady: () -> Unit = {},
     // False when the home screen is not showing the Continue Watching panel
     // (the profile has no watch history): the first shelf then runs the full
@@ -169,8 +284,21 @@ fun ShelfStack(
 
     // Prevents DPad mash from queueing multiple transitions, and blocks a
     // second nav while one is still in flight.
+    //
+    // HALF A SECOND, deliberately slower than the animation needs. The row slide
+    // is a 450ms tween and the focus handoff clears after ~7 frames, so a purely
+    // technical floor would sit near 350ms -- which is what this was. The extra
+    // 150ms is not for the machine, it is to stop the shelves being scrolled past
+    // faster than anyone can read them: at 500ms a held button walks two shelves a
+    // second, which is about the rate you can actually take in a row title and a
+    // few posters.
+    //
+    // Presses inside the window are swallowed, not queued (the handler returns
+    // true and does nothing), so mashing cannot bank up moves that fire later.
+    // Raising this much further starts to read as an unresponsive remote rather
+    // than a deliberate pace.
     var lastShelfNavTime by remember { mutableLongStateOf(0L) }
-    val shelfNavCooldownMs = 350L
+    val shelfNavCooldownMs = 500L
     fun canNavigateShelvesNow(): Boolean {
         if (tracker.isNavigating) return false
         val now = SystemClock.uptimeMillis()
@@ -182,9 +310,31 @@ fun ShelfStack(
     // Translate the whole stack so the focused row sits at Y=0.
     val density = LocalDensity.current
     val rowSpacingPx = with(density) { SHELF_ROW_SPACING.toPx() }
+    // THE ONE CONTINUOUS VALUE. Everything else about the stack's appearance is
+    // derived from this -- see the per-row alpha further down. There is exactly
+    // one animation here, so there is nothing to fall out of sync with.
+    //
+    // SPRING, NOT TWEEN, AND THAT IS THE WHOLE POINT. A tween that is retargeted
+    // mid-flight starts a brand new tween from wherever it happens to be, at ZERO
+    // velocity. With FastOutSlowIn that means the stack decelerates almost to a
+    // stop and then re-accelerates on every press -- which is what reads as the
+    // animation "restarting" when you move through rows quickly. A spring is
+    // modelled on position AND velocity, so a new target is absorbed into the
+    // motion already in progress and the row keeps flowing.
+    //
+    // Critically damped (NoBouncy) because shelves overshooting their resting
+    // position would look like a bug, not a flourish. Stiffness is the speed
+    // knob: raise it toward Spring.StiffnessMedium (1500) for snappier, lower it
+    // toward StiffnessLow (200) for lazier. visibilityThreshold is half a pixel
+    // -- the default for a generic Float is 0.01, which for a value measured in
+    // PIXELS leaves the spring running a long invisible tail.
     val animatedTranslationY by animateFloatAsState(
         targetValue = -focusedShelfIndex * rowSpacingPx,
-        animationSpec = tween(durationMillis = 450),
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioNoBouncy,
+            stiffness = Spring.StiffnessMediumLow,
+            visibilityThreshold = 0.5f,
+        ),
         label = "stackTranslationY",
     )
 
@@ -256,6 +406,9 @@ fun ShelfStack(
         label = "headerAlpha",
     )
 
+
+    // focus ENTERING from outside (the tab buttons) and restore the focused
+    // shelf's saved card on the way in.
     // Tracks whether focus is currently inside the stack, so we can detect
     // focus ENTERING from outside (the tab buttons) and restore the focused
     // shelf's saved card on the way in.
@@ -337,25 +490,86 @@ fun ShelfStack(
         ) {
             shelves.forEachIndexed { index, shelf ->
                 val distance = abs(index - focusedShelfIndex)
-                if (distance > 1) return@forEachIndexed   // outside the window
+                if (distance > SHELF_WINDOW_RADIUS) return@forEachIndexed
 
                 val isFocused = (index == focusedShelfIndex)
-                val targetAlpha = when {
-                    isFocused -> 1f
-                    index > focusedShelfIndex -> PEEK_ALPHA_BELOW
-                    else -> PEEK_ALPHA_ABOVE
-                }
-                val animatedAlpha by animateFloatAsState(
-                    targetValue = targetAlpha,
-                    animationSpec = tween(durationMillis = 350),
-                    label = "shelfAlpha_$index",
-                )
 
                 stateHolder.SaveableStateProvider(shelf.name) {
                     Box(
                         modifier = Modifier.graphicsLayer {
+                            // MODULATE, DO NOT BUFFER. This is load-bearing, and
+                            // the symptom without it is bizarre enough to be
+                            // worth spelling out: the instant a row's alpha drops
+                            // below 1, the tops of its title cards are sliced off.
+                            //
+                            // By default an alpha below 1 makes Compose render the
+                            // whole row into an offscreen buffer and composite
+                            // that, and the buffer is only as big as the row's
+                            // LAYOUT bounds. TvWideLazyRow is a 250dp Column whose
+                            // card viewport is offset -40dp (see viewportOffsetY),
+                            // so the card tops, the side frame pieces and the focus
+                            // halo are all drawn ABOVE the row's own bounds. Into a
+                            // buffer, they land outside it and are discarded. At
+                            // alpha 1 no buffer is allocated, nothing clips, and
+                            // the row looks correct -- which is why this only ever
+                            // showed up mid-transition.
+                            //
+                            // ModulateAlpha applies the alpha to each draw
+                            // instruction instead, so no buffer is allocated and
+                            // out-of-bounds drawing survives. The documented
+                            // trade-off is that overlapping translucent draws no
+                            // longer composite as a single flattened group -- here
+                            // that is only ever visible while a row is mid-fade,
+                            // and it is a far better deal than losing the cards.
+                            compositingStrategy = CompositingStrategy.ModulateAlpha
+
                             translationY = index * rowSpacingPx
-                            alpha = animatedAlpha
+
+                            // ALPHA IS A FUNCTION OF WHERE THE ROW IS, not a
+                            // second animation racing the first.
+                            //
+                            // This used to be its own animateFloatAsState on a
+                            // 350ms tween, keyed on whether the row was focused,
+                            // above or below. Two timers meant two things to get
+                            // out of step: move up twice quickly and one row was
+                            // still fading in while the next started its own
+                            // fade, at a third position, over a stack that was
+                            // itself still sliding. It read as the animation
+                            // restarting because, in effect, it was.
+                            //
+                            // Now there is one animation -- the spring above --
+                            // and opacity is read off the result. `rows` is how
+                            // many row-heights this row currently sits below the
+                            // focus line: 0 when it IS the focused row, +1 when
+                            // it is the peek beneath, negative when above. It
+                            // updates continuously with the spring, so a row that
+                            // is half way to the focus line is half faded in, by
+                            // construction. Interrupt it however fast you like:
+                            // there is no timer to restart, and alpha can never
+                            // disagree with position.
+                            //
+                            // Evaluated in the graphicsLayer lambda, so all of
+                            // this runs in the DRAW phase and costs no
+                            // recomposition per frame.
+                            val rows =
+                                (index * rowSpacingPx + animatedTranslationY) / rowSpacingPx
+                            alpha = when {
+                                // Above the focus line: fade out across one row
+                                // of travel, so arriving from above fades in.
+                                rows < 0f -> PEEK_ALPHA_ABOVE +
+                                        (PEEK_ALPHA_BELOW - PEEK_ALPHA_ABOVE) *
+                                        (1f + rows).coerceIn(0f, 1f)
+                                // Further than one row below. Unreachable while
+                                // SHELF_WINDOW_RADIUS is 1, and kept for whoever
+                                // raises it: a second row down sits squarely on
+                                // screen and would otherwise draw as a second
+                                // peek, leaving the shelf area three rows deep.
+                                rows > 1f ->
+                                    (PEEK_ALPHA_BELOW * (2f - rows))
+                                        .coerceIn(0f, PEEK_ALPHA_BELOW)
+                                // The focused row and the single peek beneath it.
+                                else -> PEEK_ALPHA_BELOW
+                            }
                         },
                     ) {
                         ShelfRowContent(
@@ -373,6 +587,7 @@ fun ShelfStack(
                             onMediaClick         = onMediaClick,
                             profileId            = profileId,
                             onFirstPageReady     = if (shelf == ContentShelf.POPULAR) onFirstPageReady else ({ }),
+                            onExitLeft           = onExitLeft,
                         )
                     }
                 }
@@ -413,6 +628,7 @@ private fun ShelfRowContent(
     onMediaClick: (MediaItem) -> Unit,
     profileId: Int = -1,
     onFirstPageReady: () -> Unit = {},
+    onExitLeft: () -> Unit = {},
     reserveContinueWatching: Boolean = true,
 ) {
     // Pagination knobs — unchanged from the old HomeSingleShelf.
@@ -685,6 +901,7 @@ private fun ShelfRowContent(
                 viewportWidth         = if (reserveContinueWatching) 610.dp else TV_WIDE_ROW_VIEWPORT_WIDTH,
                 rightLowerBodyOffsetX = if (reserveContinueWatching) 580.dp else TV_WIDE_ROW_RIGHT_BODY_X,
                 rightUpperBodyOffsetX = if (reserveContinueWatching) 580.dp else TV_WIDE_ROW_RIGHT_BODY_X,
+                onNavigateToLeftModule = onExitLeft,
             )
         }
     } else {
@@ -702,6 +919,7 @@ private fun ShelfRowContent(
                 if (BuildConfig.DEBUG) Log.d("FOCUS_MEMORY", "restored $shelf")
             },
             showTitle = false,
+            onNavigateToLeftModule = onExitLeft,
         )
     }
 }

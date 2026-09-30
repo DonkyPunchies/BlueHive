@@ -380,6 +380,141 @@ fun ConfirmationOverlay(
 
 
 /**
+ * ChoiceOverlay
+ *
+ * Two neutral options over the standard scrim and card. Same furniture as
+ * ConfirmationOverlay above, with one deliberate difference: BOTH buttons wear
+ * the blue (safe) colours. ConfirmationOverlay paints its left button red
+ * because it guards a destructive action. A dialog that only asks "where do
+ * you want to go?" has nothing destructive in it, and a red button there reads
+ * as a warning the viewer then has to work out the meaning of.
+ *
+ * Focus is trapped between the two buttons - every arrow key either moves
+ * between them or is cancelled - so the remote cannot wander into the content
+ * behind the scrim while this is up.
+ *
+ * DISMISSAL IS THE CALLER'S JOB. There is no BackHandler in here on purpose:
+ * this overlay is raised by the one back-button router in CloseApplication.kt,
+ * and a second handler registered from inside the overlay would be dispatched
+ * to first, splitting a single decision across two files.
+ *
+ * @param message    Question shown above the buttons.
+ * @param leftText   Label for the left button, which takes focus by default.
+ * @param rightText  Label for the right button.
+ * @param onLeft     Called when the left button is activated.
+ * @param onRight    Called when the right button is activated.
+ */
+@Composable
+fun ChoiceOverlay(
+    message:   String,
+    leftText:  String,
+    rightText: String,
+    onLeft:    () -> Unit,
+    onRight:   () -> Unit,
+) {
+    val leftFocus  = remember { FocusRequester() }
+    val rightFocus = remember { FocusRequester() }
+
+    // Neither option is destructive, so the default lands on the left one
+    // simply because it is the first thing read.
+    LaunchedEffect(Unit) {
+        awaitFrame()
+        leftFocus.requestFocus()
+    }
+
+    // ── Scrim ────────────────────────────────────────────────────────────
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(overlayScrimColor())
+    )
+
+    // ── Centered dialog card ────────────────────────────────────────────────
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier         = Modifier.fillMaxSize(),
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier
+                .background(
+                    color = overlayCardBackgroundColor(),
+                    shape = overlayCardShape(),
+                )
+                .border(
+                    width = 1.dp,
+                    color = overlayCardBorderColor(),
+                    shape = overlayCardShape(),
+                )
+                .padding(
+                    horizontal = OVERLAY_CARD_PADDING_HORIZONTAL,
+                    vertical   = OVERLAY_CARD_PADDING_VERTICAL,
+                )
+                .width(OVERLAY_CARD_WIDTH),
+        ) {
+
+            Text(
+                text       = message,
+                color      = Color.White,
+                fontFamily = AppTypography.interBold,
+                fontWeight = FontWeight.Bold,
+                fontSize   = 16.sp,
+                textAlign  = TextAlign.Center,
+                modifier   = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 24.dp),
+            )
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(
+                    space     = 15.dp,
+                    alignment = Alignment.CenterHorizontally,
+                ),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+
+                ModularButton(
+                    textConfig      = ModularButtonTextConfig(text = leftText, fontSize = 10f),
+                    isToggleable    = false,
+                    fontFamily      = AppTypography.interBold,
+                    focusRequester  = leftFocus,
+                    onClick         = onLeft,
+                    modifier        = Modifier.focusProperties {
+                        up    = FocusRequester.Cancel
+                        down  = FocusRequester.Cancel
+                        left  = FocusRequester.Cancel
+                        right = rightFocus
+                    },
+                    dimensions      = overlayButtonDimensions(),
+                    colors          = overlayCancelButtonColors(),
+                    glowConfig      = overlayButtonGlowConfig(),
+                    animationConfig = overlayButtonAnimationConfig(),
+                )
+
+                ModularButton(
+                    textConfig      = ModularButtonTextConfig(text = rightText, fontSize = 10f),
+                    isToggleable    = false,
+                    fontFamily      = AppTypography.interBold,
+                    focusRequester  = rightFocus,
+                    onClick         = onRight,
+                    modifier        = Modifier.focusProperties {
+                        up    = FocusRequester.Cancel
+                        down  = FocusRequester.Cancel
+                        left  = leftFocus
+                        right = FocusRequester.Cancel
+                    },
+                    dimensions      = overlayButtonDimensions(),
+                    colors          = overlayCancelButtonColors(),
+                    glowConfig      = overlayButtonGlowConfig(),
+                    animationConfig = overlayButtonAnimationConfig(),
+                )
+            }
+        }
+    }
+}
+
+
+/**
  * VideoQualityOverlay
  *
  * Centered video-quality picker over the standard dialog scrim + card, matching

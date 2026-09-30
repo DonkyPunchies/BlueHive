@@ -29,6 +29,7 @@ package com.example.bluehive.utilities
 //  ├─────────────────────────────────────────────────────────┤
 //  │  Overlay showing          │  Dismiss overlay             │
 //  │  Sidebar open (focused)   │  Show "close app?" overlay   │
+//  │  Lazy row (shelf card)    │  Show "where to?" overlay    │
 //  │  Home screen (no sidebar) │  Open the sidebar            │
 //  │  Any other screen         │  Show "close app?" overlay   │
 //  └─────────────────────────────────────────────────────────┘
@@ -94,19 +95,46 @@ import kotlinx.coroutines.withTimeout
  * Usage (HomeScreenCompose):
  *
  *     CloseApplicationHandler(
- *         isSidebarOpen = isSidebarFocused,
- *         onOpenSidebar = { openSidebar(lastFocusedTarget) }
+ *         isSidebarOpen     = isSidebarFocused,
+ *         onOpenSidebar     = { openSidebar(lastFocusedTarget) },
+ *         isOnLazyRow       = isShelfFocused,
+ *         onGoToTop         = { requesterFor(neighborOf(selectedTab)).requestFocus() },
+ *         onRestoreRowFocus = { restoreShelfFocusPending = true },
  *     )
+ *
+ * The lazy-row trio (pass all three or none):
+ *
+ *   isOnLazyRow        True while focus is inside a shelf of title cards.
+ *                      Back then raises a two-way choice instead of going
+ *                      straight to the sidebar, because from a row there are
+ *                      two reasonable places to want to be.
+ *
+ *   onGoToTop          Go back to the top of the page - the radio button for
+ *                      the next tab along, which is where UP from the first
+ *                      shelf already lands.
+ *
+ *   onRestoreRowFocus  Put focus back on the exact title card it came from.
+ *                      Called ONLY when the overlay is dismissed with back,
+ *                      i.e. the viewer picked neither option; the two buttons
+ *                      move focus themselves.
  */
 @Composable
 fun CloseApplicationHandler(
     isSidebarOpen: Boolean = false,
     onOpenSidebar: (() -> Unit)? = null,
+    isOnLazyRow: Boolean = false,
+    onGoToTop: (() -> Unit)? = null,
+    onRestoreRowFocus: (() -> Unit)? = null,
 ) {
 
     // Controls whether the exit confirmation overlay is visible.
     // Internal state — no parent screen touches this.
     var showConfirm by remember { mutableStateOf(false) }
+
+    // Controls the "where do you want to go?" overlay raised by back from a
+    // shelf row. Also internal, and never true at the same time as showConfirm
+    // -- the router below raises exactly one of them per press.
+    var showRowChoice by remember { mutableStateOf(false) }
 
     // Activity reference needed for finishAffinity().
     val activity = LocalActivity.current ?: return
@@ -125,21 +153,57 @@ fun CloseApplicationHandler(
                 // Case 1: back while overlay is visible → cancel / dismiss
                 showConfirm = false
             }
+            showRowChoice -> {
+                // Case 2: back while the choice overlay is up means "neither" --
+                // close it and hand focus back to the title card it came from.
+                // Without the restore, dismissing would drop focus wherever
+                // Compose decides once the buttons leave the tree, which is not
+                // where the viewer was.
+                showRowChoice = false
+                onRestoreRowFocus?.invoke()
+            }
             isSidebarOpen || onOpenSidebar == null -> {
-                // Case 2: sidebar is open (user is on the sidebar) OR this screen
+                // Case 3: sidebar is open (user is on the sidebar) OR this screen
                 // has no sidebar at all → show the exit confirmation overlay.
+                // Deliberately ahead of the lazy-row case: with the sidebar open
+                // the row does not hold focus, so both can never be true, and if
+                // a stale flag ever said otherwise the sidebar wins.
                 showConfirm = true
             }
+            isOnLazyRow && onGoToTop != null -> {
+                // Case 4: focus is on a title card → ask rather than assume.
+                showRowChoice = true
+            }
             else -> {
-                // Case 3: on the home screen and sidebar is closed → open sidebar.
+                // Case 5: elsewhere on the home screen → open the sidebar, which
+                // is what back has always done from the frames and the tabs.
                 onOpenSidebar()
             }
         }
     }
 
-    // ── Overlay ────────────────────────────────────────────────────────────────
-    // Only rendered when showConfirm is true. Sits on top of all other content
-    // because CloseApplicationHandler() is placed last in the Box stack.
+    // ── Overlays ───────────────────────────────────────────────────────────────
+    // Both sit on top of all other content because CloseApplicationHandler()
+    // is placed last in the Box stack. Only one of them is ever showing --
+    // the router above raises exactly one per press.
+
+    // The two-way choice raised by back from a shelf row.
+    if (showRowChoice) {
+        ChoiceOverlay(
+            message   = "Where would you like to go?",
+            leftText  = "Top of Page",
+            rightText = "Open Sidebar",
+            onLeft    = {
+                showRowChoice = false
+                onGoToTop?.invoke()
+            },
+            onRight   = {
+                showRowChoice = false
+                onOpenSidebar?.invoke()
+            },
+        )
+    }
+
     if (showConfirm) {
         ConfirmationOverlay(
             message     = "Are you sure you want to close the app?",

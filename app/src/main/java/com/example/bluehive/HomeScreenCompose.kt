@@ -109,6 +109,12 @@ private enum class SidebarReturnTarget {
     // can restore the exact title card the user was on.
     MOVIES_SHELF,
     TV_SHOWS_SHELF,
+    // ANIME_SHELF exists for the same reason, and its absence was a quiet bug:
+    // the Anime shelf used to report plain ANIME on focus, the same value its
+    // radio button reports, so leaving the shelf for the sidebar and coming
+    // back landed on the radio button instead of the card. It also made the
+    // two states indistinguishable to anything asking "is focus on a card?".
+    ANIME_SHELF,
 }
 
 
@@ -368,6 +374,24 @@ fun HomeScreenComposeContent(
     // so the sidebar can restore focus to exactly that spot on close.
     var lastFocusedTarget by remember { mutableStateOf(SidebarReturnTarget.SEARCH_BAR) }
 
+    // IS FOCUS INSIDE A SHELF OF TITLE CARDS RIGHT NOW?
+    //
+    // Back means something different there -- see the router in
+    // CloseApplication.kt -- so it needs a live answer, which lastFocusedTarget
+    // cannot give: that one records the last place focus WAS and never clears.
+    //
+    // Read off the ShelfStack container, never off a list of rows. Every shelf,
+    // on every tab, lives inside that one container, so adding a shelf,
+    // removing one, or reordering them cannot reach this flag -- the thing being
+    // watched is the box they all sit in, not its contents. Each ShelfStack call
+    // site assigns it.hasFocus straight through, so it falls to false the moment
+    // focus leaves for the tabs, a frame, or the sidebar.
+    var isShelfFocused by remember { mutableStateOf(false) }
+
+    // Raised when the choice overlay is dismissed with back, to confirm a beat
+    // later that focus really did land back on the shelf. See the effect below.
+    var restoreShelfFocusPending by remember { mutableStateOf(false) }
+
 
 
     // Single shared clock that drives both the Trailer and Trending carousels
@@ -465,6 +489,26 @@ fun HomeScreenComposeContent(
             }
         }
 
+        // SECOND CHANCE, not the main event. Dismissing the choice overlay asks
+        // for the shelf synchronously (see onRestoreRowFocus, further down),
+        // while the overlay is still composed, so focus never has a gap for
+        // Compose to fill with the trailer section -- the same failure the
+        // radio-tab parking node exists to prevent. This runs two frames later
+        // and only if that did not stick, which is what isShelfFocused answers.
+        LaunchedEffect(restoreShelfFocusPending) {
+            if (!restoreShelfFocusPending) return@LaunchedEffect
+            kotlinx.coroutines.android.awaitFrame()
+            kotlinx.coroutines.android.awaitFrame()
+            if (!isShelfFocused) {
+                Log.d("FOCUS_DEBUG", "choice overlay dismissed: shelf lost focus, re-asking")
+                // runCatching: the shelf can be gone by now -- a tab switch, or
+                // the session ending underneath us -- and a detached requester
+                // throws rather than returning false.
+                runCatching { tvLazyRowsSingleShelfFocusRequester.requestFocus() }
+            }
+            restoreShelfFocusPending = false
+        }
+
         LaunchedEffect(pendingFocusRequester) {
             pendingFocusRequester?.let { requester ->
                 kotlinx.coroutines.android.awaitFrame()
@@ -554,6 +598,7 @@ fun HomeScreenComposeContent(
                     SidebarReturnTarget.ANIME -> animeToggleButtonFocusRequester.requestFocus()
                     SidebarReturnTarget.MOVIES_SHELF -> tvLazyRowsSingleShelfFocusRequester.requestFocus()
                     SidebarReturnTarget.TV_SHOWS_SHELF -> tvLazyRowsSingleShelfFocusRequester.requestFocus()
+                    SidebarReturnTarget.ANIME_SHELF -> tvLazyRowsSingleShelfFocusRequester.requestFocus()
                     null -> trailerFrameFocusRequester.requestFocus()
                 }
 
@@ -865,9 +910,16 @@ fun HomeScreenComposeContent(
 
                 ShelfStack(
                     mediaType = MediaType.MOVIES,
+                    // LEFT on the first card of any shelf opens the sidebar,
+                    // identical to BACK. lastFocusedTarget is what lets RIGHT
+                    // on the sidebar come back to this row and card.
+                    onExitLeft = { openSidebar(lastFocusedTarget) },
                     modifier = Modifier
                         .focusRequester(tvLazyRowsSingleShelfFocusRequester)
-                        .onFocusChanged { if (it.hasFocus) lastFocusedTarget = SidebarReturnTarget.MOVIES_SHELF }
+                        .onFocusChanged {
+                            if (it.hasFocus) lastFocusedTarget = SidebarReturnTarget.MOVIES_SHELF
+                            isShelfFocused = it.hasFocus
+                        }
                         .offset(x = 90.dp, y = SHELF_STACK_Y)
                         .width(880.dp),
                     onMediaClick = onMediaClick,
@@ -893,12 +945,17 @@ fun HomeScreenComposeContent(
 
                 ShelfStack(
                     mediaType = MediaType.TV_SHOWS,
+                    // LEFT on the first card of any shelf opens the sidebar,
+                    // identical to BACK. lastFocusedTarget is what lets RIGHT
+                    // on the sidebar come back to this row and card.
+                    onExitLeft = { openSidebar(lastFocusedTarget) },
                     modifier = Modifier
                         .focusRequester(tvLazyRowsSingleShelfFocusRequester)
                         .offset(x = 90.dp, y = SHELF_STACK_Y)
                         .width(880.dp)
                         .onFocusChanged { focusState ->
                             if (focusState.hasFocus) lastFocusedTarget = SidebarReturnTarget.TV_SHOWS_SHELF
+                            isShelfFocused = focusState.hasFocus
                             Log.d("FOCUS_DEBUG", "TV Shows ShelfStack focus changed: ${focusState.hasFocus}")
                         },
                     onMediaClick = onMediaClick,
@@ -923,12 +980,17 @@ fun HomeScreenComposeContent(
 
                 ShelfStack(
                     mediaType = MediaType.ANIME,
+                    // LEFT on the first card of any shelf opens the sidebar,
+                    // identical to BACK. lastFocusedTarget is what lets RIGHT
+                    // on the sidebar come back to this row and card.
+                    onExitLeft = { openSidebar(lastFocusedTarget) },
                     modifier = Modifier
                         .focusRequester(tvLazyRowsSingleShelfFocusRequester)
                         .offset(x = 90.dp, y = SHELF_STACK_Y)
                         .width(880.dp)
                         .onFocusChanged { focusState ->
-                            if (focusState.hasFocus) lastFocusedTarget = SidebarReturnTarget.ANIME
+                            if (focusState.hasFocus) lastFocusedTarget = SidebarReturnTarget.ANIME_SHELF
+                            isShelfFocused = focusState.hasFocus
                             Log.d("FOCUS_DEBUG", "Anime ShelfStack focus changed: ${focusState.hasFocus}")
                         },
                     onMediaClick = onMediaClick,
@@ -1076,6 +1138,25 @@ fun HomeScreenComposeContent(
         CloseApplicationHandler(
             isSidebarOpen = isSidebarFocused,
             onOpenSidebar = { openSidebar(lastFocusedTarget) },
+            // From a title card, back asks instead of assuming. The guard is the
+            // container-focus flag, so it covers every shelf of every tab and
+            // nothing else on the screen.
+            isOnLazyRow = isShelfFocused,
+            // "Top of the page" is the radio button for the NEXT tab along,
+            // because the selected tab's own button is toggled and unfocusable.
+            // Same destination UP from the first shelf already goes to, via
+            // onNavigateBackToTabs.
+            onGoToTop = { requesterFor(neighborOf(selectedTab)).requestFocus() },
+            // Synchronous on purpose: this runs before the recomposition that
+            // takes the overlay away, so focus steps straight from its button
+            // to the title card with no unowned frames in between. Asking for
+            // the STACK rather than a card is what makes its own tracker
+            // restore the saved card of the shelf the viewer was on, so this
+            // screen never has to know which row or which card that was.
+            onRestoreRowFocus = {
+                runCatching { tvLazyRowsSingleShelfFocusRequester.requestFocus() }
+                restoreShelfFocusPending = true
+            },
         )
 
     }

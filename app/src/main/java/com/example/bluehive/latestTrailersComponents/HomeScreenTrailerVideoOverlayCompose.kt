@@ -37,6 +37,7 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
 import com.example.bluehive.latestTrailersComponents.trailerViewer.DownloaderImpl
 import com.example.bluehive.latestTrailersComponents.trailerViewer.NewPipeExtractorViewer
+import com.example.bluehive.webview.exoplayer_resources.ExoPlayerConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -84,6 +85,8 @@ fun HomeScreenTrailerVideoOverlayCompose(
             .apply {
                 playWhenReady = true
                 repeatMode = Player.REPEAT_MODE_OFF
+                // No embedded text track ever gets drawn — see the helper.
+                ExoPlayerConfig.disableTextTracks(this)
             }
     }
 

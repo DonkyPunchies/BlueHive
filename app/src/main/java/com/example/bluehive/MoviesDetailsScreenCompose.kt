@@ -2989,7 +2989,9 @@ fun AnimeDubButton(
     onClick: () -> Unit
 ) {
     ModularButton(
-        textConfig = ModularButtonTextConfig(text = "Watch in DuB", fontSize = 14f),
+        // "English" / "Japanese" rather than "DuB" / "SuB". Dub and sub are
+        // fan shorthand; the language is what a viewer is actually choosing.
+        textConfig = ModularButtonTextConfig(text = "Watch in English", fontSize = 14f),
         isToggleable = false,
         fontFamily = fontFamily,
         focusRequester = focusRequester,
@@ -3037,7 +3039,7 @@ fun AnimeSubButton(
     onClick: () -> Unit
 ) {
     ModularButton(
-        textConfig = ModularButtonTextConfig(text = "Watch in SuB", fontSize = 14f),
+        textConfig = ModularButtonTextConfig(text = "Watch in Japanese", fontSize = 14f),
         isToggleable = false,
         fontFamily = fontFamily,
         focusRequester = focusRequester,

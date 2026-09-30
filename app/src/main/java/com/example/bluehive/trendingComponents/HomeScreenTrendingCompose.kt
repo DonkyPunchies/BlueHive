@@ -5,6 +5,10 @@ import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -110,6 +114,15 @@ private val BACKDROP_SCRIM = Brush.verticalGradient(
 @Composable
 private fun TrendingItemAdapterCompose(
     item: TrendingItem,
+    // POSITION IN THE CAROUSEL, not the item's trend rank.
+    //
+    // The badge used to read "#8" from item.trendRank, which answers a question
+    // nobody watching a rotating frame is asking and is actively confusing when
+    // a media_type filter makes the ranks sparse (1, 2, 5, 7...). "8/20" says
+    // where you are and how much is left, and matches the trailers frame beside
+    // it, which has always read "3/36".
+    position: Int = 0,
+    total: Int = 0,
     modifier: Modifier = Modifier
 ) {
     val context     = LocalContext.current
@@ -175,13 +188,15 @@ private fun TrendingItemAdapterCompose(
         Row(
             modifier = Modifier
                 .align(Alignment.TopStart)
-                .padding(start = 6.dp, top = 6.dp),
+                // 8dp so the larger badges are not crowded against the frame.
+                .padding(start = 8.dp, top = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             TrendingPillBadge(
                 text = item.mediaType.uppercase(),
+                outlined = true,
                 bg  = when (item.mediaType.lowercase()) {
-                    "movie" -> Color(0xFF08CB00)
+                    "movie" -> Color(0xFF0BA92B)
                     "tv"    -> Color(0xFF2196F3)
                     else    -> Color(0xFF757575)
                 }
@@ -191,15 +206,17 @@ private fun TrendingItemAdapterCompose(
                 TrendingPillBadge(
                     text = item.contentRating,
                     bg   = Color(0xCC000000),
-                    modifier = Modifier.padding(start = 4.dp)
+                    modifier = Modifier.padding(start = 5.dp)
                 )
             }
 
-            TrendingPillBadge(
-                text     = "#${item.trendRank}",
-                bg       = Color(0xBB000000),
-                modifier = Modifier.padding(start = 4.dp)
-            )
+            if (total > 0) {
+                TrendingPillBadge(
+                    text     = "$position/$total",
+                    bg       = Color(0xBB000000),
+                    modifier = Modifier.padding(start = 5.dp)
+                )
+            }
         }
 
         // Top-right: rating
@@ -209,13 +226,16 @@ private fun TrendingItemAdapterCompose(
                     text = String.format(java.util.Locale.US, "%.1f", rating),
                     color    = Color.White,
                     fontFamily = metaFont,
-                    fontSize = 9.sp,
+                    // Slightly larger than the pills: it is the only number on
+                    // the frame with no label, so it has to carry itself.
+                    fontSize = 12.sp,
                     modifier = Modifier
                         .align(Alignment.TopEnd)
-                        .padding(end = 6.dp, top = 6.dp)
-                        .clip(RoundedCornerShape(3.dp))
+                        .padding(end = 8.dp, top = 8.dp)
+                        .clip(BADGE_SHAPE)
                         .background(Color(0xBB000000))
-                        .padding(horizontal = 5.dp, vertical = 3.dp)
+                        .border(1.dp, BADGE_BORDER, BADGE_SHAPE)
+                        .padding(horizontal = 7.dp, vertical = 4.dp)
                 )
             }
         }
@@ -224,21 +244,69 @@ private fun TrendingItemAdapterCompose(
 
 
 private val BADGE_SHAPE = RoundedCornerShape(3.dp)
+// A hairline near-black edge so each overlay reads as a distinct chip. It
+// defines the coloured badges cleanly against bright artwork; on the dark
+// chips it is deliberately almost invisible, which keeps them quiet.
+private val BADGE_BORDER = Color(0xFF0C0C0C)
+
 @Composable
 private fun TrendingPillBadge(
     text: String,
     bg: Color,
+    // Draws a black outline around the LETTERS, not a box around the pill.
+    // Used for the media-type badge, whose green and blue backgrounds are light
+    // enough that white text on them loses its edges over bright artwork.
+    //
+    // Compose has no text-stroke property, so the string is drawn twice: once
+    // as a stroked black path, then filled white on top. Both copies take the
+    // same font and size, so they occupy the same box and line up exactly.
+    outlined: Boolean = false,
     modifier: Modifier = Modifier
 ) {
+    if (outlined) {
+        Box(
+            modifier = modifier
+                .clip(BADGE_SHAPE)
+                .background(bg)
+                .border(1.dp, BADGE_BORDER, BADGE_SHAPE)
+                .padding(horizontal = 9.dp, vertical = 4.dp)
+        ) {
+            Text(
+                text       = text,
+                color      = Color.Black,
+                fontFamily = AppTypography.passionRegular,
+                fontSize   = 10.sp,
+                style      = TextStyle(
+                    drawStyle = Stroke(width = 1.5f, join = StrokeJoin.Round)
+                ),
+                maxLines   = 1,
+                overflow   = TextOverflow.Clip
+            )
+            Text(
+                text       = text,
+                color      = Color.White,
+                fontFamily = AppTypography.passionRegular,
+                fontSize   = 10.sp,
+                maxLines   = 1,
+                overflow   = TextOverflow.Clip
+            )
+        }
+        return
+    }
+
     Text(
         text       = text,
         color      = Color.White,
         fontFamily = AppTypography.passionRegular,
-        fontSize   = 7.sp,
+        // 10sp. Was 7sp, which was decorative rather than readable on a
+        // television viewed from a sofa; 13sp overcorrected and the badges
+        // started competing with the artwork. This is the midpoint.
+        fontSize   = 10.sp,
         modifier   = modifier
             .clip(BADGE_SHAPE)
             .background(bg)
-            .padding(horizontal = 8.dp, vertical = 4.dp),
+            .border(1.dp, BADGE_BORDER, BADGE_SHAPE)
+            .padding(horizontal = 9.dp, vertical = 4.dp),
         maxLines   = 1,
         overflow   = TextOverflow.Clip
     )
@@ -344,11 +412,19 @@ private fun TrendingNavigationCompose(
                     Key.DirectionLeft -> {
                         val now = System.currentTimeMillis()
                         if (now - lastNavTime < CAROUSEL_NAVIGATION_RATE_MS) return@onKeyEvent true
-                        if (items.isNotEmpty() && currentIndex > 0) {
+                        // WRAPS BACKWARDS, mirroring the RIGHT handler below.
+                        // Stopping at the first item left LEFT as a dead press
+                        // in exactly the way RIGHT used to be at the last one:
+                        // consumed, so focus did not move either.
+                        //
+                        // "+ size" before the modulo because Kotlin's % keeps the
+                        // sign of the left operand - (0 - 1) % 20 is -1, not 19,
+                        // and an index of -1 would crash on the next read.
+                        if (items.isNotEmpty()) {
                             lastNavTime  = now
                             slideDir     = -1
                             isManualNav  = true
-                            currentIndex -= 1
+                            currentIndex = (currentIndex - 1 + items.size) % items.size
                             BlueHiveApplication.playHoverSound()
                         }
                         true
@@ -356,11 +432,19 @@ private fun TrendingNavigationCompose(
                     Key.DirectionRight -> {
                         val now = System.currentTimeMillis()
                         if (now - lastNavTime < CAROUSEL_NAVIGATION_RATE_MS) return@onKeyEvent true
-                        if (items.isNotEmpty() && currentIndex < items.lastIndex) {
+                        // WRAPS AT THE END, exactly as the auto-advance above does.
+                        // Stopping at the last item made RIGHT a dead press: the
+                        // event was still consumed, so focus did not move either
+                        // and the remote simply did nothing.
+                        //
+                        // Same "% size" and slideDir = 1 as the automatic cycle,
+                        // so the wrap animates identically whether the carousel
+                        // turned itself or the viewer turned it.
+                        if (items.isNotEmpty()) {
                             lastNavTime  = now
                             slideDir     = 1
                             isManualNav  = true
-                            currentIndex += 1
+                            currentIndex = (currentIndex + 1) % items.size
                             BlueHiveApplication.playHoverSound()
                         }
                         true
@@ -387,6 +471,8 @@ private fun TrendingNavigationCompose(
             if (inc == null) {
                 TrendingItemAdapterCompose(
                     item     = items[shownIndex],
+                    position = shownIndex + 1,
+                    total    = items.size,
                 )
             } else {
                 val outTranslation = -slideDir * (p * cardWidthPx)
@@ -395,10 +481,18 @@ private fun TrendingNavigationCompose(
                 // graphicsLayer moves the already-drawn bitmap on the RenderThread —
                 // no layout pass, no recomposition, no UI-thread involvement per frame.
                 Box(modifier = Modifier.graphicsLayer { translationX = outTranslation }) {
-                    TrendingItemAdapterCompose(item = items[shownIndex])
+                    TrendingItemAdapterCompose(
+                        item     = items[shownIndex],
+                        position = shownIndex + 1,
+                        total    = items.size,
+                    )
                 }
                 Box(modifier = Modifier.graphicsLayer { translationX = inTranslation }) {
-                    TrendingItemAdapterCompose(item = items[inc])
+                    TrendingItemAdapterCompose(
+                        item     = items[inc],
+                        position = inc + 1,
+                        total    = items.size,
+                    )
                 }
             }
         }

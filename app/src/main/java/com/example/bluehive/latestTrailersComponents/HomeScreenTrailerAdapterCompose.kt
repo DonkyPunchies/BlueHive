@@ -1,6 +1,10 @@
 package com.example.bluehive.latestTrailersComponents
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -36,6 +40,11 @@ private val TRAILER_SCRIM = Brush.verticalGradient(
     colors = listOf(Color.Transparent, Color(0x99000000))
 )
 private val BADGE_SHAPE = RoundedCornerShape(3.dp)
+// A hairline near-black edge so each overlay reads as a distinct chip. It
+// defines the coloured badges cleanly against bright artwork; on the dark
+// chips it is deliberately almost invisible, which keeps them quiet.
+private val BADGE_BORDER = Color(0xFF0C0C0C)
+
 
 // Decode dimensions + URL transform + cache key all come from the SHARED spec
 // in homeScreenSectionRules — the window preloader and AppWarmup's splash
@@ -114,14 +123,15 @@ fun HomeScreenTrailerAdapterCompose(
         Row(
             modifier = Modifier
                 .align(Alignment.TopStart)
-                .padding(start = 6.dp, top = 6.dp),
+                .padding(start = 8.dp, top = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             trailer.mediaType?.let { type ->
                 TrailerPillBadge(
                     text = type.uppercase(),
+                    outlined = true,
                     bg = when (type.lowercase()) {
-                        "movie" -> Color(0xFF08CB00)
+                        "movie" -> Color(0xFF0BA92B)
                         "tv" -> Color(0xFF2196F3)
                         else -> Color(0xFF757575)
                     }
@@ -131,7 +141,7 @@ fun HomeScreenTrailerAdapterCompose(
             TrailerPillBadge(
                 text = "${index + 1}/$total",
                 bg = BADGE_COUNT_BG,
-                modifier = Modifier.padding(start = if (trailer.mediaType == null) 0.dp else 6.dp)
+                modifier = Modifier.padding(start = if (trailer.mediaType == null) 0.dp else 5.dp)
             )
         }
     }
@@ -141,17 +151,54 @@ fun HomeScreenTrailerAdapterCompose(
 private fun TrailerPillBadge(
     text: String,
     bg: Color,
+    // See the trending frame's badge for why this draws the string twice.
+    outlined: Boolean = false,
     modifier: Modifier = Modifier
 ) {
+    if (outlined) {
+        Box(
+            modifier = modifier
+                .clip(BADGE_SHAPE)
+                .background(bg)
+                .border(1.dp, BADGE_BORDER, BADGE_SHAPE)
+                .padding(horizontal = 9.dp, vertical = 4.dp)
+        ) {
+            Text(
+                text = text,
+                color = Color.Black,
+                fontFamily = AppTypography.passionRegular,
+                fontSize = 10.sp,
+                style = TextStyle(
+                    drawStyle = Stroke(width = 1.5f, join = StrokeJoin.Round)
+                ),
+                maxLines = 1,
+                overflow = TextOverflow.Clip
+            )
+            Text(
+                text = text,
+                color = Color.White,
+                fontFamily = AppTypography.passionRegular,
+                fontSize = 10.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Clip
+            )
+        }
+        return
+    }
+
     Text(
         text = text,
         color = Color.White,
         fontFamily = AppTypography.passionRegular,
-        fontSize = 7.sp,
+        // 10sp, matching the trending frame's pills. The two frames sit side
+        // by side on the home screen, so a size that differs between them reads
+        // as a mistake rather than a choice.
+        fontSize = 10.sp,
         modifier = modifier
             .clip(BADGE_SHAPE)
             .background(bg)
-            .padding(horizontal = 8.dp, vertical = 4.dp),
+            .border(1.dp, BADGE_BORDER, BADGE_SHAPE)
+            .padding(horizontal = 9.dp, vertical = 4.dp),
         maxLines = 1,
         overflow = TextOverflow.Clip
     )

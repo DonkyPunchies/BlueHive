@@ -18,6 +18,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.getValue
@@ -67,6 +68,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
 import java.io.File
 import java.util.Locale
+import kotlin.math.abs
 import java.util.concurrent.TimeUnit
 import com.example.bluehive.api.extractStreamAwait
 
@@ -627,6 +629,89 @@ class HlsPlayerActivity : ComponentActivity() {
     private var ccButton: ImageButton? = null
     private val subPrefs by lazy { getSharedPreferences("vidapi_sub_offsets", MODE_PRIVATE) }
 
+    /**
+     * Subtitle RATE correction — the one fix the offset buttons cannot perform.
+     *
+     * An offset is a constant shift, and it handles the common case: the release a
+     * subtitle was timed to had a different amount of distributor logo before the
+     * first frame. It cannot touch the other case. A subtitle authored against a
+     * 25fps PAL transfer, rendered over a 23.976fps source, is wrong by a RATIO
+     * rather than a constant — 4.27%, which is ~3m50s by the end of a feature.
+     * Sync the opening and the ending breaks; sync the ending and the opening
+     * does. No number of nudges fixes it, because the error GROWS.
+     *
+     * So cue times are now scaled as well as shifted: videoTime = cue*rate + offset.
+     * Because we render cues ourselves off the playback clock (see the class
+     * header) this costs one division per tick and applies instantly, mid-film,
+     * with no reload — the same property that made the offset buttons possible.
+     *
+     * NOBODY OPERATES THIS. There is no drift button, and the words "framerate"
+     * and "drift" appear nowhere in the UI. The rate is MEASURED from the ◀ / ▶
+     * nudges the viewer was already going to make — see [recordSyncPoint].
+     *
+     * That deletion is the whole design. The button this replaces made the
+     * viewer diagnose their own problem first ("is this off by a constant, or by
+     * a ratio?") before it could tell them which control to reach for. That is a
+     * distinction for someone who knows what telecine is, and asking for it is
+     * what made the feature unusable rather than the number of buttons.
+     *
+     * 1.0 means no correction, and must keep meaning exactly that — see
+     * renderActiveCues.
+     */
+    private var subtitleRate: Double = 1.0
+
+    /**
+     * One "this looks right HERE" observation: the playback position, and the
+     * offset the viewer settled on at it.
+     *
+     * Settled is the load-bearing word. Reaching +2.00s takes eight presses, and
+     * the seven offsets on the way there are not answers to anything — they are
+     * someone still turning the dial. Only the value they stop at is data, which
+     * is why these are recorded on a debounce rather than per press.
+     */
+    private data class SyncPoint(val positionMs: Long, val offsetMs: Long)
+
+    private var lastSyncPoint: SyncPoint? = null
+    private var syncSettleJob: Job? = null
+
+    /** How long the nudging must stop before an offset counts as settled. */
+    private val SYNC_SETTLE_MS = 3_000L
+
+    /**
+     * How far apart two observations must be before their slope means anything.
+     *
+     * FIFTEEN minutes, and the number is measured rather than picked. Each
+     * observation carries about ±250ms of error — the nudge step is 250ms and
+     * nobody's eye is better than that anyway — so the error in the SLOPE is
+     * roughly 500ms divided by the span. A short arm turns that into a large
+     * rate error applied across the whole film:
+     *
+     *     span    worst residual, simulated, on a 36s-per-2h drift
+     *      5 min   5.6s   ← worse than some of what it was fixing
+     *     10 min   3.0s
+     *     15 min   2.0s   ← the knee
+     *     30 min   1.1s
+     *
+     * Five minutes was the first guess and the simulation threw it out.
+     */
+    private val SYNC_MIN_SPAN_MS = 15 * 60_000L
+
+    /** Sanity band for a measured rate. Outside it, the pair was not drift. */
+    private val SYNC_RATE_MIN = 0.90
+    private val SYNC_RATE_MAX = 1.10
+
+    /**
+     * The two settled offsets must differ by at least this much.
+     *
+     * This is the noise floor, stated in the only units that matter. Two
+     * observations 250ms apart are indistinguishable from the same observation
+     * made twice, and dividing that by the span yields a confident-looking rate
+     * built out of rounding. Below 1.5s we are not measuring drift, so we leave
+     * the film alone — at which point the drift is under ~12s across a feature,
+     * which the ◀ / ▶ buttons already handle.
+     */
+    private val SYNC_MIN_OFFSET_DELTA_MS = 1_500L
+
     private lateinit var reextractLauncher: ActivityResultLauncher<Intent>
 
     private data class TimedCue(val startMs: Long, val endMs: Long, val cue: Cue)
@@ -649,10 +734,20 @@ class HlsPlayerActivity : ComponentActivity() {
         if (!streamSubtitleUrl.isNullOrBlank())
             Log.d(TAG, "subs: stream subtitle available → ${streamSubtitleUrl!!.take(90)}")
 
-        // Restore the saved timing offset for this title (sync once, remembered).
+        // Restore the saved timing for this title (sync once, remembered). The
+        // rate index is clamped: a value stored by a build with a different rate
+        // table would otherwise be an out-of-bounds read on every caption tick.
         subtitleOffsetMs = if (tmdbId > 0) subPrefs.getLong(tmdbId.toString(), 0L) else 0L
-        if (subtitleOffsetMs != 0L)
-            Log.d(TAG, "subs: restored saved timing offset ${subtitleOffsetMs}ms for tmdb=$tmdbId")
+        // Clamped on the way in: a rate outside the band would make every cue
+        // lookup wrong for the whole film, and prefs outlive the code that wrote
+        // them. The key is deliberately NOT the "_rate" one an earlier build used
+        // for a preset INDEX — getFloat on an int-typed key throws.
+        subtitleRate = if (tmdbId > 0)
+            subPrefs.getFloat("${tmdbId}_ratef", 1f).toDouble()
+                .coerceIn(SYNC_RATE_MIN, SYNC_RATE_MAX) else 1.0
+        if (subtitleOffsetMs != 0L || subtitleRate != 1.0)
+            Log.d(TAG, "subs: restored saved timing ${subtitleOffsetMs}ms " +
+                    "rate=${"%.5f".format(subtitleRate)} for tmdb=$tmdbId")
 
         reextractLauncher = registerForActivityResult(
             ActivityResultContracts.StartActivityForResult()
@@ -1140,7 +1235,14 @@ class HlsPlayerActivity : ComponentActivity() {
                             textAlign = TextAlign.End,
                             modifier = Modifier
                                 .align(Alignment.BottomEnd)
-                                .padding(end = 28.dp, bottom = 28.dp)
+                                // Clears the control bar. At bottom = 28.dp a toast
+                                // raised BY a control-bar button lands on top of the
+                                // buttons that raised it — the timing read-out sits
+                                // exactly there, which is the one thing you want to
+                                // read afterwards. The width cap stops a long
+                                // message spanning the screen instead of wrapping.
+                                .padding(end = 28.dp, bottom = 96.dp)
+                                .widthIn(max = 560.dp)
                                 .background(Color(0xE6000000), RoundedCornerShape(10.dp))
                                 .padding(horizontal = 18.dp, vertical = 12.dp)
                         )
@@ -1298,24 +1400,40 @@ class HlsPlayerActivity : ComponentActivity() {
                     withTimeoutOrNull(25_000) {
                         val key = subtitleCacheKey()
                         val fromStream = streamSubtitleUrl
-                        val options = if (tmdbId > 0) HlsSubtitles.listEnglishOptions(
+
+                        // NOTHING IS DOWNLOADED HERE ANY MORE except the stream's
+                        // own caption. This used to fan out and fetch every
+                        // candidate at once — the comment claimed "~40 KB each",
+                        // and measured on the onn box it peaked at 806MB and got
+                        // the app killed by the low-memory killer mid-film.
+                        //
+                        // The backend lists them with their cue counts and timings
+                        // already computed, so the picker renders from a few
+                        // hundred bytes of JSON. The chosen file is fetched in
+                        // applyChoice, one download instead of eight.
+                        val listed = if (tmdbId > 0) HlsSubtitles.listChoices(
                             tmdbId    = tmdbId,
                             mediaType = intent.getStringExtra("MEDIA_TYPE") ?: "movie",
                             season    = intent.getIntExtra("SEASON_NUMBER", 0),
                             episode   = intent.getIntExtra("EPISODE_NUMBER", 0),
                         ) else emptyList()
 
-                        // Fetch every candidate at once. They're ~40 KB each, and
-                        // downloading five serially would make the panel crawl.
-                        coroutineScope {
-                            val stream = if (!fromStream.isNullOrBlank())
-                                async { HlsSubtitles.streamChoice(this@HlsPlayerActivity, fromStream, key) }
-                            else null
-                            val rest = options.map { opt ->
-                                async { HlsSubtitles.downloadChoice(this@HlsPlayerActivity, opt, key) }
-                            }
-                            listOfNotNull(stream?.await()) + rest.awaitAll().filterNotNull()
-                        }
+                        // The stream caption still has to be fetched to be offered
+                        // at all — it is the only way to know whether it has cues.
+                        // One file, and it is the option most likely to be picked.
+                        // The SOURCE is part of the cache key. Every site serves
+                        // its own encode with its own caption, so one name per
+                        // title handed the second site the first site's file.
+                        val stream = if (!fromStream.isNullOrBlank())
+                            HlsSubtitles.streamChoice(
+                                context   = this@HlsPlayerActivity,
+                                url       = fromStream,
+                                key       = key,
+                                sourceTag = intent.getStringExtra("EXTRACT_SOURCE") ?: "vidfast",
+                            )
+                        else null
+
+                        listOfNotNull(stream) + listed
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "subs: listing threw — ${e.message}", e); null
@@ -1346,7 +1464,20 @@ class HlsPlayerActivity : ComponentActivity() {
         lifecycleScope.launch {
             val cues = withContext(Dispatchers.IO) {
                 try {
-                    if (File(choice.path).exists()) parseVtt(choice.path) else null
+                    // THE DOWNLOAD HAPPENS HERE NOW, for this one option only.
+                    // Listing an option costs a row; fetching it costs a request,
+                    // and only the option actually chosen ever pays that. The
+                    // stream caption returns its existing path immediately.
+                    val path = HlsSubtitles.ensureVtt(
+                        context   = this@HlsPlayerActivity,
+                        choice    = choice,
+                        tmdbId    = tmdbId,
+                        mediaType = intent.getStringExtra("MEDIA_TYPE") ?: "movie",
+                        season    = intent.getIntExtra("SEASON_NUMBER", 0),
+                        episode   = intent.getIntExtra("EPISODE_NUMBER", 0),
+                        key       = subtitleCacheKey(),
+                    )
+                    if (path != null && File(path).exists()) parseVtt(path) else null
                 } catch (e: Exception) {
                     Log.e(TAG, "subs: parse threw — ${e.message}", e); null
                 }
@@ -1359,16 +1490,21 @@ class HlsPlayerActivity : ComponentActivity() {
             captionsLoaded = true
             captionsOn = true
             activeSubtitleIndex = choice.option.index
+            // A different file has different timing, so an anchor taken against
+            // the old one would pair with a point from the new one and measure
+            // a drift that belongs to neither.
+            lastSyncPoint = null
+            syncSettleJob?.cancel()
             lastCueKey = noCueKey
             updateCcButtonState()
             startCaptionTicker()
             Log.d(TAG, "subs: captions loaded — ${choice.label} (${cues.size} cues), offset=${subtitleOffsetMs}ms")
             closeSubtitlePicker()
             showToast(
-                if (subtitleOffsetMs == 0L)
-                    "${choice.label} on. Still off? Nudge it with the ◀ / ▶ buttons."
+                if (subtitleOffsetMs != 0L || subtitleRate != 1.0)
+                    "${choice.label} on (timing saved from last time)."
                 else
-                    "${choice.label} on (saved timing ${fmtOffset(subtitleOffsetMs)})."
+                    "${choice.label} on. Out of sync? Nudge it with ◀ / ▶."
             )
         }
     }
@@ -1405,7 +1541,14 @@ class HlsPlayerActivity : ComponentActivity() {
         val active: List<Cue> =
             if (!captionsOn || p == null || parsedCues.isEmpty()) emptyList()
             else {
-                val t = p.currentPosition - subtitleOffsetMs   // +offset ⇒ cue shows later
+                // Map the playback clock into CUE space: videoTime = cue*rate +
+                // offset, inverted. +offset ⇒ cue shows later; rate > 1 stretches
+                // the subtitle to fit a longer video, fixing one that runs ahead.
+                //
+                // At rate 1.0 this is exactly the old expression: a Long position
+                // converts to Double losslessly below 2^53 ms, and dividing by 1.0
+                // is the identity, so the uncorrected path did not change.
+                val t = ((p.currentPosition - subtitleOffsetMs) / subtitleRate).toLong()
                 parsedCues.filter { t >= it.startMs && t <= it.endMs }.map { it.cue }
             }
         val key = active.joinToString("") { it.text ?: "" }
@@ -1428,7 +1571,7 @@ class HlsPlayerActivity : ComponentActivity() {
         val cc = syncButton(R.drawable.ic_sub_cc, "Toggle captions") { onCcClicked() }
         val earlier = syncButton(R.drawable.ic_sub_earlier, "Subtitles earlier") { nudgeOffset(-250) }
         val label = (inflater.inflate(R.layout.vidapi_sub_offset_label, bar, false) as TextView).apply {
-            text = fmtOffset(subtitleOffsetMs)
+            text = fmtTiming()
         }
         val later = syncButton(R.drawable.ic_sub_later, "Subtitles later") { nudgeOffset(+250) }
         val reset = syncButton(R.drawable.ic_sub_reset, "Reset subtitle timing") { resetOffset() }
@@ -1437,15 +1580,18 @@ class HlsPlayerActivity : ComponentActivity() {
         subOffsetLabel = label
         updateCcButtonState()
 
-        // Prepend the cluster to the right-hand controls, in order.
-        listOf(cc, earlier, label, later, reset).forEachIndexed { i, v -> bar.addView(v, i) }
+        // Four controls, and every one of them does something the viewer can
+        // state without jargon: show captions, earlier, later, start over. Rate
+        // correction is deliberately absent — it is measured, not operated.
+        listOf(cc, earlier, label, later, reset)
+            .forEachIndexed { i, v -> bar.addView(v, i) }
         Log.d(TAG, "subs: injected caption + timing controls into control bar")
     }
 
     private fun nudgeOffset(deltaMs: Int) {
         subtitleOffsetMs = (subtitleOffsetMs + deltaMs).coerceIn(-60_000L, 60_000L)
-        subOffsetLabel?.text = fmtOffset(subtitleOffsetMs)
-        persistOffset()
+        subOffsetLabel?.text = fmtTiming()
+        persistTiming()
         // Nudging the timing implies wanting captions visible — but only while
         // one is still selected. After an explicit turn-off there is nothing to
         // re-enable, and resurrecting it there would undo the user's choice.
@@ -1453,24 +1599,126 @@ class HlsPlayerActivity : ComponentActivity() {
             captionsOn = true; updateCcButtonState()
         }
         renderActiveCues()                                 // instant, no reload
+        armSyncSettle()                                    // learn from this nudge
         Log.d(TAG, "subs: timing offset → ${subtitleOffsetMs}ms")
     }
 
-    private fun resetOffset() {
-        subtitleOffsetMs = 0
-        subOffsetLabel?.text = fmtOffset(0)
-        persistOffset()
-        renderActiveCues()
-        Log.d(TAG, "subs: timing offset reset to 0")
+    /**
+     * Wait for the nudging to stop, then record where they stopped.
+     *
+     * Restarted on every press, so a run of presses collapses into the single
+     * value they landed on. Cancelled outright when captions are off, because an
+     * offset nobody can see is not an observation of anything.
+     */
+    private fun armSyncSettle() {
+        syncSettleJob?.cancel()
+        if (!captionsOn || !captionsLoaded) return
+        syncSettleJob = lifecycleScope.launch {
+            delay(SYNC_SETTLE_MS)
+            player?.currentPosition?.let { recordSyncPoint(it, subtitleOffsetMs) }
+        }
     }
 
-    private fun persistOffset() {
-        if (tmdbId > 0) subPrefs.edit().putLong(tmdbId.toString(), subtitleOffsetMs).apply()
+    /**
+     * The whole drift feature, with no UI attached.
+     *
+     * A viewer fixing a subtitle tells us, without meaning to, exactly what is
+     * wrong with it. Each time they settle on an offset they are asserting "at
+     * THIS moment, the right shift is THIS much". One such assertion is a
+     * constant offset and we already honour it. Two of them, far enough apart,
+     * are a LINE — and the slope of that line is the timing error we could not
+     * otherwise see.
+     *
+     *     needed offset at p   o(p) = p·(1 − 1/rate) + delta/rate
+     *     slope                m    = (o₂ − o₁) / (p₂ − p₁) = 1 − 1/rate
+     *     so                   rate = 1 / (1 − m)
+     *     and                  delta = rate·(o₁ − p₁·m)
+     *
+     * Both fall out exactly; nothing is guessed and no preset is involved. Note
+     * it does NOT need them to have fully corrected the drift either time — only
+     * to have stopped somewhere they were happy with, twice.
+     */
+    private fun recordSyncPoint(positionMs: Long, offsetMs: Long) {
+        val point = SyncPoint(positionMs, offsetMs)
+        val prev = lastSyncPoint
+        val span = positionMs - (prev?.positionMs ?: 0L)
+
+        // Too close together, or they seeked backwards: this is the new anchor
+        // rather than the far end of a measurement.
+        if (prev == null || span < SYNC_MIN_SPAN_MS) {
+            lastSyncPoint = point
+            Log.d(TAG, "subs: sync anchor at ${positionMs}ms offset=${offsetMs}ms")
+            return
+        }
+
+        // Under the noise floor: they settled on effectively the same answer
+        // twice, which means the subtitle is NOT drifting. Leave it alone.
+        if (abs(offsetMs - prev.offsetMs) < SYNC_MIN_OFFSET_DELTA_MS) {
+            lastSyncPoint = point
+            return
+        }
+
+        val m = (offsetMs - prev.offsetMs).toDouble() / span.toDouble()
+        val rate = 1.0 / (1.0 - m)
+        if (rate.isNaN() || rate !in SYNC_RATE_MIN..SYNC_RATE_MAX) {
+            // Not a rate error — more likely they simply wanted it shifted twice.
+            // Keep the newer point; the next one may still form a sane pair.
+            lastSyncPoint = point
+            Log.d(TAG, "subs: sync pair implied rate ${"%.4f".format(rate)} — out of band, ignored")
+            return
+        }
+
+        subtitleRate = rate
+        subtitleOffsetMs = (rate * (prev.offsetMs - prev.positionMs * m))
+            .toLong().coerceIn(-60_000L, 60_000L)
+        lastSyncPoint = null                               // measured; start over
+        subOffsetLabel?.text = fmtTiming()
+        persistTiming()
+        renderActiveCues()
+
+        // The one sentence the viewer ever sees about any of this. It names no
+        // mechanism — but it DOES name the way out, because something that
+        // changes your subtitles on its own has to be undoable by someone who
+        // never asked for it and does not know what it did.
+        showToast("This subtitle drifts — corrected for the rest of the film. " +
+                "Reset undoes it.")
+        Log.d(TAG, "subs: measured drift from 2 sync points — " +
+                "rate=${"%.5f".format(rate)} offset=${subtitleOffsetMs}ms " +
+                "(p1=${prev.positionMs} o1=${prev.offsetMs}, p2=$positionMs o2=$offsetMs)")
+    }
+
+    /** Start over — including anything measured, and the measurement in progress. */
+    private fun resetOffset() {
+        subtitleOffsetMs = 0
+        subtitleRate = 1.0
+        lastSyncPoint = null
+        syncSettleJob?.cancel()
+        subOffsetLabel?.text = fmtTiming()
+        persistTiming()
+        renderActiveCues()
+        Log.d(TAG, "subs: timing reset — offset 0, rate 1.0, sync points cleared")
+    }
+
+    /** Offset and rate travel together: a title is synced once, both parts of it. */
+    private fun persistTiming() {
+        if (tmdbId <= 0) return
+        subPrefs.edit()
+            .putLong(tmdbId.toString(), subtitleOffsetMs)   // key unchanged: saved offsets survive
+            .putFloat("${tmdbId}_ratef", subtitleRate.toFloat())
+            .remove("${tmdbId}_rate")                      // the old preset index, now meaningless
+            .apply()
     }
 
     private fun updateCcButtonState() { ccButton?.alpha = if (captionsOn) 1f else 0.45f }
 
     private fun fmtOffset(ms: Long): String = String.format(Locale.US, "%+.2fs", ms / 1000.0)
+
+    /**
+     * The control-bar read-out. Just the offset — the rate is deliberately NOT
+     * shown. "×1.043" is a number nobody can act on, and putting it here would
+     * re-introduce the mechanism this design exists to hide.
+     */
+    private fun fmtTiming(): String = fmtOffset(subtitleOffsetMs)
 
     /** Parse our WEBVTT (always HH:MM:SS.mmm from HlsSubtitles) into timed cues. */
     private fun parseVtt(path: String): List<TimedCue> {

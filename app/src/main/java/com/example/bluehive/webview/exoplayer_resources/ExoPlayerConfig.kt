@@ -2,6 +2,7 @@ package com.example.bluehive.webview.exoplayer_resources
 
 import android.content.Context
 import android.util.Log
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
@@ -776,6 +777,27 @@ object ExoPlayerConfig {
     fun trackSelector(context: Context): DefaultTrackSelector =
         DefaultTrackSelector(context).apply { applyVideoPolicy(this) }
 
+    /**
+     * Never let a player choose a text track. THE SAME RULE as the one applied in
+     * [applyVideoPolicy], for the players that do not take a selector from here.
+     *
+     * A bare ExoPlayer.Builder(context) builds its own DefaultTrackSelector, which
+     * carries the same preferred-text-language default and would render an
+     * embedded track just as happily — see applyVideoPolicy for the advertising
+     * track this stopped. The trailer and loading-screen players play our own clip
+     * and TMDB trailers, so nothing they touch carries one today. That is luck
+     * about the CONTENT rather than a property of the code, and the invariant is
+     * cheap enough to hold everywhere instead.
+     *
+     * Call it on any player not built through [buildPlayer].
+     */
+    fun disableTextTracks(player: Player) {
+        player.trackSelectionParameters = player.trackSelectionParameters
+            .buildUpon()
+            .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+            .build()
+    }
+
     /** Applies the shared video policy to a selector that already exists. */
     fun applyVideoPolicy(selector: DefaultTrackSelector) {
         selector.setParameters(
@@ -809,6 +831,38 @@ object ExoPlayerConfig {
                 .setPreferredAudioLanguages(
                     java.util.Locale.getDefault().language, "en"
                 )
+                // ── NO TEXT TRACK IS EVER SELECTED BY THE PLAYER ────────────
+                //
+                // We render captions ourselves — parsed into timed cues and
+                // driven from the playback clock into our own SubtitleView (see
+                // HlsPlayerActivity's header). PlayerView ALSO ships a built-in
+                // SubtitleView, which draws whatever text track the selector
+                // picked, and nothing connected that to our CC button. Two
+                // renderers, one switch.
+                //
+                // DefaultTrackSelector(context) — the constructor two lines up
+                // from here — fills in a preferred TEXT language from the device
+                // locale. So any English text track in the container got selected
+                // and drawn whether captions were on or not.
+                //
+                // MEASURED 2026-09-29, Terminator 2 (tmdb 280) on VidNest. The
+                // source is a progressive .mkv, and its header reads:
+                //
+                //   S_TEXT/UTF8                 ← an embedded SRT track
+                //   mkvmerge v56.1.0            ← what muxed it in
+                //   "Visit 480ptvseries.com For More Movie & TV Series"
+                //
+                // An advertising track the release group buried in the file. It
+                // sat on the picture at all times, below our own caption line
+                // because PlayerView's view has no bottom-padding fraction, and
+                // it could not be turned off: the control bar hides media3's CC
+                // button (we use our own), so the one switch for it was gone.
+                //
+                // Costs us nothing. The subtitles we do offer come from the
+                // extractor's subtitle_url and from the backend — never from
+                // track selection — and MiruroPlayerActivity has no captions at
+                // all, so it only benefits from the same junk being suppressed.
+                .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
         )
     }
 

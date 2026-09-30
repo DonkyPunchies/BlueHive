@@ -4368,7 +4368,7 @@ private fun AnimeEpisodeProviderButtons(
     ) {
         Row(horizontalArrangement = Arrangement.spacedBy((-2).dp)) {
             AnimeOverlayButton(
-                text = "Watch in DuB",
+                text = "Watch in English",
                 passionFont = passionFont,
                 focusRequester = focusRequesters[0],
                 buttonColors = AnimeDubButtonColors,
@@ -4386,7 +4386,7 @@ private fun AnimeEpisodeProviderButtons(
                 onClick = { if (miruroUrl != null) onDub(miruroUrl) else onUnavailable() }
             )
             AnimeOverlayButton(
-                text = "Watch in SuB",
+                text = "Watch in Japanese",
                 passionFont = passionFont,
                 focusRequester = focusRequesters[1],
                 buttonColors = AnimeSubButtonColors,
