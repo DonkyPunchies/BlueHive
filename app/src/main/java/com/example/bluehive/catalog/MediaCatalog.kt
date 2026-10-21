@@ -31,9 +31,6 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -51,12 +48,10 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import com.example.bluehive.utilities.TitleCardPress
 import com.example.bluehive.utilities.runTitleCardPress
@@ -68,11 +63,8 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -90,6 +82,8 @@ import com.example.bluehive.models.MediaItem
 import com.example.bluehive.repository.EpisodesRepository
 import com.example.bluehive.repository.RecommendationsRepository
 import com.example.bluehive.sidebarComponents.HistoryDropdown
+import com.example.bluehive.searchBarComponent.HoneycombKeyboardPopup
+import com.example.bluehive.searchBarComponent.hiveBackdropBlur
 import com.example.bluehive.searchBarComponent.openSearchScreen
 import com.example.bluehive.utilities.AppTypography
 import com.example.bluehive.utilities.MediaCard
@@ -290,27 +284,30 @@ fun MediaCatalogScreen(profileId: Int = -1) {
     var suppressNextHover     by remember { mutableStateOf(false) }
 
     // ── Search state ──────────────────────────────────────────────────────────
-    // Search no longer runs in-page. The search bar is a trampoline to
-    // SearchBarActivity — we only keep local UI state for the in-bar text field.
-    var isSearchEditing      by remember { mutableStateOf(false) }
+    // The search bar is a button. It pops the honeycomb keyboard up over the
+    // catalog, blurred behind it, the same way the home sidebar does; Search
+    // (or a finished Voice search) then opens the search page with the text.
     var isSearchBarFocused   by remember { mutableStateOf(false) }
-    var isSearchFieldFocused by remember { mutableStateOf(false) }
-    var searchText           by remember { mutableStateOf("") }
-    // Set to true when a multi-character chunk arrives (voice recognizer
-    // streams partials 4+ chars at a time). Manual keystrokes are 1 char
-    // each, so this stays false and the debounce trampoline is disabled
-    // for typed input — typed users must press the IME search button.
-    var voiceInputDetected   by remember { mutableStateOf(false) }
-    val keyboardController   = LocalSoftwareKeyboardController.current
+    var showSearchKeyboard   by remember { mutableStateOf(false) }
+    var hadSearchKeyboard    by remember { mutableStateOf(false) }
 
     // ── Focus requesters — control bar ────────────────────────────────────────
     val filterDropdownFocus = remember { FocusRequester() }
     val sortDropdownFocus   = remember { FocusRequester() }
     val yearDropdownFocus   = remember { FocusRequester() }
     val searchBarFocus      = remember { FocusRequester() }
-    val searchFieldFocus    = remember { FocusRequester() }
     val moviesFocus         = remember { FocusRequester() }
     val tvShowsFocus        = remember { FocusRequester() }
+
+    // Closing the search keyboard hands the focus back to the search bar.
+    LaunchedEffect(showSearchKeyboard) {
+        if (showSearchKeyboard) {
+            hadSearchKeyboard = true
+        } else if (hadSearchKeyboard) {
+            kotlinx.coroutines.android.awaitFrame()
+            runCatching { searchBarFocus.requestFocus() }
+        }
+    }
 
     // ── Grid focus state (ABSOLUTE INDEX) ─────────────────────────────────────
     var hasGridFocus     by remember { mutableStateOf(false) }
@@ -341,9 +338,6 @@ fun MediaCatalogScreen(profileId: Int = -1) {
             selectedMediaType = "movie"
             isAnyDropdownExpanded = false
             suppressNextHover = false
-            isSearchEditing = false
-            searchText = ""
-            voiceInputDetected = false
             hasGridFocus = false
             focusedAbsIndex = -1
             lastNavTime = 0L
@@ -533,41 +527,6 @@ fun MediaCatalogScreen(profileId: Int = -1) {
             }
     }
 
-    // ── Keyboard show/hide for search field ───────────────────────────────────
-    LaunchedEffect(isSearchFieldFocused) {
-        if (isSearchFieldFocused) keyboardController?.show() else keyboardController?.hide()
-    }
-
-    LaunchedEffect(isSearchEditing) {
-        if (isSearchEditing) {
-            kotlinx.coroutines.android.awaitFrame()
-            searchFieldFocus.requestFocus()
-        }
-    }
-
-    // ── Debounced trampoline to SearchBarActivity ────────────────────────────
-    // Mirrors SearchScreen.kt's debounce-on-quiet pattern. The Android speech
-    // recognizer streams partial results ("res" → "resi" → "resident" →
-    // "resident evil") while the user holds the mic button. Each partial
-    // restarts this effect, cancelling the previous timer. Only when the user
-    // stops talking (or stops typing) and 1000ms of silence passes does the
-    // trampoline fire with the FINAL phrase.
-    //
-    // Manual typing: each keystroke restarts the timer; pause for 1000ms and
-    // it fires automatically. The IME "search" button still routes through
-    // onSubmit above for instant submission.
-    LaunchedEffect(searchText) {
-        val q = searchText.trim()
-        if (q.length < 2) return@LaunchedEffect
-        if (!voiceInputDetected) return@LaunchedEffect  // ← this line must be present
-        delay(1000)
-        isSearchEditing = false
-        keyboardController?.hide()
-        searchText = ""
-        voiceInputDetected = false
-        openSearchScreen(context, profileId, q)
-    }
-
     // ── Helper: get or create a FocusRequester for an absolute index ─────────
     fun requesterFor(absIndex: Int): FocusRequester {
         return gridFocusRequesters.getOrPut(absIndex) { FocusRequester() }
@@ -723,7 +682,13 @@ fun MediaCatalogScreen(profileId: Int = -1) {
     //  UI
     // ─────────────────────────────────────────────────────────────────────────
 
-    Box(modifier = Modifier.fillMaxSize()) {
+    // With the search keyboard up, the catalog blurs behind it -- the same GPU
+    // blur home puts behind the sidebar (API 31+; older boxes go without).
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .hiveBackdropBlur(showSearchKeyboard)
+    ) {
 
         Image(
             painter            = painterResource(id = R.drawable.home_screen),
@@ -832,39 +797,23 @@ fun MediaCatalogScreen(profileId: Int = -1) {
                     .align(Alignment.TopStart)
                     .offset(x = SEARCH_BAR_X, y = CONTROLS_ROW_Y + 4.dp)
                     .zIndex(1f),
-                searchText = searchText,
-                onSearchTextChange = { newText ->
-                    // Detect voice: a single onValueChange jump of 4+ characters
-                    // means the speech recognizer streamed a partial result. Manual
-                    // typing arrives one character at a time and never trips this.
-                    if (newText.length - searchText.length >= 4) {
-                        voiceInputDetected = true
-                    }
-                    searchText = newText
-                },
-                isFocused = isSearchBarFocused,
-                isEditing = isSearchEditing,
+                // No glow while the keyboard is up -- it has the focus, the
+                // same rule as the home sidebar behind its keyboard.
+                isFocused = isSearchBarFocused && !showSearchKeyboard,
                 onFocusChange = { isSearchBarFocused = it },
-                onFieldFocusChange = { isSearchFieldFocused = it },
                 barFocusRequester = searchBarFocus,
-                fieldFocusRequester = searchFieldFocus,
-                onStartEditing = { isSearchEditing = true },
-                onStopEditing = { isSearchEditing = false },
-                onSubmit = { query ->
-                    val q = query.trim()
-                    isSearchEditing = false
-                    keyboardController?.hide()
-                    if (q.isNotEmpty()) {
-                        searchText = ""
-                        openSearchScreen(context, profileId, q)
-                    } else {
-                        searchBarFocus.requestFocus()
-                    }
-                },
-                onClear = {
-                    searchText = ""
-                },
+                onOpen = { showSearchKeyboard = true },
             )
+
+            if (showSearchKeyboard) {
+                HoneycombKeyboardPopup(
+                    onSearch = { query ->
+                        showSearchKeyboard = false
+                        openSearchScreen(context, profileId, query)
+                    },
+                    onDismiss = { showSearchKeyboard = false },
+                )
+            }
 
 
             // ── Movies button ─────────────────────────────────────────────────────
@@ -1210,24 +1159,18 @@ private fun MediaItem.toCardDisplayData(): CardDisplayData {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Search bar (unchanged)
+//  Search bar — a button into the honeycomb search screen
 // ─────────────────────────────────────────────────────────────────────────────
 
+// It used to be a text field on the system keyboard. The honeycomb keyboard
+// has its own keys and voice, so this only has to bring it up.
 @Composable
 private fun CatalogSearchBar(
     modifier: Modifier = Modifier,
-    searchText: String,
-    onSearchTextChange: (String) -> Unit,
     isFocused: Boolean,
-    isEditing: Boolean,
     onFocusChange: (Boolean) -> Unit,
-    onFieldFocusChange: (Boolean) -> Unit,
     barFocusRequester: FocusRequester,
-    fieldFocusRequester: FocusRequester,
-    onStartEditing: () -> Unit,
-    onStopEditing: () -> Unit,
-    onSubmit: (String) -> Unit,
-    onClear: () -> Unit,
+    onOpen: () -> Unit,
 ) {
     Box(
         modifier = modifier
@@ -1237,14 +1180,9 @@ private fun CatalogSearchBar(
                 if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                 when (event.key) {
                     Key.DirectionCenter, Key.Enter, Key.NumPadEnter -> {
-                        if (!isEditing) { onStartEditing(); true } else false
-                    }
-                    Key.Back -> {
-                        if (isEditing) {
-                            onStopEditing()
-                            barFocusRequester.requestFocus()
-                            true
-                        } else false
+                        BlueHiveApplication.playClickSound()
+                        onOpen()
+                        true
                     }
                     Key.DirectionLeft, Key.DirectionRight, Key.DirectionUp, Key.DirectionDown -> {
                         BlueHiveApplication.playHoverSound()
@@ -1257,7 +1195,7 @@ private fun CatalogSearchBar(
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null
-            ) { onStartEditing() }
+            ) { onOpen() }
     ) {
         Image(
             painter = painterResource(id = R.drawable.button_focus_wide_glow),
@@ -1266,7 +1204,7 @@ private fun CatalogSearchBar(
                 .offset(x = (-14).dp, y = (-17.7).dp)
                 .width(252.dp + 36.dp - 60.dp)
                 .height(12.dp + 40.2.dp)
-                .graphicsLayer(alpha = if (isFocused || isEditing) 1f else 0f),
+                .graphicsLayer(alpha = if (isFocused) 1f else 0f),
             contentScale = ContentScale.FillBounds
         )
 
@@ -1290,48 +1228,16 @@ private fun CatalogSearchBar(
                     .graphicsLayer(alpha = 0.4f)
             )
 
-            BasicTextField(
-                value = searchText,
-                onValueChange = onSearchTextChange,
-                singleLine = true,
-                cursorBrush = SolidColor(if (isEditing) Color.White else Color.Transparent),
-                textStyle = TextStyle(color = Color.White, fontSize = 11.sp),
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                keyboardActions = KeyboardActions(onSearch = { onSubmit(searchText) }),
+            Text(
+                text = "Search catalog...",
+                color = Color(0xFF656565),
+                fontSize = 11.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
                 modifier = Modifier
                     .align(Alignment.CenterStart)
-                    .padding(start = 33.dp)
-                    .width(114.dp)
-                    .focusRequester(fieldFocusRequester)
-                    .focusProperties { canFocus = isEditing }
-                    .onFocusChanged { state ->
-                        onFieldFocusChange(state.isFocused)
-                        if (!state.isFocused) onStopEditing()
-                    }
-                    .onKeyEvent { event ->
-                        if (
-                            event.type == KeyEventType.KeyUp &&
-                            (event.key == Key.Enter || event.key == Key.NumPadEnter || event.key == Key.DirectionCenter) &&
-                            searchText.isNotBlank()
-                        ) {
-                            onSubmit(searchText)
-                            true
-                        } else false
-                    }
+                    .padding(start = 28.dp)
             )
-
-            if (searchText.isEmpty() && !isEditing) {
-                Text(
-                    text = "Search catalog...",
-                    color = Color(0xFF656565),
-                    fontSize = 11.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier
-                        .align(Alignment.CenterStart)
-                        .padding(start = 28.dp)
-                )
-            }
         }
     }
 }
@@ -1463,15 +1369,12 @@ private fun PreviewCatalogControlBar() {
     var selectedSort         by remember { mutableStateOf("Most Popular") }
     var selectedYear         by remember { mutableStateOf("Assorted") }
     var selectedMediaType    by remember { mutableStateOf("movie") }
-    var searchText           by remember { mutableStateOf("") }
-    var isSearchEditing      by remember { mutableStateOf(true) }
     var isSearchBarFocused   by remember { mutableStateOf(true) }
 
     val filterFR    = remember { FocusRequester() }
     val sortFR      = remember { FocusRequester() }
     val yearFR      = remember { FocusRequester() }
     val searchBarFR = remember { FocusRequester() }
-    val searchFldFR = remember { FocusRequester() }
     val moviesFR    = remember { FocusRequester() }
     val tvFR        = remember { FocusRequester() }
 
@@ -1499,12 +1402,10 @@ private fun PreviewCatalogControlBar() {
         )
         CatalogSearchBar(
             modifier = Modifier.align(Alignment.TopStart).offset(x = SEARCH_BAR_X, y = CONTROLS_ROW_Y + 4.dp).zIndex(1f),
-            searchText = searchText, onSearchTextChange = { searchText = it },
-            isFocused = isSearchBarFocused, isEditing = isSearchEditing,
-            onFocusChange = { isSearchBarFocused = it }, onFieldFocusChange = {},
-            barFocusRequester = searchBarFR, fieldFocusRequester = searchFldFR,
-            onStartEditing = { isSearchEditing = true }, onStopEditing = { isSearchEditing = false },
-            onSubmit = {}, onClear = { searchText = "" },
+            isFocused = isSearchBarFocused,
+            onFocusChange = { isSearchBarFocused = it },
+            barFocusRequester = searchBarFR,
+            onOpen = {},
         )
         ModularButton(
             textConfig = ModularButtonTextConfig(text = "Movies", fontSize = 10f),

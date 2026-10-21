@@ -222,6 +222,9 @@ private const val SHELF_WINDOW_RADIUS = 1
 private const val HEADER_REAPPEAR_DELAY_MS   = 150L
 private const val HEADER_FADE_IN_DURATION_MS = 300
 
+// How long the rows take to fade out before a scrollToShelf jump swaps them.
+private const val SCROLL_FADE_OUT_MS = 120
+
 
 @Composable
 fun ShelfStack(
@@ -244,6 +247,26 @@ fun ShelfStack(
     // apart from showContinueWatching on purpose -- that one flips with the
     // focused shelf, this one only when the history does.
     reserveContinueWatching: Boolean = true,
+    /**
+     * Non-null asks the stack to take focus and land on THIS shelf index.
+     *
+     * For arrivals from outside that care which row they reach -- today, DOWN
+     * out of the Continue Watching panel. Cleared through
+     * [onEnterAtShelfHandled] once acted on, so the request is an event rather
+     * than a state the stack keeps re-reading.
+     */
+    enterAtShelf: Int? = null,
+    onEnterAtShelfHandled: () -> Unit = {},
+    /**
+     * Non-null slides the stack to THIS shelf and leaves focus where it is --
+     * the other half of [enterAtShelf]. For leaving the rows from outside:
+     * "Top of Page" sends focus up to the tabs and the rows back to the first
+     * shelf, so what sits under the tabs is the top of the page as well.
+     *
+     * Cleared through [onScrollToShelfHandled], as [enterAtShelf] is.
+     */
+    scrollToShelf: Int? = null,
+    onScrollToShelfHandled: () -> Unit = {},
 ) {
     val shelves = remember(mediaType) {
         when (mediaType) {
@@ -280,6 +303,27 @@ fun ShelfStack(
     LaunchedEffect(focusedShelfIndex) {
         onFirstShelfChanged(focusedShelfIndex == 0)
         onShelfChanged(focusedShelf)
+    }
+
+    // ── ENTERING THE STACK AT A NAMED ROW ────────────────────────────
+    //
+    // Routed through requestNavigation -- the SAME call the stack's own DOWN
+    // makes -- so an outside arrival gets the identical row slide, parking and
+    // card handoff rather than a second, subtly different path into the same
+    // place.
+    //
+    // This works from outside the stack because the handoff's first act is
+    // parkingRequester.requestFocus(): focus does not have to already be in
+    // here for the rest of the sequence to hold.
+    LaunchedEffect(enterAtShelf) {
+        val target = enterAtShelf ?: return@LaunchedEffect
+        if (target in shelves.indices) {
+            // Already on that row (only reachable if a caller asks for the row
+            // it is on): nothing to slide, just take the card.
+            if (target == focusedShelfIndex) tracker.requestCardFocus(shelves[target])
+            else tracker.requestNavigation(target)
+        }
+        onEnterAtShelfHandled()
     }
 
     // Prevents DPad mash from queueing multiple transitions, and blocks a
@@ -328,14 +372,35 @@ fun ShelfStack(
     // toward StiffnessLow (200) for lazier. visibilityThreshold is half a pixel
     // -- the default for a generic Float is 0.01, which for a value measured in
     // PIXELS leaves the spring running a long invisible tail.
+    //
+    // The one exception is snapNextMove: a jump of several rows from
+    // scrollToShelf lands at once instead (see there). Every UP and DOWN still
+    // slides on the spring.
+    var snapNextMove by remember { mutableStateOf(false) }
     val animatedTranslationY by animateFloatAsState(
         targetValue = -focusedShelfIndex * rowSpacingPx,
-        animationSpec = spring(
+        animationSpec = if (snapNextMove) snap() else spring(
             dampingRatio = Spring.DampingRatioNoBouncy,
             stiffness = Spring.StiffnessMediumLow,
             visibilityThreshold = 0.5f,
         ),
         label = "stackTranslationY",
+    )
+
+    // Where the rows are drawn: the spring, except during a snapped jump, when
+    // it is the target itself from the very first frame. The spring's snap only
+    // lands a frame later, and that frame would draw the new rows at the OLD
+    // offset -- off-screen, leaving the shelf area empty for as long as their
+    // first draw takes. Read only from graphicsLayer blocks, i.e. at draw time.
+    fun stackTranslationY(): Float =
+        if (snapNextMove) -focusedShelfIndex * rowSpacingPx else animatedTranslationY
+
+    // The whole stack faded out for a scrollToShelf jump; see there.
+    var stackHidden by remember { mutableStateOf(false) }
+    val stackAlpha by animateFloatAsState(
+        targetValue = if (stackHidden) 0f else 1f,
+        animationSpec = if (stackHidden) tween(SCROLL_FADE_OUT_MS) else snap(),
+        label = "stackAlpha",
     )
 
     // Navigation handoff.
@@ -414,6 +479,62 @@ fun ShelfStack(
     // shelf's saved card on the way in.
     var stackHadFocus by remember { mutableStateOf(false) }
 
+    // Handed to every row, whose own card restores must not act while focus is
+    // outside the stack (see scrollToShelf below). A lambda, so the read happens
+    // inside their effects rather than in composition: focus entering or
+    // leaving the stack must not recompose the rows.
+    val stackHasFocus = remember { { stackHadFocus } }
+
+    // ── MOVING TO A ROW WITHOUT TAKING FOCUS ─────────────────────────
+    //
+    // Focus is already where the caller sent it, so this only sets the row:
+    // the stack slides, the header changes, and onFirstShelfChanged brings
+    // Continue Watching back when the row is the first one.
+    //
+    // A row that comes back into the window as the focused one restores its
+    // saved card -- stackHasFocus is what stops that taking focus off the tabs.
+    // The card is still remembered, and the next entry from the tabs lands on it.
+    //
+    // A CUT, NOT A SLIDE. Only the rows beside the target are composed, so
+    // sliding several rows showed an empty shelf area first and then the
+    // target's neighbour sweeping through its slot before the target arrived
+    // (screen recording, 2026-10-16).
+    //
+    // THE SHELF AREA IS CLEARED FIRST. The swap's first frame draws two rows
+    // at once and is slow (~350 ms measured), and the screen holds whatever
+    // came before it for that long. Old rows standing still read as the press
+    // lagging; an area that has just faded out reads as a cut. The header goes
+    // with them, as a navigation hides it, and fades back in after.
+    LaunchedEffect(scrollToShelf) {
+        val target = scrollToShelf ?: return@LaunchedEffect
+        when {
+            target !in shelves.indices || target == focusedShelfIndex -> Unit
+            // A row change already under way owns focus; leave it to finish.
+            tracker.isNavigating -> Unit
+            // Focus is outside: just move the rows.
+            !stackHadFocus -> try {
+                headerVisible = false
+                stackHidden = true
+                delay(SCROLL_FADE_OUT_MS + 32L)
+
+                snapNextMove = true
+                focusedShelfIndex = target
+                stackHidden = false
+                // Snap held for a few frames, until the spring has taken it.
+                repeat(3) { kotlinx.coroutines.android.awaitFrame() }
+            } finally {
+                // However this ends: left set, every later UP and DOWN would
+                // cut, or the rows would stay invisible.
+                snapNextMove = false
+                stackHidden = false
+            }
+            // Focus is in here, and moving the rows out from under it would
+            // drop it -- so take the row the ordinary way, focus and all.
+            else -> tracker.requestNavigation(target)
+        }
+        onScrollToShelfHandled()
+    }
+
     Box(
         modifier = modifier
             // Entering from the tabs above: route to the focused shelf's row
@@ -485,8 +606,15 @@ fun ShelfStack(
         )
 
         // Inner Box carries the translation.  Holds all in-window shelves.
+        // Also the scrollToShelf fade -- modulated, not buffered, for the same
+        // reason as each row's alpha below: a buffer would slice off everything
+        // drawn outside this box's bounds, which is most of the stack.
         Box(
-            modifier = Modifier.graphicsLayer { translationY = animatedTranslationY },
+            modifier = Modifier.graphicsLayer {
+                translationY = stackTranslationY()
+                alpha = stackAlpha
+                compositingStrategy = CompositingStrategy.ModulateAlpha
+            },
         ) {
             shelves.forEachIndexed { index, shelf ->
                 val distance = abs(index - focusedShelfIndex)
@@ -552,7 +680,7 @@ fun ShelfStack(
                             // this runs in the DRAW phase and costs no
                             // recomposition per frame.
                             val rows =
-                                (index * rowSpacingPx + animatedTranslationY) / rowSpacingPx
+                                (index * rowSpacingPx + stackTranslationY()) / rowSpacingPx
                             alpha = when {
                                 // Above the focus line: fade out across one row
                                 // of travel, so arriving from above fades in.
@@ -581,6 +709,7 @@ fun ShelfStack(
                             repository           = repository,
                             isFocused            = isFocused,
                             cardFocusEpoch       = tracker.cardFocusEpoch(shelf),
+                            stackHasFocus        = stackHasFocus,
                             showContinueWatching = showContinueWatching
                                     && shelf == ContentShelf.POPULAR,
                             reserveContinueWatching = reserveContinueWatching,
@@ -624,6 +753,7 @@ private fun ShelfRowContent(
     repository: ShelfRepository,
     isFocused: Boolean,
     cardFocusEpoch: Int,
+    stackHasFocus: () -> Boolean,
     showContinueWatching: Boolean,
     onMediaClick: (MediaItem) -> Unit,
     profileId: Int = -1,
@@ -889,6 +1019,7 @@ private fun ShelfRowContent(
                 pendingFocusTmdbId = pendingFocusProvider,
                 cardFocusEpoch     = cardFocusEpoch,
                 isFocusedShelf     = isFocused,
+                stackHasFocus      = stackHasFocus,
                 onFocusRestored    = {
                     if (BuildConfig.DEBUG) Log.d("FOCUS_MEMORY", "restored $shelf")
                 },
@@ -915,6 +1046,7 @@ private fun ShelfRowContent(
             pendingFocusTmdbId = pendingFocusProvider,
             cardFocusEpoch     = cardFocusEpoch,
             isFocusedShelf     = isFocused,
+            stackHasFocus      = stackHasFocus,
             onFocusRestored    = {
                 if (BuildConfig.DEBUG) Log.d("FOCUS_MEMORY", "restored $shelf")
             },

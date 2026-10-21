@@ -100,6 +100,15 @@ sealed class TrendingFrameState {
 // homeScreenSectionRules — the window preloader and AppWarmup's splash prefetch
 // build byte-identical requests, so renders here are always cache hits.
 
+// THE PICTURE AREA IS 16:9, the shape of every TMDB backdrop. At 424 dp wide
+// it was 1.94:1, so each backdrop was zoomed ~9% and lost ~20 px off its top
+// and bottom; the Latest Trailers panel beside it is 16:9 and shows its images
+// whole. At 389 x 218.7 dp the picture is 778 x 437 px on the onn box, and the
+// w780 files (780 x 439) fit it almost exactly. Also the slide distance of the
+// carousel, which must match or a slide stops short of the edge.
+private val TRENDING_VIEWPORT_W = 389.dp
+private val TRENDING_VIEWPORT_H = 218.7.dp
+
 // Hoisted gradient — single allocation for the lifetime of the process.
 // Brush.verticalGradient inside a composable allocates on every recompose.
 private val BACKDROP_SCRIM = Brush.verticalGradient(
@@ -219,26 +228,11 @@ private fun TrendingItemAdapterCompose(
             }
         }
 
-        // Top-right: rating
-        item.voteAverage?.let { rating ->
-            if (rating > 0) {
-                Text(
-                    text = String.format(java.util.Locale.US, "%.1f", rating),
-                    color    = Color.White,
-                    fontFamily = metaFont,
-                    // Slightly larger than the pills: it is the only number on
-                    // the frame with no label, so it has to carry itself.
-                    fontSize = 12.sp,
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(end = 8.dp, top = 8.dp)
-                        .clip(BADGE_SHAPE)
-                        .background(Color(0xBB000000))
-                        .border(1.dp, BADGE_BORDER, BADGE_SHAPE)
-                        .padding(horizontal = 7.dp, vertical = 4.dp)
-                )
-            }
-        }
+        // TOP-RIGHT IS DELIBERATELY EMPTY. The score badge that sat here was
+        // removed on request; the corner is being kept clear for something
+        // else. item.voteAverage is still carried on the model and still
+        // populated from the detail fetch below, so putting a number back here
+        // needs no plumbing -- only a composable.
     }
 }
 
@@ -463,7 +457,7 @@ private fun TrendingNavigationCompose(
             .focusable(enabled = isInteractive, interactionSource = interaction)
     ) {
         val density = androidx.compose.ui.platform.LocalDensity.current
-        val cardWidthPx = with(density) { 424.dp.toPx() }
+        val cardWidthPx = with(density) { TRENDING_VIEWPORT_W.toPx() }
         val inc         = incomingIndex
         val p           = slideProgress.value
 
@@ -566,22 +560,30 @@ fun HomeScreenTrendingCompose(
         }
     }
 
+    // Leaving Selected is a back-out, matching the trailer panel: it undoes the
+    // press that entered, and the shadow clears with it.
     BackHandler(enabled = trendingState is TrendingFrameState.Selected) {
+        BlueHiveApplication.playBackOutSound()
         trendingState = TrendingFrameState.Focused
         hitboxFocusRequester.requestFocus()
     }
 
     // ── Layout dimensions — mirror HRC frame pattern, adjust to taste ────────
-    val shadowW = 495.dp;  val shadowH = 295.dp
+    //
+    // Every width is 35 dp narrower than it was before 2026-10-19, to make the
+    // picture 16:9 (see TRENDING_VIEWPORT_W). The three frame images were cut
+    // down by the same 70 px rather than squeezed, so these sizes still draw
+    // them 1:1. Home moved the panel 35 dp right to keep its right edge.
+    val shadowW = 460.dp;  val shadowH = 295.dp
     val shadowX = 0.dp;    val shadowY = 1.5.dp
 
-    val focusedW = 488.dp; val focusedH = 285.75.dp
+    val focusedW = 453.dp; val focusedH = 285.75.dp
     val focusedX = 4.dp;   val focusedY = 6.5.dp
 
-    val frameW   = 455.dp; val frameH   = 252.75.dp
+    val frameW   = 420.dp; val frameH   = 252.75.dp
     val frameX   = 20.dp;  val frameY   = 23.dp
 
-    val viewportW = 424.dp; val viewportH = 218.7.dp
+    val viewportW = TRENDING_VIEWPORT_W; val viewportH = TRENDING_VIEWPORT_H
     val viewportX = 36.5.dp;  val viewportY = 38.5.dp
 
     Box(modifier = modifier) {
@@ -599,7 +601,15 @@ fun HomeScreenTrendingCompose(
             contentScale = ContentScale.FillBounds
         )
 
-        // Shadow — disappears only when Selected
+        // Shadow — visible ONLY when Selected.
+        //
+        // INVERTED FROM ITS ORIGINAL SENSE, matching the Continue Watching
+        // panel. The focus overlay is drawn for BOTH Focused and Selected, so
+        // this shadow is the only thing separating "I am on this panel" from
+        // "I am inside it" -- and inside is the state worth marking, because it
+        // is where LEFT/RIGHT stop moving between sections and start turning
+        // the carousel. Spending the effect at rest and removing it on entry
+        // said the least at the moment something actually changed.
         Image(
             painter = painterResource(id = R.drawable.hrc_frame_shadow),
             contentDescription = "Trending frame shadow",
@@ -608,7 +618,7 @@ fun HomeScreenTrendingCompose(
                 .width(shadowW)
                 .height(shadowH)
                 .zIndex(1f)
-                .graphicsLayer(alpha = if (trendingState is TrendingFrameState.Selected) 0f else 1f),
+                .graphicsLayer(alpha = if (trendingState is TrendingFrameState.Selected) 1f else 0f),
             contentScale = ContentScale.FillBounds
         )
 
@@ -735,9 +745,36 @@ fun HomeScreenTrendingCompose(
                     if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                     if (trendingState is TrendingFrameState.Selected) return@onPreviewKeyEvent false
                     when (event.key) {
-                        Key.DirectionUp, Key.DirectionDown, Key.DirectionRight -> {
+                        // DOWN lands on something -- the Continue Watching
+                        // panel or the shelf row below -- so the departing side
+                        // speaks for the move and then lets focus go.
+                        Key.DirectionDown -> {
                             BlueHiveApplication.playHoverSound(); false
                         }
+
+                        // UP IS AN EDGE TOO. The comment this replaces claimed
+                        // UP reached "the frame above"; there is no frame above.
+                        // This panel sits at the top of the content area, and
+                        // measured, focus does not move.
+                        Key.DirectionUp -> true
+
+                        // RIGHT IS AN EDGE. This frame is the rightmost thing
+                        // on its row, so the press moved nothing while still
+                        // chirping as though it had: the sound said "you went
+                        // somewhere" to a viewer looking at an unchanged screen,
+                        // which is worse than silence because it reads as the
+                        // screen having missed the press.
+                        //
+                        // Consumed rather than passed through, so nothing below
+                        // can quietly take focus off the edge instead -- the
+                        // Continue Watching panel sits right-and-below and is a
+                        // plausible target for a directional search.
+                        //
+                        // Only the UNSELECTED frame. Once the carousel is
+                        // entered, RIGHT turns it, and that handler is upstream
+                        // of this one (see the Selected early-return above).
+                        Key.DirectionRight -> true
+
                         else -> false
                     }
                 }

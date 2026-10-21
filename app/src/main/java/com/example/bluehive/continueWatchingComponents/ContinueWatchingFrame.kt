@@ -487,7 +487,7 @@ fun HomeScreenContinueWatchingCompose(
         }
     }
 
-    // Back exits Selected -> Focused (shadow returns, focus back to frame)
+    // Back exits Selected -> Focused (shadow clears, focus back to frame)
     BackHandler(enabled = frameState is ContinueWatchingFrameState.Selected) {
         Log.d("CONTINUE_WATCHING", "⬅️ Back pressed - exiting Selected")
         frameState = ContinueWatchingFrameState.Focused
@@ -551,7 +551,18 @@ fun HomeScreenContinueWatchingCompose(
             contentScale = ContentScale.FillBounds
         )
 
-        // ✅ SHADOW: visible ONLY when UnFocused OR Focused (disappears when Selected)
+        // ✅ SHADOW: visible ONLY when Selected.
+        //
+        // INVERTED FROM ITS ORIGINAL SENSE, on purpose. It used to sit under the
+        // panel at rest and vanish on entry, which spent the effect on the two
+        // states the viewer is in most of the time and removed it at the one
+        // moment something had actually changed.
+        //
+        // Focused and Selected are otherwise near-identical here -- the focus
+        // overlay is drawn for both -- so this is the ONLY thing separating "I
+        // am on this panel" from "I am inside it", and inside is the state that
+        // needs saying: it is where LEFT/RIGHT stop moving between sections and
+        // start moving within the list.
         Image(
             painter = painterResource(id = R.drawable.continue_watching_frame_shadow),
             contentDescription = "Continue Watching Shadow",
@@ -560,7 +571,7 @@ fun HomeScreenContinueWatchingCompose(
                 .width(shadowW)
                 .height(shadowH)
                 .zIndex(shadowZ)
-                .graphicsLayer(alpha = if (frameState is ContinueWatchingFrameState.Selected) 0f else 1f),
+                .graphicsLayer(alpha = if (frameState is ContinueWatchingFrameState.Selected) 1f else 0f),
             contentScale = ContentScale.FillBounds
         )
 
@@ -641,7 +652,7 @@ fun HomeScreenContinueWatchingCompose(
                     }
                 }
 
-                // Click selects it (shadow disappears + nav locks)
+                // Click selects it (shadow appears + nav locks)
                 .clickable(
                     interactionSource = frameInteraction,
                     indication = null

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Double triangle, pointing forward. Mirror of ic_seek_rewind.
+
+  NO android:tint HERE, deliberately — see the note in ic_seek_rewind.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+  <path
+      android:fillColor="#FFFFFFFF"
+      android:pathData="M4,18l8.5,-6L4,6v12zM13,6v12l8.5,-6L13,6z"/>
+</vector>

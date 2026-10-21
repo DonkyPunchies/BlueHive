@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The control bar's one subtitle control.
+
+    REPLACES FIVE VIEWS: a CC icon, two nudge arrows, an offset read-out and a
+    reset. Those timing controls live behind this button now, because timing is
+    adjusted rarely and judged by watching, while the bar is navigated constantly
+    on a d-pad.
+
+    IT WEARS THE BAND'S OWN BACKGROUND. It used to carry a hairline white outline
+    at 3dp radius, from a time when it sat among media3's bare glyphs and had to
+    announce itself as something pressable. Every control beside it is now a
+    10dp rounded fill with a blue focus ring, so the outline was the only thing
+    in the row still speaking the old language. Sharing player_pill_bg means it
+    also shares the focus treatment, which is the part that has to match.
+
+    ICON AND TEXT, not either alone. The glyph is what the eye finds in the
+    row; the words are what make the state readable without decoding opacity,
+    which is what an icon on its own asked of you at three metres.
+
+    MEDIUM, not regular. It is the only text in the band that is a control
+    rather than a read-out, and at 14sp on a panel several metres away regular
+    Roboto thins out next to the solid glyphs beside it. Bold was too loud for
+    a label that is read once; medium just stops it looking skinny.
+-->
+<TextView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="wrap_content"
+    android:layout_height="40dp"
+    android:layout_gravity="center_vertical"
+    android:paddingStart="16dp"
+    android:paddingEnd="16dp"
+    android:background="@drawable/player_pill_bg"
+    android:textColor="#FFDBE4F6"
+    android:textSize="14sp"
+    android:fontFamily="sans-serif-medium"
+    android:includeFontPadding="false"
+    android:gravity="center"
+    android:drawableStart="@drawable/ic_player_cc"
+    android:drawablePadding="9dp"
+    android:maxLines="1"
+    android:ellipsize="end"
+    android:maxWidth="260dp"
+    android:focusable="true"
+    android:clickable="true"
+    android:text="Subtitles" />

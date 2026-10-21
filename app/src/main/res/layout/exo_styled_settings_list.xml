@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    SHADOWS A media3 LAYOUT. Same filename as androidx.media3.ui's own, so the
+    app's copy wins at resource merge and every PlayerView in the app gets this
+    one. There is no per player override: PlayerControlView inflates this by
+    constant in its constructor.
+
+    THE ROOT MUST STAY A RecyclerView. PlayerControlView casts the inflation
+    result to RecyclerView with no instanceof check, so any other root is a
+    ClassCastException the moment a player is built, not when the menu opens.
+
+    PADDING IS LOAD BEARING, not decoration. It does two jobs:
+      - it is what makes the window big enough for the card to sit where
+        player_menu_surface insets it to, 106dp up and 44dp in. The popup is
+        sized from this view's measured size, so padding is the only way to buy
+        space media3 did not intend to give.
+      - the extra 6dp on each side beyond the insets is the gap between a
+        focused row's outline and the edge of the card.
+    Change either number here and the matching inset in player_menu_surface has
+    to move with it, or the rows drift off the card.
+-->
+<androidx.recyclerview.widget.RecyclerView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/exo_settings_listview"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/player_menu_surface"
+    android:paddingLeft="6dp"
+    android:paddingTop="8dp"
+    android:paddingRight="50dp"
+    android:paddingBottom="114dp"
+    android:layoutDirection="ltr"
+    android:scrollbars="none"/>

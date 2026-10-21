@@ -91,6 +91,10 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import com.example.bluehive.BlueHiveApplication
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Dp
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.BoxWithConstraints
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -826,29 +830,159 @@ fun DefaultServerPrompt(
 //    Back is handled by the host screen (BackHandler), not here.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── Neon scrollbar ──────────────────────────────────────────────────────────
+//
+// Same look as the avatar grid's: a dark track with a thumb that reads as lit
+// rather than merely coloured. That one is positioned absolutely inside a fixed
+// layout and is left alone; this is the version that sizes itself to whatever
+// it is dropped into.
+//
+// A DELIBERATE COPY of AvatarGridScrollbar in ProfileCreationActivity -- same
+// colours, same 4dp core, same three-rect bloom, same track length. The two are
+// the same control in the user's eyes and must not drift, so changing one means
+// changing the other.
+//
+// A gradient bloom was tried here and rejected on sight: smoother in principle,
+// visibly not the same object next to the grid's. Matching beat improving.
+//
+// They are separate functions because AvatarGridScrollbar positions itself with
+// absolute offsets inside a fixed-size panel, while this one measures itself
+// against whatever it is dropped into. Unifying them means giving the profile
+// screen a layout contract it does not currently have.
+private val NEON_SCROLL_TRACK: Color = Color(0xFF3A3012)
+private val NEON_SCROLL_NEON:  Color = Color(0xFFFFC800)
+
+/**
+ * The widest bloom spread below. The bar reserves this much lateral room so the
+ * glow has somewhere to render.
+ *
+ * MEASURED FROM A DEVICE SCREENSHOT 2026-10-08, sampling one row of pixels
+ * straight through the bar:
+ *
+ *     x 672..679   glow, three bands at alpha 0.13 / 0.34 / 0.62
+ *     x 680..687   core #B026FF
+ *     x 688+       flat card background -- nothing at all
+ *
+ * All of the light on one side and none on the other. The cause was the
+ * container: BoxWithConstraints(modifier.width(4.dp)) fixes the incoming
+ * constraints at the CORE'S width, and Modifier.size() is clamped by its
+ * parent's constraints rather than overriding them -- so every bloom box asked
+ * for 4 + spread and was handed back 4, and offset(x = -spread / 2) then slid
+ * that squashed box entirely to the left of the core.
+ *
+ * AvatarGridScrollbar never hit this because it draws into a full-size panel
+ * with absolute offsets, so its bloom gets the width it asks for. Same drawing
+ * code, different container, and only one of them rendered correctly.
+ */
+private val NEON_SCROLL_SPREAD_MAX: Dp = 8.dp
+
+/**
+ * @param progress        0f at the top of the travel, 1f at the bottom.
+ * @param visibleFraction thumb length as a fraction of the track — how much of
+ *                        the content is on screen. Floored at 0.1 so a very
+ *                        long list still leaves something to see.
+ */
+@Composable
+private fun NeonScrollbar(
+    progress: Float,
+    visibleFraction: Float,
+    modifier: Modifier = Modifier,
+    width: Dp = 4.dp,
+) {
+    // Wide enough for the widest bloom, with the core sitting in the middle of
+    // it -- so every layer below gets the width it asks for and spreads evenly
+    // to both sides. The caller positions this LANE, not the core, so its start
+    // inset is NEON_SCROLL_SPREAD_MAX / 2 smaller than where the core lands.
+    val lane  = width + NEON_SCROLL_SPREAD_MAX
+    val coreX = NEON_SCROLL_SPREAD_MAX / 2
+
+    BoxWithConstraints(modifier.width(lane)) {
+        val track  = maxHeight
+        val thumb  = track * visibleFraction.coerceIn(0.1f, 1f)
+        val thumbY = (track - thumb) * progress.coerceIn(0f, 1f)
+
+        // Explicitly placed and sized now: fillMaxSize() would paint the whole
+        // lane, turning a 4dp rail into a 12dp slab.
+        Box(
+            Modifier
+                .offset(x = coreX)
+                .size(width = width, height = track)
+                .background(NEON_SCROLL_TRACK, RoundedCornerShape(percent = 50)),
+        )
+        // Widest and faintest first, so the core lands on top.
+        listOf(8.dp to 0.13f, 5.dp to 0.24f, 2.5.dp to 0.42f).forEach { (spread, alpha) ->
+            // CLAMPED TO THE RAIL. Each rect is drawn half its spread above
+            // the thumb and half below, so at either end of the travel the
+            // widest one hangs 4dp past the track's rounded cap -- glow with no
+            // rail under it, which reads as light pouring out of the end of the
+            // tube rather than sitting inside it.
+            //
+            // Only the ENDS move. Everywhere in between top and bottom are
+            // unchanged, so the bloom looks exactly as it always did.
+            val top    = (thumbY - spread / 2).coerceAtLeast(0.dp)
+            val bottom = (thumbY + thumb + spread / 2).coerceAtMost(track)
+            Box(
+                Modifier
+                    .offset(x = coreX - spread / 2, y = top)
+                    .size(width = width + spread, height = bottom - top)
+                    .background(
+                        NEON_SCROLL_NEON.copy(alpha = alpha),
+                        RoundedCornerShape(percent = 50),
+                    ),
+            )
+        }
+        Box(
+            Modifier
+                .offset(x = coreX, y = thumbY)
+                .size(width = width, height = thumb)
+                .background(NEON_SCROLL_NEON, RoundedCornerShape(percent = 50)),
+        )
+    }
+}
+
 data class ServerOption(
     val name: String,
     val tags: List<String> = emptyList(),
 )
 
+/**
+ * The list's viewport, and so also the scrollbar's length.
+ *
+ * 246dp is AvatarGridScrollbar's track to the dp -- its four visible rows at a
+ * 64dp pitch plus the last row's own 54dp. Carried over as a literal rather
+ * than derived, because the two panels share a look, not a grid geometry.
+ */
+private val SERVER_LIST_MAX_HEIGHT: Dp = 246.dp
+
 @Composable
 fun ServerPickerOverlay(
     servers: List<ServerOption>,
-    defaultIndex: Int,
     audioLabel: String,                 // "Dub" or "Sub" — used in the title
     onSelect: (String) -> Unit,         // server name
 ) {
     val focusRequesters = remember(servers) { List(servers.size) { FocusRequester() } }
-    val startIndex = remember(servers) {
-        if (servers.isEmpty()) 0 else defaultIndex.coerceIn(0, servers.lastIndex)
-    }
     val scrollState = rememberScrollState()
 
+    // OPENS AT THE TOP, ALWAYS.
+    //
+    // This used to focus the provider already in use, which sounds helpful and
+    // is not: that provider is usually somewhere in the middle, so the dialog
+    // opened already scrolled, with the first entries cut off above the fold and
+    // no hint that they were there. Someone opening a list of alternatives wants
+    // to see the alternatives, from the start -- and the one they are already on
+    // is the one they are trying to get away from.
+    //
+    // Row 0 also leaves the scroll position at 0, so the bar's thumb starts at
+    // the top of its rail where it reads as "there is more below".
+    //
+    // The caller's defaultIndex is gone rather than ignored; a parameter that
+    // silently does nothing is worse than one that is absent. Which provider is
+    // actually serving is answered in the player's title strip now.
     LaunchedEffect(servers) {
         if (servers.isNotEmpty()) {
             awaitFrame()
             awaitFrame()   // let the rows lay out before grabbing focus
-            try { focusRequesters[startIndex].requestFocus() } catch (_: Exception) {}
+            try { focusRequesters[0].requestFocus() } catch (_: Exception) {}
         }
     }
 
@@ -882,22 +1016,69 @@ fun ServerPickerOverlay(
                     .padding(bottom = 14.dp),
             )
 
-            Column(
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = 260.dp)
-                    .verticalScroll(scrollState),
-            ) {
-                servers.forEachIndexed { index, server ->
-                    ServerRow(
-                        server = server,
-                        focusRequester = focusRequesters[index],
-                        upTarget = if (index == 0) FocusRequester.Cancel
-                        else focusRequesters[index - 1],
-                        downTarget = if (index == servers.lastIndex) FocusRequester.Cancel
-                        else focusRequesters[index + 1],
-                        onSelect = { onSelect(server.name) },
+            // The bar sits OUTSIDE the scrolling column, in a gutter the rows
+            // leave for it — inside, it would scroll away with the content and
+            // its bloom would be clipped by the viewport edge.
+            // DOES THIS LIST SCROLL AT ALL?
+            //
+            // Not simply maxValue > 0. ScrollState starts life with maxValue =
+            // Int.MAX_VALUE and only learns the real number once the content has
+            // been measured, so the naive test is true on the first frame for
+            // EVERY list -- including ones that fit, which would flash a bar and
+            // a gutter for a frame before both vanished. Excluding the sentinel
+            // means nothing is drawn until the measurement is real.
+            val scrollable = scrollState.maxValue in 1 until Int.MAX_VALUE
+
+            Box(modifier = Modifier.fillMaxWidth()) {
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = SERVER_LIST_MAX_HEIGHT)
+                        .verticalScroll(scrollState)
+                        // The bar's lane, plus clear space between it and the
+                        // rows: 28dp against a bloom that ends at 18dp.
+                        //
+                        // ONLY WHEN THERE IS A BAR. This was unconditional, to
+                        // stop the rows shifting if the list ever gained a row --
+                        // but a picker's server list is fixed for as long as the
+                        // dialog is open, so there was no shift to prevent and
+                        // the reserved lane just sat there empty, pushing a
+                        // five-server list visibly off-centre in its own card.
+                        .padding(start = if (scrollable) 28.dp else 0.dp),
+                ) {
+                    servers.forEachIndexed { index, server ->
+                        ServerRow(
+                            server = server,
+                            focusRequester = focusRequesters[index],
+                            upTarget = if (index == 0) FocusRequester.Cancel
+                            else focusRequesters[index - 1],
+                            downTarget = if (index == servers.lastIndex) FocusRequester.Cancel
+                            else focusRequesters[index + 1],
+                            onSelect = { onSelect(server.name) },
+                        )
+                    }
+                }
+
+                // A full-length thumb on a list that fits is a control that
+                // does nothing, so a list that fits gets no bar at all.
+                if (scrollable) {
+                    val viewportPx = with(LocalDensity.current) {
+                        SERVER_LIST_MAX_HEIGHT.toPx()
+                    }
+                    NeonScrollbar(
+                        progress = scrollState.value.toFloat() / scrollState.maxValue,
+                        // viewport / content, and content is viewport + the
+                        // distance still to travel.
+                        visibleFraction = viewportPx / (viewportPx + scrollState.maxValue),
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            // Positions the LANE, whose first 4dp is bloom room,
+                            // so the core itself lands 10dp in -- the same place
+                            // AVATAR_SCROLLBAR_X puts the grid's. Bloom then
+                            // spans 6..18dp, matching the grid to the dp.
+                            .padding(start = 6.dp)
+                            .height(SERVER_LIST_MAX_HEIGHT),
                     )
                 }
             }
@@ -952,13 +1133,21 @@ private fun ServerRow(
             }
             .focusable(),
     ) {
-        Text(
-            text = server.name,
-            color = if (focused) Color.White else Color(0xFFD6D6D6),
-            fontFamily = AppTypography.interBold,
-            fontWeight = FontWeight.Bold,
-            fontSize = 14.sp,
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Image(
+                painter = painterResource(R.drawable.server),
+                contentDescription = null,      // the name beside it already says it
+                modifier = Modifier.size(20.dp),
+            )
+            Spacer(Modifier.width(10.dp))
+            Text(
+                text = server.name,
+                color = if (focused) Color.White else Color(0xFFD6D6D6),
+                fontFamily = AppTypography.interBold,
+                fontWeight = FontWeight.Bold,
+                fontSize = 14.sp,
+            )
+        }
         if (server.tags.isNotEmpty()) {
             Text(
                 text = server.tags.joinToString(" · "),
@@ -1184,15 +1373,15 @@ private fun hexPath(centre: Offset, radius: Float): Path = Path().apply {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 9. PlaybackSettingsOverlay
-//    Reached from the browser button in the corner of a details screen. Controls
-//    whether picking a streaming source raises the "our player, or the site?"
-//    prompt (DefaultServerPrompt, above) or goes straight to the built-in player.
+//    Reached from Settings > Playback method. Controls whether picking a
+//    streaming source raises the "our player, or a browser?" prompt
+//    (DefaultServerPrompt, above) or goes straight to the built-in player.
 //
 //    WHY THIS EXISTS. That prompt is correct the first few times and tiresome
 //    after that: most viewers pick the same answer every time, and it stands
 //    between them and playback on every single episode. Rather than removing it
-//    — the site path is a genuine fallback when extraction fails — this lets a
-//    viewer turn it off once.
+//    — the browser path is a genuine fallback when extraction fails — this lets
+//    a viewer turn it off once.
 //
 //    Two buttons rather than a checkbox: on a remote, "which of these two" is
 //    one press, while a checkbox is a press plus working out what state it
@@ -1209,15 +1398,30 @@ fun PlaybackSettingsOverlay(
     val askFocus    = remember { FocusRequester() }
     val directFocus = remember { FocusRequester() }
 
+    // NAVIGATION TICKS ARE ARMED ONLY AFTER THE OPENING FOCUS HAS LANDED.
+    // Putting the cursor on the setting already in force is not a move the
+    // viewer made, and chirping at them for it is the same complaint focus
+    // restoration raised -- see muteHoverSounds in BlueHiveApplication. Armed a
+    // frame LATER than the request, because the resulting onFocusGained arrives
+    // on the frame after it and would otherwise still be inside the window.
+    var navArmed by remember { mutableStateOf(false) }
+
     // Focus lands on the setting that is CURRENTLY active, so the overlay opens
     // showing the viewer where they already are. Confirming without reading is
     // then a no-op rather than a silent change of behaviour.
     LaunchedEffect(Unit) {
         awaitFrame()
         if (askEachTime) askFocus.requestFocus() else directFocus.requestFocus()
+        awaitFrame()
+        navArmed = true
     }
 
-    BackHandler(enabled = true) { onDismiss() }
+    // Dismissing is a back-out. Choosing is not -- that path is a press, and
+    // ModularButton plays the click itself.
+    BackHandler(enabled = true) {
+        BlueHiveApplication.playBackOutSound()
+        onDismiss()
+    }
 
     Box(
         modifier = Modifier
@@ -1252,8 +1456,8 @@ fun PlaybackSettingsOverlay(
 
             Text(
                 text = "Some sources can be played in the built-in player or " +
-                       "opened directly on the streaming site. Choose whether " +
-                       "to be asked each time, or to go straight to the " +
+                       "opened directly with a browser. Choose whether to ask " +
+                       "to open with the browser, or to go straight to the " +
                        "built-in player.",
                 color = Color(0xFFB8B8C0),
                 fontFamily = AppTypography.interSemiBold,
@@ -1273,10 +1477,11 @@ fun PlaybackSettingsOverlay(
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 ModularButton(
-                    textConfig = ModularButtonTextConfig(text = "Ask each time", fontSize = 10f),
+                    textConfig = ModularButtonTextConfig(text = "Ask for browser", fontSize = 10f),
                     isToggleable = false,
                     fontFamily = AppTypography.interBold,
                     focusRequester = askFocus,
+                    onFocusGained = { if (navArmed) BlueHiveApplication.playHoverSound() },
                     onClick = { onChoose(true) },
                     modifier = Modifier.focusProperties {
                         up    = FocusRequester.Cancel
@@ -1295,6 +1500,7 @@ fun PlaybackSettingsOverlay(
                     isToggleable = false,
                     fontFamily = AppTypography.interBold,
                     focusRequester = directFocus,
+                    onFocusGained = { if (navArmed) BlueHiveApplication.playHoverSound() },
                     onClick = { onChoose(false) },
                     modifier = Modifier.focusProperties {
                         up    = FocusRequester.Cancel

@@ -258,9 +258,19 @@ object ExoPlayerConfig {
      * timeout, the focus tint, and the buffering spinner. Call once, in the
      * PlayerView factory.
      */
-    fun applyControllerPolicy(playerView: androidx.media3.ui.PlayerView) {
+    /**
+     * @param tintTimeBar whether to drive the time bar's colours from focus.
+     *   FALSE for a player whose control layout STATES its colours: this helper
+     *   calls setPlayedColor immediately on attach, so the unfocused white would
+     *   silently paint over an app:played_color declared in XML -- which is
+     *   exactly what turned the HLS player's blue progress line white.
+     */
+    fun applyControllerPolicy(
+        playerView: androidx.media3.ui.PlayerView,
+        tintTimeBar: Boolean = true,
+    ) {
         playerView.setControllerShowTimeoutMs(CONTROLLER_SHOW_TIMEOUT_MS)
-        attachTimeBarFocusTint(playerView)
+        if (tintTimeBar) attachTimeBarFocusTint(playerView)
 
         // ── Show something while starved ────────────────────────────────────
         // PlayerView ships a spinner (R.id.exo_buffering) but defaults to
@@ -1421,76 +1431,6 @@ object ExoPlayerConfig {
     }
 
     /**
-     * Resolve the known CDN hosts BEFORE anything needs them, so ECH is already
-     * cached when playback starts.
-     *
-     * WHY THIS EXISTS. ECH conceals the hostname, and the filter matches on the
-     * hostname, so ECH is the whole defence. But ECH needs the HTTPS/SVCB DNS
-     * record, and Chromium only waits `insecure_extra_time` for it AFTER the
-     * address answer lands. In the playback path that wait sits ~34ms before the
-     * ClientHello goes out, and if the record loses the race the resolver caches
-     * an entry with NO ech_config_list. Every request against that cached entry
-     * then goes out in cleartext until it expires.
-     *
-     * MEASURED 2026-08-30 10:58: moon.peakstorm.top produced four handshake
-     * refusals in a capture with no fresh DNS and zero ECH events — served from
-     * exactly such an entry. The same host had worked earlier the same day.
-     *
-     * Doing it at startup removes the race instead of trying to win it: nothing
-     * is waiting on these, so the full allowance is available, and by the time a
-     * playback resolves the host the entry already carries its ECH config.
-     *
-     * ONE CHEAP REQUEST PER HOST, capped and serialised in small batches. Cronet
-     * exposes no resolve-only API, so a request is the only way to drive the
-     * resolver — but the response is irrelevant. A 403 or 404 warms the DNS entry
-     * exactly as well as a 200, so failures are ignored by design.
-     */
-    /**
-     * Warm DNS/ECH for hosts an extraction just reported, before playback starts.
-     *
-     * The startup prewarm covers hosts the backend already knew when the app
-     * launched. It cannot cover one discovered minutes later — and those are
-     * exactly the hosts that cost a relay, because they resolve inside the
-     * playback critical path where the ECH race is lost.
-     *
-     * Called from extractStreamAwait the moment a manifest comes back, which
-     * buys the player-setup window (~1s) as warm time. Fire-and-forget: if it
-     * does not finish before the first segment request, that request behaves
-     * exactly as it does today, so this can only help.
-     *
-     * Also merges them into the hint list, so the QUIC hint follows on the next
-     * engine build rather than waiting for the next app start.
-     */
-    fun warmHosts(hosts: List<String>) {
-        if (hosts.isEmpty()) return
-        val ctx = com.example.bluehive.BlueHiveApplication.appContext ?: return
-        // WARM EVERY HOST IN THIS STREAM, known or not. The first version of
-        // this filtered to hosts absent from the hint list, which conflated two
-        // unrelated things and left the commonest failure untouched: the hint
-        // list is permanent, the DNS cache is not.
-        //
-        // MEASURED 2026-08-30 on "Bring Her Back". moon.peakstorm.top — in the
-        // hint list for days, and serving h3 200 at 13:01:29 — was severed at
-        // 13:06:26. The HTTPS record's TTL is 300s and the gap was 297s: its ECH
-        // config had simply expired, so the host was re-resolved inside the
-        // playback critical path, lost the race for a fresh config, and went out
-        // in cleartext. Being "known" is exactly why it was skipped.
-        //
-        // So: merge only the new ones into the hint list, but warm them all.
-        // Two or three requests per playback against hosts we are about to use
-        // anyway, which keeps their ECH configs alive across the 5-minute TTL.
-        val all = hosts.map { it.lowercase() }.filter { it.isNotBlank() }.distinct()
-        if (all.isEmpty()) return
-        val known = learnedQuicHosts(ctx)
-        val fresh = all.filter { it !in known }
-        if (fresh.isNotEmpty()) mergeQuicHints(ctx, fresh)
-        Log.e("scraper-vidapi",
-            "🔥 warming ${all.size} CDN host(s) for this stream " +
-            "(${fresh.size} new): ${all.joinToString()}")
-        warm(ctx, all)
-    }
-
-    /**
      * Warm this stream's hosts and WAIT for it, capped.
      *
      * WHY WAITING IS NECESSARY. Fire-and-forget lost a real race, twice.
@@ -1605,6 +1545,31 @@ object ExoPlayerConfig {
 
     @Volatile private var prewarmed = false
 
+    /**
+     * Resolve the known CDN hosts BEFORE anything needs them, so ECH is already
+     * cached when playback starts.
+     *
+     * WHY THIS EXISTS. ECH conceals the hostname, and the filter matches on the
+     * hostname, so ECH is the whole defence. But ECH needs the HTTPS/SVCB DNS
+     * record, and Chromium only waits `insecure_extra_time` for it AFTER the
+     * address answer lands. In the playback path that wait sits ~34ms before the
+     * ClientHello goes out, and if the record loses the race the resolver caches
+     * an entry with NO ech_config_list. Every request against that cached entry
+     * then goes out in cleartext until it expires.
+     *
+     * MEASURED 2026-08-30 10:58: moon.peakstorm.top produced four handshake
+     * refusals in a capture with no fresh DNS and zero ECH events — served from
+     * exactly such an entry. The same host had worked earlier the same day.
+     *
+     * Doing it at startup removes the race instead of trying to win it: nothing
+     * is waiting on these, so the full allowance is available, and by the time a
+     * playback resolves the host the entry already carries its ECH config.
+     *
+     * ONE CHEAP REQUEST PER HOST, capped and serialised in small batches. Cronet
+     * exposes no resolve-only API, so a request is the only way to drive the
+     * resolver — but the response is irrelevant. A 403 or 404 warms the DNS entry
+     * exactly as well as a 200, so failures are ignored by design.
+     */
     fun prewarmCdnDns(context: Context) {
         if (prewarmed) return
         prewarmed = true
@@ -2298,9 +2263,6 @@ object ExoPlayerConfig {
     /** Hosts the backend has PROVEN cannot speak h3. Never hinted, never warmed. */
     private const val NO_QUIC_KEY = "h2_only"
 
-    private fun noQuicHosts(context: Context): Set<String> =
-        context.getSharedPreferences(QUIC_PREFS, Context.MODE_PRIVATE)
-            .getStringSet(NO_QUIC_KEY, emptySet()) ?: emptySet()
 
     /**
      * Hosts learned so far, fed into the builder alongside the static seeds.
@@ -2498,60 +2460,20 @@ object ExoPlayerConfig {
         ExoPlayer.Builder(context)
             .setTrackSelector(selector)
             .setLoadControl(loadControl())
+            // THE CONTROL BAR'S SEEK BUTTONS READ THESE, not SEEK_INCREMENT_MS.
+            // media3 wires exo_rew and exo_ffwd straight to player.seekBack()
+            // and seekForward(), which use the PLAYER's increments -- and
+            // ExoPlayer defaults to 5s back and 15s forward, which is where the
+            // mismatched "5" and "15" on the stock bar came from.
+            // SEEK_INCREMENT_MS was only ever honoured by the channel-key
+            // handler in dispatchKeyEvent, so the two disagreed depending on
+            // which control you used.
+            .setSeekBackIncrementMs(SEEK_INCREMENT_MS)
+            .setSeekForwardIncrementMs(SEEK_INCREMENT_MS)
             .build()
 
     // ── Header helpers (shared shape, per-site values) ────────────────────────
 
-    /**
-     * The header set extracted CDNs generally expect. [referer] and [origin] are
-     * the parts that vary by site — get them wrong and the CDN 403s even though
-     * the URL is valid, which is the single most common extracted-playback failure.
-     *
-     * @param extra site-specific additions, e.g. X-API-Key when the stream is
-     *              relayed through our own backend.
-     */
-    fun streamHeaders(
-        userAgent: String,
-        referer: String,
-        origin: String,
-        extra: Map<String, String> = emptyMap(),
-    ): Map<String, String> = buildMap {
-        // REFERER: SENT ONLY WHEN THE BACKEND SUPPLIES ONE. ORIGIN: NEVER.
-        //
-        // MEASURED 2026-08-30, per playlist level, from an unfiltered VPS:
-        //
-        //   source      master  variant  segment(bare)  segment(+Referer)
-        //   vidfast     200     200      200            200
-        //   vidnest     200     200      200            200
-        //   moviesapi   200     200      200            403
-        //   vidapi/vidspark/vidsrc  same as moviesapi
-        //
-        // So there is no single answer: the moviesapi family 403s a segment that
-        // carries a Referer, while vidfast tolerates one everywhere. The backend
-        // knows which source produced a manifest, so it decides — it returns an
-        // EMPTY referer for the hostile sources and a real one otherwise, and this
-        // simply honours what it is given.
-        //
-        // A BLANKET REMOVAL WAS TRIED FIRST AND WAS WRONG. Build 114 dropped the
-        // Referer for everyone on a measurement that covered master manifests and
-        // segments but NOT the variant playlists between them — and a vidfast
-        // variant (index-s720p-v1-a1.m3u8) then 403'd, relaying Django Unchained.
-        // Test every level of the playlist tree, not just the ends.
-        //
-        // ORIGIN stays gone unconditionally: it 403s vidfast segments AND the
-        // whole moviesapi family, and no source requires it.
-        put("User-Agent", userAgent)
-        if (referer.isNotBlank()) put("Referer", referer)
-        put("Accept", "*/*")
-        put("Accept-Language", "en-US,en;q=0.9")
-        putAll(extra)
-    }
 
     /** `https://host` for a URL — the Origin that pairs with a page/CDN Referer. */
-    fun originOf(url: String, fallback: String): String = try {
-        val u = android.net.Uri.parse(url)
-        if (u.scheme != null && u.host != null) "${u.scheme}://${u.host}" else fallback
-    } catch (_: Exception) {
-        fallback
-    }
 }

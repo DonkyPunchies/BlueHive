@@ -243,24 +243,7 @@ object CacheMonitor {
             .format(bytes / 1024.0.pow(digitGroups.toDouble())) + " " + units[digitGroups]
     }
 
-    /**
-     * Clear all tracked screen data
-     */
-    fun clearScreenTracking() {
-        screenImageCounts.clear()
-        Log.d(TAG, "🗑️  Screen tracking cleared")
-    }
 
-    /**
-     * Clear Coil caches (useful for testing)
-     */
-    suspend fun clearAllCaches(context: Context) = withContext(Dispatchers.IO) {
-        val imageLoader = context.imageLoader
-        imageLoader.memoryCache?.clear()
-        imageLoader.diskCache?.clear()
-        screenImageCounts.clear()
-        Log.d(TAG, "🗑️  All caches cleared")
-    }
 
     /**
      * Data class holding all statistics

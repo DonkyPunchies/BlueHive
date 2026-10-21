@@ -9,16 +9,11 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.offset
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
@@ -85,9 +80,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.core.tween
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.sp
 import com.example.bluehive.auth.DeviceEventStream
 import com.example.bluehive.sidebarComponents.openLiveTvScreen
 import kotlinx.coroutines.delay
@@ -96,6 +88,14 @@ import kotlinx.coroutines.launch
 
 
 enum class CatalogTab { MOVIES, TV_SHOWS, ANIME }
+
+/**
+ * Longest the navigation tick stays muted while focus returns from the
+ * sidebar. The restore ends the mute itself the moment focus lands (~100 ms,
+ * measured); this cap only matters if it never does.
+ */
+private const val SIDEBAR_RETURN_MUTE_CAP_MS = 1_000L
+
 private enum class SidebarReturnTarget {
     SEARCH_BAR,
     TRAILER,
@@ -352,6 +352,17 @@ fun HomeScreenComposeContent(
 
     var isOnFirstShelf by remember { mutableStateOf(true) }
 
+    // ── WHICH SHELF ROW AN OUTSIDE ARRIVAL WANTS ───────────────────────
+    //
+    // Non-null for the one frame it takes ShelfStack to act on it; the stack
+    // clears it. An event, not a mode -- left set, it would re-fire every time
+    // the stack recomposed.
+    var enterShelfAt by remember { mutableStateOf<Int?>(null) }
+
+    // The same kind of event for a row change that leaves focus where it is
+    // (ShelfStack's scrollToShelf). "Top of Page" sets it to the first shelf.
+    var scrollShelfTo by remember { mutableStateOf<Int?>(null) }
+
     // Whether this profile has any watch history, as the Continue Watching
     // panel last reported it: null until its first load answers. Only a known
     // "no" hides the panel, so a profile with history never sees the layout
@@ -373,6 +384,19 @@ fun HomeScreenComposeContent(
     // Tracks which home-screen area had focus when back was pressed,
     // so the sidebar can restore focus to exactly that spot on close.
     var lastFocusedTarget by remember { mutableStateOf(SidebarReturnTarget.SEARCH_BAR) }
+
+    // ── Radio-button navigation sound ──────────────────────────────────────
+    // The sound means "you moved onto this". The home screen OPENS with focus
+    // already on a radio button, and announcing that is announcing a move that
+    // never happened -- so the first arrival arms the flag instead of playing.
+    //
+    // ONE FLAG FOR ALL THREE, not one each: with a flag per button the first
+    // hop from MOVIES to TV SHOWS would be silent too.
+    var radioSoundArmed by remember { mutableStateOf(false) }
+    val radioNavSound: () -> Unit = {
+        if (radioSoundArmed) BlueHiveApplication.playNavClickSound()
+        else radioSoundArmed = true
+    }
 
     // IS FOCUS INSIDE A SHELF OF TITLE CARDS RIGHT NOW?
     //
@@ -576,41 +600,47 @@ fun HomeScreenComposeContent(
 
         LaunchedEffect(requestSidebarReturnFocus, sidebarCanFocus) {
             if (requestSidebarReturnFocus && !sidebarCanFocus) {
-                // ✅ Parking is ALREADY enabled from onExitToRight
+                // ✅ Parking is ALREADY enabled from onExitToRight, and so is the
+                // navigation-tick mute; finally ends it once focus has landed.
+                try {
+                    // Wait 1 frame for composition
+                    kotlinx.coroutines.android.awaitFrame()
 
-                // Wait 1 frame for composition
-                kotlinx.coroutines.android.awaitFrame()
+                    // Move focus to parking spot
+                    sidebarParkingRequester.requestFocus()
+                    kotlinx.coroutines.android.awaitFrame()
 
-                // Move focus to parking spot
-                sidebarParkingRequester.requestFocus()
-                kotlinx.coroutines.android.awaitFrame()
+                    // Now restore to actual target
+                    when (sidebarReturnTarget) {
+                        SidebarReturnTarget.SEARCH_BAR -> trailerFrameFocusRequester.requestFocus()
+                        SidebarReturnTarget.TRAILER -> trailerFrameFocusRequester.requestFocus()
+                        SidebarReturnTarget.TRENDING -> trendingFrameFocusRequester.requestFocus()
+                        SidebarReturnTarget.CONTINUE_WATCHING ->
+                            if (continueWatchingShown()) continueWatchingRequester.requestFocus()
+                            else tvLazyRowsSingleShelfFocusRequester.requestFocus()
+                        SidebarReturnTarget.MOVIES -> moviesToggleButtonFocusRequester.requestFocus()
+                        SidebarReturnTarget.TV_SHOWS -> tvShowsToggleButtonFocusRequester.requestFocus()
+                        SidebarReturnTarget.ANIME -> animeToggleButtonFocusRequester.requestFocus()
+                        SidebarReturnTarget.MOVIES_SHELF -> tvLazyRowsSingleShelfFocusRequester.requestFocus()
+                        SidebarReturnTarget.TV_SHOWS_SHELF -> tvLazyRowsSingleShelfFocusRequester.requestFocus()
+                        SidebarReturnTarget.ANIME_SHELF -> tvLazyRowsSingleShelfFocusRequester.requestFocus()
+                        null -> trailerFrameFocusRequester.requestFocus()
+                    }
 
-                // Now restore to actual target
-                when (sidebarReturnTarget) {
-                    SidebarReturnTarget.SEARCH_BAR -> trailerFrameFocusRequester.requestFocus()
-                    SidebarReturnTarget.TRAILER -> trailerFrameFocusRequester.requestFocus()
-                    SidebarReturnTarget.TRENDING -> trendingFrameFocusRequester.requestFocus()
-                    SidebarReturnTarget.CONTINUE_WATCHING ->
-                        if (continueWatchingShown()) continueWatchingRequester.requestFocus()
-                        else tvLazyRowsSingleShelfFocusRequester.requestFocus()
-                    SidebarReturnTarget.MOVIES -> moviesToggleButtonFocusRequester.requestFocus()
-                    SidebarReturnTarget.TV_SHOWS -> tvShowsToggleButtonFocusRequester.requestFocus()
-                    SidebarReturnTarget.ANIME -> animeToggleButtonFocusRequester.requestFocus()
-                    SidebarReturnTarget.MOVIES_SHELF -> tvLazyRowsSingleShelfFocusRequester.requestFocus()
-                    SidebarReturnTarget.TV_SHOWS_SHELF -> tvLazyRowsSingleShelfFocusRequester.requestFocus()
-                    SidebarReturnTarget.ANIME_SHELF -> tvLazyRowsSingleShelfFocusRequester.requestFocus()
-                    null -> trailerFrameFocusRequester.requestFocus()
+                    // Wait for focus to settle
+                    kotlinx.coroutines.android.awaitFrame()
+
+                    // Cleanup
+                    sidebarReturnTarget = null
+                    requestSidebarReturnFocus = false
+                    sidebarParkingEnabled = false
+
+                    Log.d("SIDEBAR_PARKING", "✅ Focus restored and parking disabled")
+                } finally {
+                    // Focus has landed (or the restore was cancelled): from here
+                    // on every tick is a move the viewer made.
+                    BlueHiveApplication.unmuteHoverSounds()
                 }
-
-                // Wait for focus to settle
-                kotlinx.coroutines.android.awaitFrame()
-
-                // Cleanup
-                sidebarReturnTarget = null
-                requestSidebarReturnFocus = false
-                sidebarParkingEnabled = false
-
-                Log.d("SIDEBAR_PARKING", "✅ Focus restored and parking disabled")
             }
         }
 
@@ -723,7 +753,10 @@ fun HomeScreenComposeContent(
                 // ====================================================================================> trending Section (extracted)
                 if (startContent) Box(
                     modifier = Modifier
-                        .offset(x = 458.dp, y = (-3.6).dp)
+                        // 458 dp before the panel narrowed by 35 dp to 16:9
+                        // (2026-10-19); moved right by the same 35 so its right
+                        // edge still lines up with Continue Watching below.
+                        .offset(x = 493.dp, y = (-3.6).dp)
                         .focusRequester(trendingFrameFocusRequester)
                         .onFocusChanged { if (it.hasFocus) lastFocusedTarget = SidebarReturnTarget.TRENDING }
                         .focusProperties {
@@ -779,8 +812,26 @@ fun HomeScreenComposeContent(
                         profileId = profileId,
                         focusRequester = continueWatchingRequester,
                         upNeighbor = trendingFrameFocusRequester,
+                        // DOWN SKIPS THE FIRST ROW ON PURPOSE.
+                        //
+                        // This panel sits BESIDE row 0, not above it -- the row
+                        // runs underneath it and stops short of it. So "down"
+                        // onto row 0 would be a sideways move dressed as a
+                        // downward one, landing on a row that is already on
+                        // screen and already reachable with LEFT. Row 1 is the
+                        // first thing genuinely below the panel.
+                        //
+                        // Deliberately ONE WAY. Coming back UP from row 1 goes
+                        // to row 0, not here, because that is the stack's own
+                        // vertical order and the panel is not part of it.
+                        //
+                        // The sound is made here because nothing downstream
+                        // will: requestNavigation is called directly rather
+                        // than through the stack's key handler, which is where
+                        // its own DOWN sound lives.
                         onNavigateDown = {
-                            Log.d("CONTINUE_WATCHING", "⬇️ Navigating down")
+                            BlueHiveApplication.playHoverSound()
+                            enterShelfAt = 1
                         },
                         onNavigateLeft = {
                             tvLazyRowsSingleShelfFocusRequester.requestFocus()
@@ -831,6 +882,7 @@ fun HomeScreenComposeContent(
                 upNeighbor = trailerFrameFocusRequester,
                 onOpenSidebar = { openSidebar(SidebarReturnTarget.MOVIES) },
                 onFocused = { lastFocusedTarget = SidebarReturnTarget.MOVIES },
+                onNavSound = radioNavSound,
                 rightNeighbor = if (selectedTab == CatalogTab.TV_SHOWS) {
                     animeToggleButtonFocusRequester
                 } else {
@@ -856,6 +908,7 @@ fun HomeScreenComposeContent(
                     openSidebar(SidebarReturnTarget.TV_SHOWS)
                 },
                 onFocused = { lastFocusedTarget = SidebarReturnTarget.TV_SHOWS },
+                onNavSound = radioNavSound,
                 leftNeighbor = moviesToggleButtonFocusRequester,
                 // When ANIME is the selected tab its radio button is toggled and
                 // unfocusable, so RIGHT from TV SHOWS must skip it and land on
@@ -882,6 +935,7 @@ fun HomeScreenComposeContent(
                 upNeighbor = trailerFrameFocusRequester,
                 downNeighbor = tvLazyRowsSingleShelfFocusRequester,
                 onFocused = { lastFocusedTarget = SidebarReturnTarget.ANIME },
+                onNavSound = radioNavSound,
                 leftNeighbor = if (selectedTab == CatalogTab.TV_SHOWS) {
                     moviesToggleButtonFocusRequester
                 } else {
@@ -935,6 +989,10 @@ fun HomeScreenComposeContent(
                     profileId = profileId,
                     onFirstPageReady = { firstShelfDataReady = true },
                     reserveContinueWatching = continueWatchingHasHistory != false,
+                    enterAtShelf = enterShelfAt,
+                    onEnterAtShelfHandled = { enterShelfAt = null },
+                    scrollToShelf = scrollShelfTo,
+                    onScrollToShelfHandled = { scrollShelfTo = null },
                 )
             }
 
@@ -970,6 +1028,10 @@ fun HomeScreenComposeContent(
                     },
                     profileId = profileId,
                     reserveContinueWatching = continueWatchingHasHistory != false,
+                    enterAtShelf = enterShelfAt,
+                    onEnterAtShelfHandled = { enterShelfAt = null },
+                    scrollToShelf = scrollShelfTo,
+                    onScrollToShelfHandled = { scrollShelfTo = null },
                 )
             }
 
@@ -1005,6 +1067,10 @@ fun HomeScreenComposeContent(
                     },
                     profileId = profileId,
                     reserveContinueWatching = continueWatchingHasHistory != false,
+                    enterAtShelf = enterShelfAt,
+                    onEnterAtShelfHandled = { enterShelfAt = null },
+                    scrollToShelf = scrollShelfTo,
+                    onScrollToShelfHandled = { scrollShelfTo = null },
                 )
             }
             // ====================================================================================>
@@ -1035,6 +1101,14 @@ fun HomeScreenComposeContent(
             onExitToRight = {
                 BlueHiveApplication.coilImageLoader.memoryCache?.clear()
                 Log.d("CACHE", "🧹 Cleared Coil memory + disk caches on sidebar exit")
+
+                // ONE PRESS, ONE TICK. The sidebar has just played the tick for
+                // this RIGHT. Everything from here to the end of the restore
+                // below moves focus on its own, and a radio button announces
+                // every arrival -- so the press used to tick twice, ~100 ms
+                // apart (measured 2026-10-16). Muted until the restore lands;
+                // the cap only matters if that never happens.
+                BlueHiveApplication.muteHoverSounds(SIDEBAR_RETURN_MUTE_CAP_MS)
 
                 sidebarParkingEnabled = true
                 sidebarCanFocus = false
@@ -1146,7 +1220,15 @@ fun HomeScreenComposeContent(
             // because the selected tab's own button is toggled and unfocusable.
             // Same destination UP from the first shelf already goes to, via
             // onNavigateBackToTabs.
-            onGoToTop = { requesterFor(neighborOf(selectedTab)).requestFocus() },
+            //
+            // And the rows go back to the first shelf with it, so the page
+            // really is at its top: What's Popular under the tabs and Continue
+            // Watching beside it, instead of whichever row back was pressed on.
+            // Focus moves first; the stack then changes row without taking it.
+            onGoToTop = {
+                requesterFor(neighborOf(selectedTab)).requestFocus()
+                scrollShelfTo = 0
+            },
             // Synchronous on purpose: this runs before the recomposition that
             // takes the overlay away, so focus steps straight from its button
             // to the title card with no unowned frames in between. Asking for
@@ -1182,6 +1264,10 @@ fun MoviesRadioButton(
     rightNeighbor: FocusRequester,
     onOpenSidebar: () -> Unit,
     onFocused: () -> Unit = {},
+    // Fired when focus LANDS here from anywhere. The old sound fired from this
+    // button's own key handler, so it could only speak when it already had
+    // focus -- arriving from the shelf row above was silent.
+    onNavSound: () -> Unit = {},
     onSelect: () -> Unit = {}
 ) {
     ModularButton(
@@ -1194,6 +1280,7 @@ fun MoviesRadioButton(
         isFocusable = enableFocus && !selected,
         fontFamily = fontFamily,
         focusRequester = focusRequester,
+        onFocusGained   = onNavSound,
         modifier = Modifier
             .offset(x = offsetX, y = offsetY)
             .focusProperties {
@@ -1215,11 +1302,36 @@ fun MoviesRadioButton(
             .onKeyEvent { event ->
                 if (event.type == KeyEventType.KeyDown) {
                     when (event.key) {
+                        // LEFT and RIGHT land on another radio button, which
+                        // announces its own arrival, so speaking here too would
+                        // play the same sample twice.
                         Key.DirectionLeft,
-                        Key.DirectionRight,
-                        Key.DirectionUp,
+                        Key.DirectionRight -> false
+
+                        // UP AND DOWN BOTH LEAVE THE ROW, and neither place they
+                        // land says anything: the trailer frame above has no
+                        // arrival sound, and a title card in the shelf below
+                        // plays from the card you LEAVE, never the one you reach.
+                        // So nothing downstream will speak for either move and
+                        // both have to be made here.
+                        //
+                        // UP was missing. The comment this replaces claimed
+                        // "everything except DOWN lands on something that
+                        // announces its own arrival" -- true of LEFT and RIGHT,
+                        // never of UP, so moving onto the trailer frame was
+                        // silent while every other move on this screen spoke.
+                        Key.DirectionUp -> {
+                            BlueHiveApplication.playNavClickSound()
+                            false
+                        }
+
+                        // DOWN IS THE EXCEPTION. It leaves for the shelf row,
+                        // and a title card makes no sound when focus lands on
+                        // it -- that row plays from the card you LEAVE, never
+                        // the one you reach. So nothing downstream will speak
+                        // for this move and it has to be made here.
                         Key.DirectionDown -> {
-                            BlueHiveApplication.playHoverSound()
+                            BlueHiveApplication.playNavClickSound()
                             false
                         }
 
@@ -1267,6 +1379,10 @@ fun TvShowsRadioButton(
     onOpenSidebar: () -> Unit,
     shouldOpenSidebar: Boolean = false,
     onFocused: () -> Unit = {},
+    // Fired when focus LANDS here from anywhere. The old sound fired from this
+    // button's own key handler, so it could only speak when it already had
+    // focus -- arriving from the shelf row above was silent.
+    onNavSound: () -> Unit = {},
     onSelect: () -> Unit = {}
 ) {
     ModularButton(
@@ -1279,6 +1395,7 @@ fun TvShowsRadioButton(
         isFocusable = enableFocus && !selected,
         fontFamily = fontFamily,
         focusRequester = focusRequester,
+        onFocusGained   = onNavSound,
         modifier = Modifier
             .offset(x = offsetX, y = offsetY)
             .focusProperties {
@@ -1304,11 +1421,36 @@ fun TvShowsRadioButton(
             .onKeyEvent { event ->
                 if (event.type == KeyEventType.KeyDown) {
                     when (event.key) {
+                        // LEFT and RIGHT land on another radio button, which
+                        // announces its own arrival, so speaking here too would
+                        // play the same sample twice.
                         Key.DirectionLeft,
-                        Key.DirectionRight,
-                        Key.DirectionUp,
+                        Key.DirectionRight -> false
+
+                        // UP AND DOWN BOTH LEAVE THE ROW, and neither place they
+                        // land says anything: the trailer frame above has no
+                        // arrival sound, and a title card in the shelf below
+                        // plays from the card you LEAVE, never the one you reach.
+                        // So nothing downstream will speak for either move and
+                        // both have to be made here.
+                        //
+                        // UP was missing. The comment this replaces claimed
+                        // "everything except DOWN lands on something that
+                        // announces its own arrival" -- true of LEFT and RIGHT,
+                        // never of UP, so moving onto the trailer frame was
+                        // silent while every other move on this screen spoke.
+                        Key.DirectionUp -> {
+                            BlueHiveApplication.playNavClickSound()
+                            false
+                        }
+
+                        // DOWN IS THE EXCEPTION. It leaves for the shelf row,
+                        // and a title card makes no sound when focus lands on
+                        // it -- that row plays from the card you LEAVE, never
+                        // the one you reach. So nothing downstream will speak
+                        // for this move and it has to be made here.
                         Key.DirectionDown -> {
-                            BlueHiveApplication.playHoverSound()
+                            BlueHiveApplication.playNavClickSound()
                             false  // 2B) your onKeyEvent returns false for DirectionDown, which is good — it doesn’t consume the event, so the focus engine is allowed to move focus.
                         }
 
@@ -1353,6 +1495,10 @@ fun AnimeRadioButton(
     leftNeighbor: FocusRequester,
     rightNeighbor: FocusRequester,
     onFocused: () -> Unit = {},
+    // Fired when focus LANDS here from anywhere. The old sound fired from this
+    // button's own key handler, so it could only speak when it already had
+    // focus -- arriving from the shelf row above was silent.
+    onNavSound: () -> Unit = {},
     onSelect: () -> Unit = {}
 ) {
     ModularButton(
@@ -1365,6 +1511,7 @@ fun AnimeRadioButton(
         isFocusable = enableFocus && !selected,
         fontFamily = fontFamily,
         focusRequester = focusRequester,
+        onFocusGained   = onNavSound,
         modifier = Modifier
             .offset(x = offsetX, y = offsetY)
             .focusProperties {
@@ -1378,11 +1525,36 @@ fun AnimeRadioButton(
             .onKeyEvent { event ->
                 if (event.type == KeyEventType.KeyDown) {
                     when (event.key) {
+                        // LEFT and RIGHT land on another radio button, which
+                        // announces its own arrival, so speaking here too would
+                        // play the same sample twice.
                         Key.DirectionLeft,
-                        Key.DirectionRight,
-                        Key.DirectionUp,
+                        Key.DirectionRight -> false
+
+                        // UP AND DOWN BOTH LEAVE THE ROW, and neither place they
+                        // land says anything: the trailer frame above has no
+                        // arrival sound, and a title card in the shelf below
+                        // plays from the card you LEAVE, never the one you reach.
+                        // So nothing downstream will speak for either move and
+                        // both have to be made here.
+                        //
+                        // UP was missing. The comment this replaces claimed
+                        // "everything except DOWN lands on something that
+                        // announces its own arrival" -- true of LEFT and RIGHT,
+                        // never of UP, so moving onto the trailer frame was
+                        // silent while every other move on this screen spoke.
+                        Key.DirectionUp -> {
+                            BlueHiveApplication.playNavClickSound()
+                            false
+                        }
+
+                        // DOWN IS THE EXCEPTION. It leaves for the shelf row,
+                        // and a title card makes no sound when focus lands on
+                        // it -- that row plays from the card you LEAVE, never
+                        // the one you reach. So nothing downstream will speak
+                        // for this move and it has to be made here.
                         Key.DirectionDown -> {
-                            BlueHiveApplication.playHoverSound()
+                            BlueHiveApplication.playNavClickSound()
                             false
                         }
 

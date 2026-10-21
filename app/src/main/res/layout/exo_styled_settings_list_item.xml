@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    SHADOWS A media3 LAYOUT: the settings card's top level rows, "Speed /
+    Normal" and "Audio / Auto".
+
+    THREE IDS ARE A CONTRACT. SettingViewHolder does findViewById for
+    exo_icon, exo_main_text and exo_sub_text and dereferences all three with no
+    null check, so a missing one is a crash the first time the menu opens, and a
+    wrong type is a ClassCastException in the same place. The icon must stay an
+    ImageView, both labels TextViews.
+
+    THEY ARE @+id HERE, NOT @id. The opposite of the band layout, and for a
+    plain reason: hls_player_controls uses @id because those ids come from
+    media3's values/ids.xml, which is still there. These three are declared
+    nowhere but this file — so the app's copy replacing it is also the only
+    declaration left, and @id would not resolve to anything.
+
+    focusable is explicit even though media3 only sets it below API 26. Above
+    that it relies on FOCUSABLE_AUTO plus the click listener it attaches, which
+    is true but leaves the one thing a d-pad needs resting on a default.
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:minWidth="200dp"
+    android:minHeight="56dp"
+    android:background="@drawable/player_menu_row_bg"
+    android:focusable="true"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:paddingLeft="14dp"
+    android:paddingRight="18dp"
+    android:layoutDirection="ltr">
+
+  <ImageView
+      android:id="@+id/exo_icon"
+      android:layout_width="22dp"
+      android:layout_height="22dp"
+      android:layout_gravity="center_vertical"
+      android:tint="#FFB9C7E2"
+      android:contentDescription="@null"/>
+
+  <LinearLayout
+      android:layout_width="wrap_content"
+      android:layout_height="wrap_content"
+      android:layout_marginStart="14dp"
+      android:layout_marginLeft="14dp"
+      android:gravity="center_vertical|start"
+      android:orientation="vertical"
+      android:layoutDirection="ltr">
+
+    <TextView
+        android:id="@+id/exo_main_text"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:fontFamily="sans-serif-medium"
+        android:includeFontPadding="false"
+        android:textColor="#FFE8EEFA"
+        android:textDirection="locale"
+        android:textSize="15sp"/>
+
+    <!-- GONE when a row has no second line: media3 hides this itself, so it
+         must not carry a top margin that would survive the hide. The gap is a
+         padding on the view that stays. -->
+    <TextView
+        android:id="@+id/exo_sub_text"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:includeFontPadding="false"
+        android:paddingTop="3dp"
+        android:textColor="#B3C6D2E8"
+        android:textDirection="locale"
+        android:textSize="12sp"/>
+
+  </LinearLayout>
+
+</LinearLayout>

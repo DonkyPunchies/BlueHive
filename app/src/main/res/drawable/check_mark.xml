@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Selection tick — a gold check on a white disc.
+
+    A VECTOR, NOT A BITMAP. This mark draws at two quite different sizes: 27dp
+    over an avatar in the picker (AVATAR_SIZE / 2) and MANAGE_CHECKMARK_SIZE over
+    a profile card on the manage screen. One raster cannot be crisp at both, and
+    the shape is simple enough that it costs nothing to draw.
+
+    Replaces the old two-tone purple check_mark.webp.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+
+    <!--
+        The white disc. It lands on artwork of any colour — a red angry face, a
+        night-time city, a pale giraffe — so it carries its own contrast instead
+        of relying on whatever happens to be underneath.
+    -->
+    <path
+        android:pathData="M2,24 A22,22 0 1,1 46,24 A22,22 0 1,1 2,24 Z"
+        android:fillColor="#FFFFFFFF" />
+
+    <!--
+        A hairline edge, so the disc still reads as a shape when it lands on a
+        pale avatar rather than dissolving into one.
+    -->
+    <path
+        android:pathData="M2.75,24 A21.25,21.25 0 1,1 45.25,24 A21.25,21.25 0 1,1 2.75,24 Z"
+        android:strokeColor="#26000000"
+        android:strokeWidth="1.5" />
+
+    <!--
+        The tick. Three stops rather than a flat fill: gold that does not shade
+        reads as yellow plastic, and the light runs top-left to bottom-right to
+        match where the focus glow sits.
+
+        EVERY STOP IS SATURATED. The first pass shaded towards a pale #F7D774,
+        only 53% saturated, so over the top half of the stroke it read as washed
+        out rather than lit, and against a white disc the mark looked like it was
+        hiding. These three run 81 to 100% saturation, so the gradient reads as
+        gold catching light instead of gold fading away.
+    -->
+    <path
+        android:pathData="M15,24.6 L21.3,31 L33.4,17.6"
+        android:strokeWidth="5.6"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round">
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:type="linear"
+                android:startX="15"
+                android:startY="17.6"
+                android:endX="33.4"
+                android:endY="31">
+                <item android:offset="0" android:color="#FFFFD230" />
+                <item android:offset="0.55" android:color="#FFF5A800" />
+                <item android:offset="1" android:color="#FFD98500" />
+            </gradient>
+        </aapt:attr>
+    </path>
+</vector>

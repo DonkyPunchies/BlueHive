@@ -18,7 +18,6 @@ import retrofit2.Response
 import retrofit2.http.Body
 import retrofit2.http.DELETE
 import retrofit2.http.GET
-import retrofit2.http.Header
 import retrofit2.http.PATCH
 import retrofit2.http.POST
 import retrofit2.http.Path
@@ -115,11 +114,13 @@ interface ApiService {
         @Query("ids") ids: String,
     ): List<MediaDetailResponse>
 
-    @GET("/api/media/search")
-    suspend fun searchMedia(
-        @Query("q")          query:     String,
-        @Query("media_type") mediaType: String,
-        @Query("limit")      limit:     Int = 20
+    // Type-ahead for the honeycomb search, called as each key is pressed. Unlike
+    // /api/media/search it answers PARTIAL words ("bla" -> Black Clover), folds
+    // accents ("pokemon" -> Pokémon), and covers movies and TV in one request.
+    @GET("/api/media/suggest")
+    suspend fun suggestMedia(
+        @Query("q")     query: String,
+        @Query("limit") limit: Int = 40
     ): MediaBrowseResponse
 
 
@@ -423,6 +424,19 @@ data class ExtractResponse(
      * did before. Nothing regresses while the two sides are out of step.
      */
     val audio:        String? = null,
+    /**
+     * The provider list as it stood AFTER selection, so the entry flagged
+     * is_default is the one actually serving this stream.
+     *
+     * The backend has always sent this; the client simply had no field for it
+     * and Gson dropped it. It is what lets the player name the server rather
+     * than the audio track — "(Miruro bee)" instead of "(Miruro Dub)", which
+     * told the viewer something the voices already had.
+     *
+     * Nullable: an older backend, or a cache entry written before the field
+     * existed, just means the server cannot be named.
+     */
+    val servers:      List<ExtractServerOption>? = null,
 )
 
 /**
@@ -550,6 +564,45 @@ data class SubtitleListResponse(
     val season:     Int?    = null,
     val episode:    Int?    = null,
     val options:    List<SubtitleOption> = emptyList(),
+)
+
+
+/**
+ * Ask the backend to time this subtitle against this source's audio.
+ *
+ * WHY THE CLIENT SENDS THE STREAM URL. The backend handed it to us moments ago
+ * and it expires in 300s, so the player's copy is the freshest one in
+ * existence. Having the server re-extract would spend a browser run to
+ * rediscover it, and could easily come back with a different encode — these
+ * sources rotate — which would measure one video and store the answer against
+ * another.
+ *
+ * The source is part of the key for the same reason: Terminator 2 is 2:17:08 on
+ * VidFast and 2:35:56 on VidNest, and an offset measured against one is
+ * meaningless for the other.
+ */
+data class SubtitleSyncRequest(
+    val tmdb_id:     Int,
+    val id:          String,
+    val source:      String,
+    val media_type:  String = "movie",
+    val season:      Int    = 0,
+    val episode:     Int    = 0,
+    val stream_url:  String = "",
+    val referer:     String = "",
+    val user_agent:  String = "",
+    val duration_ms: Long   = 0,
+)
+
+data class SubtitleSyncResponse(
+    val ok:            Boolean = false,
+    val cached:        Boolean = false,
+    /** + shows the cue later; the player's own nudge buttons feed the same field. */
+    val offset_ms:     Long    = 0,
+    /** cue * rate + offset. 1.0 means no drift was found. */
+    val rate:          Double  = 1.0,
+    val median_err_ms: Int     = 0,
+    val reason:        String? = null,
 )
 
 
@@ -740,6 +793,18 @@ interface BluehiveApiService {
      * a browser. Pass refresh=1 to force a fresh extraction when a token dies
      * mid-play.
      */
+    /**
+     * Which sources to show, and what url shape each uses.
+     *
+     * NO API KEY: this is what goes on a button, not a secret, and a client
+     * that cannot authenticate still needs to show something. Templates come
+     * back rather than finished urls, so one fetch serves every title.
+     */
+    @GET("/api/sources")
+    suspend fun getSources(
+        @Query("type") type: String,                     // "tv" | "movie"
+    ): retrofit2.Response<com.example.bluehive.api.SourceCatalog.Response>
+
     @GET("/api/extract")
     suspend fun extractStream(
         @Query("type")     type:     String,          // "tv" | "movie"
@@ -890,6 +955,17 @@ interface BluehiveApiService {
         @Query("season")     season:    Int = 0,
         @Query("episode")    episode:   Int = 0,
     ): okhttp3.ResponseBody
+
+    /**
+     * Measure this subtitle against this source's own audio. Slow on a miss.
+     *
+     * Called in the BACKGROUND once captions are already on screen, never in
+     * front of them: a miss costs ten to twenty seconds while the backend pulls
+     * three windows of audio and correlates them, and nobody should wait for
+     * that to read a line of dialogue. A hit is a single indexed row.
+     */
+    @POST("/api/subtitles/sync")
+    suspend fun syncSubtitle(@Body body: SubtitleSyncRequest): SubtitleSyncResponse
 
     @GET("/api/bluehive/profiles/{profileId}/watch-history")
     suspend fun getWatchHistory(

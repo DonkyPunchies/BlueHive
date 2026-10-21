@@ -149,7 +149,6 @@
             android:theme="@style/Theme.BlueHive" />
 
 
-
         <!-- HostEntryActivity REMOVED 2026-08-16, with the rest of the companion
              contract. It was the only exported entry point, reachable solely via
              io.companion.host.action.LAUNCH, which meant BlueHive could not start
@@ -206,11 +205,6 @@
 
 
 
-        <activity
-            android:name=".webview.vidapi.VidApiExtractorActivity"
-            android:exported="false"
-            android:process=":vidapiextractor"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
         <!-- VidFast m3u8 extraction moved to the backend (/api/extract). The
              on-device extractor and its :vidfastextractor process are gone: on a
@@ -222,6 +216,7 @@
             android:name=".webview.hls.HlsPlayerActivity"
             android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden"
+            android:windowSoftInputMode="adjustNothing"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
 
 

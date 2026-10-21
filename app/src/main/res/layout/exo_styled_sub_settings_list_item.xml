@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    SHADOWS A media3 LAYOUT: the card's second level, reached by picking Speed
+    or Audio. One checkable row per choice.
+
+    TWO IDS ARE A CONTRACT: SubSettingViewHolder reads exo_text and exo_check
+    and dereferences both. @+id rather than @id for the same reason as the
+    parent row — this file is their only declaration once the app's copy
+    replaces media3's.
+
+    THE CHECK STAYS "invisible", NEVER "gone". media3 toggles it between VISIBLE
+    and INVISIBLE, so it has to keep occupying its space on the unselected rows;
+    gone here would leave every label but the current one shifted left by 36dp.
+
+    Tinted blue rather than white: it is the only mark in the card that says
+    which row is already in force, and the band uses that blue for exactly the
+    same job on the Subtitles button.
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:minWidth="200dp"
+    android:minHeight="56dp"
+    android:background="@drawable/player_menu_row_bg"
+    android:focusable="true"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:paddingLeft="14dp"
+    android:paddingRight="18dp"
+    android:layoutDirection="ltr">
+
+  <ImageView
+      android:id="@+id/exo_check"
+      android:layout_width="22dp"
+      android:layout_height="22dp"
+      android:layout_gravity="center_vertical"
+      android:src="@drawable/exo_styled_controls_check"
+      android:tint="#FF4477FF"
+      android:visibility="invisible"
+      android:contentDescription="@null"/>
+
+  <TextView
+      android:id="@+id/exo_text"
+      android:layout_width="wrap_content"
+      android:layout_height="wrap_content"
+      android:layout_marginStart="14dp"
+      android:layout_marginLeft="14dp"
+      android:fontFamily="sans-serif-medium"
+      android:gravity="center_vertical|start"
+      android:includeFontPadding="false"
+      android:textColor="#FFE8EEFA"
+      android:textDirection="locale"
+      android:textSize="15sp"/>
+
+</LinearLayout>

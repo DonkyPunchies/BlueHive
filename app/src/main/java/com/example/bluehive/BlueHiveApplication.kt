@@ -98,10 +98,25 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
         // cap couldn't hold even the visible home screen imagery, so Coil was
         // constantly evicting + re-decoding (thrash = jank). Hardware bitmaps
         // live in graphics memory, not the Java heap, so a bigger cache does
-        // NOT cause GC churn. Low-RAM boxes (2 GB onn / Firestick report
-        // isLowRamDevice) get the smaller share.
+        // NOT cause GC churn. Small boxes get the smaller share.
+        //
+        // THE OLD NOTE HERE CLAIMED "2 GB onn / Firestick report
+        // isLowRamDevice". MEASURED 2026-10-07 on the onn 4K box: they do not.
+        // ro.config.low_ram is UNSET, isLowRamDevice returns false, and this
+        // device took the 25% branch — see the detection site for what that
+        // cost. The share is now chosen from physical RAM instead.
         private const val MEMORY_CACHE_PERCENT         = 0.25
         private const val MEMORY_CACHE_PERCENT_LOW_RAM = 0.15
+
+        /**
+         * At or below this much physical RAM, take the smaller cache share.
+         *
+         * 3 GB rather than 2 because a box sold as "2 GB" reports less than it
+         * says: this one has 1.88 GB left after the kernel and GPU take their
+         * cut, and a threshold written at exactly 2 GB would miss it. Anything
+         * between is small enough to want the smaller share anyway.
+         */
+        private const val SMALL_RAM_BYTES = 3L * 1024 * 1024 * 1024
 
         lateinit var coilImageLoader: ImageLoader
         private var soundPool: SoundPool? = null
@@ -113,6 +128,8 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
         private var webViewerClickSoundId: Int = 0
         private var profileSwapSoundId: Int = 0
         private var lastProfileSwapPlayTime: Long = 0L
+        private var errorSoundId: Int = 0
+        private var lastErrorPlayTime: Long = 0L
         // No sample id of its own: the nav sound shares
         // buttonNavigationSoundId (button_navigation.mp3) with playHoverSound.
         // Only the clock is separate — see playNavClickSound.
@@ -133,6 +150,7 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
         private const val PROFILE_SWAP_VOLUME         = 0.45f
         private const val BACK_OUT_VOLUME             = 0.35f
         private const val WEBVIEWER_CLICK_VOLUME      = 0.35f
+        private const val ERROR_VOLUME                = 0.45f
 
         /**
          * Play one sample at one volume — the ONLY place SoundPool.play is called.
@@ -155,6 +173,9 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
         // This only collapses the double-fire of one keypress.
         private const val NAV_SOUND_DEBOUNCE_MS = 70L
 
+        // See playErrorSound: long because the sample is long.
+        private const val ERROR_DEBOUNCE_MS = 600L
+
         fun initSoundPool(context: Context) {
             if (soundPool == null) {
                 soundPool = SoundPool.Builder()
@@ -167,6 +188,7 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
                 backOutSoundId             = soundPool!!.load(context, R.raw.backedout, 1)
                 webViewerClickSoundId      = soundPool!!.load(context, R.raw.webviewerclick, 1)
                 profileSwapSoundId         = soundPool!!.load(context, R.raw.profile_swap, 1)
+                errorSoundId               = soundPool!!.load(context, R.raw.error, 1)
             }
         }
 
@@ -178,7 +200,53 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
             play(titleCardNavigationSoundId, TITLECARD_NAVIGATION_VOLUME)
         }
 
+        /**
+         * Until when navigation ticks are swallowed. uptimeMillis, so it is
+         * immune to the wall clock moving.
+         */
+        @Volatile private var hoverMuteUntil = 0L
+
+        /**
+         * Swallow navigation ticks for the next [ms].
+         *
+         * FOCUS RESTORED IS NOT FOCUS MOVED. Closing the player drops the viewer
+         * back on the details screen, which puts the cursor back on the button
+         * they launched from -- and that lands as an onFocusChanged, which is
+         * indistinguishable at the button from someone arrowing onto it. So the
+         * app chirped at them for a move they did not make, on every single exit
+         * from a video.
+         *
+         * A WINDOW RATHER THAN A FLAG, because the restore is not one event: it
+         * re-requests across several frames and once more after a settle delay,
+         * and any of those passes can be the one that actually lands. A flag
+         * would have to be cleared by whichever pass won, which is the thing
+         * that cannot be known in advance.
+         *
+         * Deliberately global. playHoverSound has callers in a dozen files and
+         * the restore can land on any of them; gating the function is the only
+         * version of this that cannot be forgotten at a new call site.
+         *
+         * BOTH NAVIGATION FUNCTIONS, NOT JUST HOVER. playNavClickSound plays the
+         * same sample for the same reason -- focus arriving -- and the home
+         * screen's radio buttons announce every arrival with it. Left ungated,
+         * a restore landing on one of them chirped exactly like the ones this
+         * was written for.
+         */
+        fun muteHoverSounds(ms: Long) {
+            hoverMuteUntil = SystemClock.uptimeMillis() + ms
+        }
+
+        /**
+         * End a mute early. For a restore that knows the moment it has landed:
+         * holding the window open past that would swallow the ticks of the
+         * viewer's next real moves.
+         */
+        fun unmuteHoverSounds() {
+            hoverMuteUntil = 0L
+        }
+
         fun playHoverSound() {
+            if (SystemClock.uptimeMillis() < hoverMuteUntil) return
             play(buttonNavigationSoundId, BUTTON_NAVIGATION_VOLUME)
         }
 
@@ -191,6 +259,22 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
 
         fun playBackOutSound() {
             play(backOutSoundId, BACK_OUT_VOLUME)
+        }
+
+        /**
+         * Refusing a press — today, pressing an episode that has not aired.
+         *
+         * ITS OWN CLOCK, AND A LONG ONE. error.wav runs 1.13s where every other
+         * sample here is a tick under 200ms. A held D-pad repeats every ~100ms,
+         * so on the 120ms click debounce one leaned-on button would stack a
+         * dozen overlapping copies of a second-long sound. 600ms lets a
+         * deliberate second press answer again while a held one says it once.
+         */
+        fun playErrorSound() {
+            val now = SystemClock.uptimeMillis()
+            if (now - lastErrorPlayTime < ERROR_DEBOUNCE_MS) return
+            lastErrorPlayTime = now
+            play(errorSoundId, ERROR_VOLUME)
         }
 
         /**
@@ -229,6 +313,9 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
          */
         fun playNavClickSound() {
             val now = SystemClock.uptimeMillis()
+            // Muted like hover (see muteHoverSounds); checked first so a muted
+            // call does not start the debounce clock for the next real one.
+            if (now < hoverMuteUntil) return
             if (now - lastNavClickPlayTime < NAV_SOUND_DEBOUNCE_MS) return
             lastNavClickPlayTime = now
             play(buttonNavigationSoundId, BUTTON_NAVIGATION_VOLUME)
@@ -707,7 +794,7 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
                 // something to get here. Without this, a navigation that happens to
                 // straddle a tick could be judged against the previous screen's
                 // stale input time.
-                IdleWatcher.noteInteraction()
+                IdleWatcher.noteInteraction("resume ${activity.javaClass.simpleName}")
             }
             override fun onActivityPaused(activity: android.app.Activity) {
                 if (foregroundActivity?.get() === activity) foregroundActivity = null
@@ -780,6 +867,13 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
                     Log.d(TAG, "☀️ ProcessLifecycleOwner.onStart fired — app is foreground")
                     InactivityWatcher.onAppForegrounded()
                     IdleWatcher.setForeground(true)
+                    // Pick up a source switched off on the server while this
+                    // process was asleep. Throttled inside warm(), so the
+                    // several onStart calls Android fires for one return cost
+                    // one fetch at most.
+                    kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                        com.example.bluehive.api.SourceCatalog.warm(this@BlueHiveApplication)
+                    }
                     // Resume proving we are alive. Idempotent, so the repeated
                     // onStart Android fires for one user-visible return does not
                     // start a second loop.
@@ -952,7 +1046,29 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
         // lag). 4 fetches keeps the network pipe full; 2 decodes always leaves
         // cores free for the UI. Total fill time barely changes — network was
         // the bottleneck — but frames stop dropping.
-        val lowRam = (getSystemService(ACTIVITY_SERVICE) as ActivityManager).isLowRamDevice
+        // SMALL RAM IS MEASURED, NOT ASKED FOR.
+        //
+        // isLowRamDevice only reports what the vendor put in ro.config.low_ram,
+        // and the 2 GB onn 4K box this branch exists for leaves it UNSET.
+        // MEASURED 2026-10-07: the prop is empty, so the device took the 25%
+        // share — and because the manifest sets largeHeap, Coil sizes that
+        // against largeMemoryClass (dalvik.vm.heapsize = 384 MB), not the
+        // 256 MB growth limit. That is a 96 MB bitmap budget on a 1.88 GB box.
+        // Graphics PSS was sitting at 79 MB against it, and the process was
+        // SIGKILLed at 401 MB RSS the night before (reason=2 SIGNALED).
+        //
+        // totalMem is the physical truth and no vendor can forget to set it.
+        // isLowRamDevice is still honoured first, so a device that DOES declare
+        // itself keeps the smaller share however much RAM it reports.
+        val activityManager = getSystemService(ACTIVITY_SERVICE) as ActivityManager
+        val totalRamBytes = ActivityManager.MemoryInfo()
+            .also { activityManager.getMemoryInfo(it) }
+            .totalMem
+        // > 0 guards a MemoryInfo that failed to fill: a zero there would read
+        // as the smallest possible device and silently halve the cache on a box
+        // that has no need of it.
+        val lowRam = activityManager.isLowRamDevice ||
+                (totalRamBytes in 1 until SMALL_RAM_BYTES)
         val imageLoader = ImageLoader.Builder(this)
             .components {
                 add(SvgDecoder.Factory())
@@ -977,6 +1093,25 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
 
         Coil.setImageLoader(imageLoader)
         coilImageLoader = imageLoader
+
+        // Which streaming sources to show, fetched once per launch.
+        //
+        // AT LAUNCH, not on the details screen, because the screen reads the
+        // catalog SYNCHRONOUSLY while composing — it cannot wait for a network
+        // call. Warming here means the answer is already in memory by the time
+        // anyone navigates to a title. A failure is silent and harmless: the
+        // last cached list, or the built-in one, is used instead.
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+            com.example.bluehive.api.SourceCatalog.warm(this@BlueHiveApplication)
+        }
+
+        // Log.e, not Log.i: R8 strips the quieter levels from release, and this
+        // is the one line that says which branch a given box actually took.
+        // The previous reading of it was wrong for a year and nothing said so.
+        Log.e(TAG, "🖼 image cache: ${if (lowRam) "small" else "full"} share " +
+                "(${imageLoader.memoryCache?.maxSize?.div(1024 * 1024) ?: 0} MB), " +
+                "totalMem=${totalRamBytes / (1024 * 1024)} MB, " +
+                "isLowRamDevice=${activityManager.isLowRamDevice}")
 
         // Walks the whole 300 MB disk-cache directory — never on the main
         // thread during startup (it was a cold-start hitch all by itself).
@@ -1057,13 +1192,6 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
         }
     }
 
-    fun cleanupOldCaches() {
-        listOf(cacheDir.resolve("titlecard_cache")).forEach { dir ->
-            if (dir.exists() && dir.deleteRecursively()) {
-                Log.d(TAG, "🧹 Cleaned up old cache: ${dir.name}")
-            }
-        }
-    }
 
     // ── Helpers ────────────────────────────────────────────────────────────────
     private fun isMainProcess(): Boolean {

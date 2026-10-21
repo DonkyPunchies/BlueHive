@@ -47,7 +47,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.bluehive.BlueHiveApplication
 import com.example.bluehive.R
-import com.example.bluehive.searchBarComponent.SidebarSearchOverlay
+import com.example.bluehive.searchBarComponent.HoneycombKeyboardPopup
 
 // Sidebar menu item data class
 data class SidebarMenuItem(
@@ -303,19 +303,16 @@ fun HomeScreenSidebarCompose(
             // BLUE HIGHLIGHT BACKGROUNDS
             // ========================================
             menuItems.forEachIndexed { index, item ->
-                // NOT gated on isSearchActive.
+                // HIDDEN WHILE THE SEARCH KEYBOARD IS UP (isSearchActive).
                     //
-                    // This highlight follows selectedIndex, not focus. While the
-                    // search overlay is open the sidebar has genuinely lost focus
-                    // to the keyboard, but the user is still *in* Search Bar --
-                    // which is why the sidebar stays expanded rather than
-                    // collapsing (see the isSearchActive checks on the expand and
-                    // cover layers). Dropping the pill there contradicted every
-                    // other cue on the same row: the label stays white, bold, 13sp
-                    // and scaled up throughout, so the row went on announcing it
-                    // was selected while the one thing that made that legible
-                    // disappeared.
-                    if (index == selectedIndex) {
+                    // The sidebar stays expanded behind the keyboard, but the
+                    // keyboard has the focus, so the sidebar shows no selection
+                    // at all -- the user's call, 2026-10-16. The label below
+                    // follows the same rule; dropping only this pill once left
+                    // the row white, bold and scaled up, half-announcing a
+                    // selection. Both come back when the keyboard closes and
+                    // focus returns here.
+                    if (index == selectedIndex && !isSearchActive) {
                     val yOffset = (index * 35).dp
 
                     Box(
@@ -346,7 +343,7 @@ fun HomeScreenSidebarCompose(
                     .fillMaxHeight()
             ) {
                 menuItems.forEachIndexed { index, item ->
-                    val isSelected = index == selectedIndex
+                    val isSelected = index == selectedIndex && !isSearchActive
 
                     val yOffset = if (isSelected) {
                         item.focusedCustomYOffset
@@ -423,11 +420,13 @@ fun HomeScreenSidebarCompose(
         }
 
         // ========================================
-        // INLINE SEARCH OVERLAY (centered, system keyboard)
+        // INLINE SEARCH KEYBOARD (honeycomb, centered over the blurred home)
         // ========================================
+        // Search -- or a finished Voice search -- hands the text to the search
+        // page, which runs it; BACK just closes the keyboard.
         if (isSearchActive && hasEverBeenFocused) {
-            SidebarSearchOverlay(
-                onSubmit = { query ->
+            HoneycombKeyboardPopup(
+                onSearch = { query ->
                     val q = query.trim()
                     isSearchActive = false
                     if (q.isNotEmpty()) onSearchSubmit(q)

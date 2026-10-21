@@ -1,5 +1,6 @@
 package com.example.bluehive.utilities
 
+import com.example.bluehive.BlueHiveApplication
 import android.util.Log
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -64,6 +65,12 @@ fun RestoreFocusOnPlayerReturn(
         val observer = LifecycleEventObserver { _, event ->
             if (event != Lifecycle.Event.ON_RESUME) return@LifecycleEventObserver
 
+            // Everything below moves the cursor without the viewer touching the
+            // remote, so the navigation tick that normally accompanies a focus
+            // change would be a lie. Muted for the whole restore, not just the
+            // first pass -- see RESTORE_MUTE_MS.
+            BlueHiveApplication.muteHoverSounds(RESTORE_MUTE_MS)
+
             scope.launch {
                 // Insist for a few frames rather than firing once. Two reasons:
                 //  • the button may live in a panel that hasn't been re-laid-out
@@ -122,3 +129,17 @@ private const val RESTORE_FRAME_ATTEMPTS = 5
 
 /** Final re-assert, once the resume has settled. */
 private const val RESTORE_SETTLE_MS = 120L
+
+/**
+ * How long navigation ticks stay muted after a resume.
+ *
+ * Must outlast the whole restore: RESTORE_FRAME_ATTEMPTS frames (up to ~170ms
+ * if the panel is running at 30fps) plus RESTORE_SETTLE_MS plus the late pass
+ * after it. 450ms covers that with room spare.
+ *
+ * The cost of being generous is one swallowed tick for a viewer who presses a
+ * direction within half a second of the player closing; the cost of being tight
+ * is the chirp coming back intermittently, which is harder to notice and harder
+ * to diagnose.
+ */
+private const val RESTORE_MUTE_MS = 450L

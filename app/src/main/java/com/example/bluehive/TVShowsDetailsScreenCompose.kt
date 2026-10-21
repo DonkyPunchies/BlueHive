@@ -9,7 +9,6 @@ import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.annotation.OptIn
-import androidx.compose.foundation.Canvas
 import androidx.compose.ui.draw.scale
 import com.example.bluehive.utilities.WatchedCornerFold
 import androidx.compose.ui.tooling.preview.Preview
@@ -22,8 +21,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -74,7 +71,6 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.wrapContentSize
-import androidx.compose.animation.animateColorAsState
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.ColorMatrix
 import androidx.compose.animation.AnimatedVisibility
@@ -90,19 +86,14 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.geometry.CornerRadius
-import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.unit.IntOffset
-import com.example.bluehive.utilities.PlaybackSettingsOverlay
-import com.example.bluehive.utilities.BrowserCornerButton
-import com.example.bluehive.utilities.BROWSER_BUTTON_MARGIN
 import com.example.bluehive.utilities.PlaybackPrefs
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.focus.focusProperties
 import com.example.bluehive.api.ApiClient
+import com.example.bluehive.api.ExtractServerOption
+import com.example.bluehive.api.SourceCatalog
 import com.example.bluehive.api.ExtractOutcome
 import com.example.bluehive.api.FavoriteRequest
 import com.example.bluehive.sidebarComponents.FavoritesScreenActivity
@@ -111,8 +102,8 @@ import kotlinx.coroutines.async
 import com.example.bluehive.searchBarComponent.SearchBarActivity
 import com.example.bluehive.api.isJapaneseAnimation
 import com.example.bluehive.api.buildJapaneseAnimationSources
-import com.example.bluehive.api.WatchHistoryRequest
 import com.example.bluehive.webview.BeeLogo
+import com.example.bluehive.webview.ExtractionFocusTrap
 import com.example.bluehive.webview.ExtractionLoadingOverlay
 import com.example.bluehive.webview.miruro.MiruroPlayerActivity
 import com.example.bluehive.webview.hls.HlsExtract
@@ -128,6 +119,7 @@ import com.example.bluehive.auth.SessionManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.android.awaitFrame
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import com.example.bluehive.api.extractStreamAwait
 
 
@@ -521,7 +513,29 @@ internal fun extractionErrorMessage(
     reason: String?,
     sourceName: String,
     unit: String,               // "episode" or "movie"
+    /**
+     * Every source the chain tried, in order, including [sourceName] last.
+     *
+     * NAMING ONLY THE LAST ONE WAS WRONG TWICE. Pressing VidNest on South Park
+     * s15e4 walked VidNest -> VidFast -> VidLove and then reported "VidLove
+     * doesn't have this episode" -- a source the viewer never chose, blamed for
+     * a failure three sources wide. Worse, it reads as a fact about VidLove,
+     * which sends someone to try the others when the others have already been
+     * tried.
+     */
+    tried: List<String> = emptyList(),
 ): String = when {
+    // ── MORE THAN ONE SOURCE WAS TRIED ──────────────────────────────────
+    //
+    // Deliberately claims less than the single-source messages below. Each
+    // source failed for its own reason and only the LAST one's is in hand, so
+    // "none of them have it" would be an assertion about sources whose reason
+    // we never saw. "could not play it" is what is actually known.
+    tried.size > 1 -> {
+        val list = tried.dropLast(1).joinToString(", ") + " and " + tried.last()
+        "Tried $list." +
+            "\n\nNone of them could play this $unit."
+    }
     // Our own extractor, not the source — a restart or a cold container.
     httpCode == 503 ->
         "$sourceName is starting up.\n\nGive it a moment and try again."
@@ -593,46 +607,70 @@ internal fun animeRelayUrl(
             q("device", runCatching { SessionManager.get().deviceFingerprint }.getOrNull())
 }
 
-internal fun usesBackendExtraction(sourceName: String): Boolean =
-    sourceName.equals("VidFast", true) ||
-        // VidLove — MUST be listed, for the same reason spelled out for MoviesAPI
-        // below: without it the button falls through to the raw Gecko embed,
-        // losing the relay and keeping a browser engine resident for the whole
-        // title, which is what OOM-kills the 2 GB box.
-        sourceName.equals("VidLove", true) ||
-        // VidEasy is no longer listed on EITHER screen (VidNest replaced it on TV,
-        // VidSpark on movies). Kept matched so an older build's source list, or a
-        // future re-listing, still routes to the backend rather than silently
-        // dropping to the raw embed.
-        sourceName.equals("VidEasy", true) ||
-        sourceName.equals("VidSpark", true) ||
-        // MoviesAPI ("Purple Stream") — the same site VidSpark pointed at, renamed
-        // on both screens 2026-08-21. MUST be listed: without it the button falls
-        // through to the raw Gecko embed, losing the relay and keeping a browser
-        // engine resident for the whole title, which is what OOM-kills the 2 GB
-        // box. The backend extracts this source in ~5s by going straight to the
-        // inner embed and skipping the wrapper's anti-automation redirect.
-        sourceName.equals("MoviesAPI", true) ||
-        // VidApi ("Honeycomb") — BOTH screens now. This match shadows the movies
-        // list's `useExtractor = true` on that entry, because the movies button
-        // tests usesBackendExtraction FIRST: the on-device VidApiExtractorActivity
-        // path is unreachable from the movies screen as a result. Left in place
-        // rather than deleted — see the note in MoviesDetailsScreenCompose.
-        sourceName.equals("VidApi", true) ||
-        // VidSrc ("Swarm Stream") — BOTH screens. The movies entry was labelled
-        // "VidLink" while already pointing at vidsrc.mov, so it missed this match
-        // and lost extraction + relay. Renamed to VidSrc so the two screens behave
-        // identically.
-        sourceName.equals("VidSrc", true) ||
-        // VidNest ("Royal Jelly") — BOTH screens.
-        sourceName.equals("VidNest", true)
+/**
+ * What an anime stream is called in the player's title strip and in history.
+ *
+ * NAMES THE SERVER, NOT THE TRACK. "Miruro (Dub)" spent the one line of space
+ * on something the viewer can hear within a second of playback starting; which
+ * of six providers is serving it is the thing they cannot know and the thing
+ * that matters when it stalls.
+ *
+ * Prefers what the backend observed over what was asked for: a requested
+ * server that the site quietly ignored would otherwise be reported as in use.
+ * Falls back to the plain source name when neither is known, so the strip
+ * never shows a dangling "Miruro ".
+ */
+internal fun miruroSourceLabel(
+    servers: List<ExtractServerOption>?,
+    requested: String?,
+): String {
+    val inUse = servers?.firstOrNull { it.is_default }?.name?.takeIf { it.isNotBlank() }
+        ?: requested?.takeIf { it.isNotBlank() }
+    return if (inUse == null) "Miruro" else "Miruro $inUse"
+}
 
+/**
+ * Should this source be played through the backend extractor rather than the
+ * embedded browser?
+ *
+ * BACKEND-OWNED NOW. This was a hardcoded list of eight names, which quietly
+ * broke the thing sources.conf exists for: a source added there that the client
+ * had never heard of failed the match and fell through to the raw embed --
+ * losing the relay and keeping a browser engine resident for the whole title,
+ * which is what OOM-kills the 2 GB box. The answer travels with the source.
+ *
+ * The compiled-in list survives as SourceCatalog.BUILTIN_EXTRACTABLE and is
+ * consulted only when the backend did not say, so an older server behaves
+ * exactly as this function did before.
+ */
+internal fun usesBackendExtraction(sourceName: String): Boolean =
+    SourceCatalog.canBackendExtract(sourceName)
+
+/**
+ * The source buttons for this episode.
+ *
+ * NOW BACKEND-OWNED. The list, its order, the button labels and the url shapes
+ * all come from config/sources.conf on the server via SourceCatalog, so a dead
+ * source is switched off by editing one line there rather than by shipping a
+ * build. The hardcoded list that used to live here is still compiled in as
+ * SourceCatalog's built-in fallback, so an unreachable backend behaves exactly
+ * as this function did before.
+ *
+ * Still synchronous: SourceCatalog answers from memory or disk and never does
+ * IO here, which is what lets the focus-requester pool size itself during
+ * composition.
+ */
 private fun getStreamingSources(
     mediaType: String,
     mediaId: Int,
     seasonNumber: Int,
     episodeNumber: Int
 ): List<TVShowsDetailsScreenCompose.StreamingSource> {
+    if (!mediaType.equals("movie", true)) {
+        return com.example.bluehive.api.SourceCatalog
+            .sources(BlueHiveApplication.appContext, "tv", mediaId, seasonNumber, episodeNumber)
+            .map { TVShowsDetailsScreenCompose.StreamingSource(it.label, it.name, it.url) }
+    }
     return when (mediaType) {
         "tv" -> listOf(
             TVShowsDetailsScreenCompose.StreamingSource(
@@ -740,6 +778,173 @@ private fun ZeroHeightAbove(content: @Composable () -> Unit) {
  * Returns "" for a missing or malformed date — unaired episodes carry a null
  * air_date, and the caller renders the blank so the row keeps its height.
  */
+/**
+ * Today as a yyyyMMdd integer, in the DEVICE's own timezone.
+ *
+ * Calendar rather than java.time: minSdk is 25 and LocalDate needs 26 or
+ * desugaring, and a plain calendar-day number needs neither.
+ */
+/**
+ * How long a first press on an unaired episode stays armed.
+ *
+ * Long enough to read the notice and answer it; short enough that the answer is
+ * clearly to THAT question. 6s is about two unhurried reads of the band.
+ */
+private const val UNAIRED_OVERRIDE_WINDOW_MS = 6_000L
+
+private fun currentYmd(): Int {
+    val c = java.util.Calendar.getInstance()
+    return c.get(java.util.Calendar.YEAR) * 10000 +
+           (c.get(java.util.Calendar.MONTH) + 1) * 100 +
+           c.get(java.util.Calendar.DAY_OF_MONTH)
+}
+
+/**
+ * Has this episode not aired yet?
+ *
+ * Compared as yyyyMMdd INTEGERS. The input is a fixed ISO format and the
+ * question is a pure calendar-day one, so there is no locale or timezone
+ * conversion to get wrong -- and this runs per card during D-pad scrolling.
+ *
+ * FAILS OPEN IN BOTH AMBIGUOUS CASES, because wrongly blocking an episode that
+ * would have played is worse than letting through one that fails:
+ *
+ *   * a missing or malformed date is not evidence of anything;
+ *   * an episode airing TODAY is treated as available. TMDB dates carry no time
+ *     of day, the box runs UTC-4, and by the time someone is looking at this row
+ *     an episode dated today is usually already up.
+ */
+internal fun isEpisodeUnaired(raw: String?, todayYmd: Int): Boolean {
+    val s = raw?.trim().orEmpty()
+    if (s.length < 10) return false
+    val y = s.substring(0, 4).toIntOrNull() ?: return false
+    val m = s.substring(5, 7).toIntOrNull() ?: return false
+    val d = s.substring(8, 10).toIntOrNull() ?: return false
+    return (y * 10000 + m * 100 + d) > todayYmd
+}
+
+/**
+ * Does this season have anything to watch yet? True once any episode has aired
+ * by [isEpisodeUnaired]'s rule, so it fails open the same way: an episode with
+ * no usable date counts. An empty season has nothing.
+ */
+internal fun seasonHasAiredEpisode(episodes: List<Episode>, todayYmd: Int): Boolean =
+    episodes.any { !isEpisodeUnaired(it.airDate, todayYmd) }
+
+/** How many of the newest seasons the season check looks at before listing the rest unchecked. */
+internal const val MAX_SEASON_CHECKS = 3
+
+/**
+ * How many seasons the season column lists, counting from Season 1:
+ * [seasonCount] less the newest seasons with nothing aired yet -- an announced
+ * season with no episodes, or one whose every episode is dated after today.
+ *
+ * ONLY THE NEWEST SEASONS ARE EVER LEFT OFF. Seasons air in order, so "not out
+ * yet" only happens at the end; an empty season in the middle is missing data,
+ * not an unaired season. Keeping the list a prefix also keeps every index in
+ * the column equal to season - 1, which the focus code relies on.
+ *
+ * Walks back from the newest season and stops at the first one that
+ *   * has an aired episode -- it and every season before it are listed;
+ *   * could not be checked ([episodesOf] returned null) -- unknown is listed;
+ *   * is Season 1, which is always listed, so the column is never empty;
+ *   * is past [maxChecks] seasons -- the rest are listed unchecked.
+ *
+ * Nothing carries over between calls: once an episode's date arrives, the next
+ * call finds it aired and the season is listed again.
+ */
+internal suspend fun watchableSeasonCount(
+    seasonCount: Int,
+    todayYmd: Int,
+    maxChecks: Int = MAX_SEASON_CHECKS,
+    episodesOf: suspend (season: Int) -> List<Episode>?,
+): Int {
+    var listed = seasonCount
+    var checks = 0
+    while (listed > 1 && checks < maxChecks) {
+        val episodes = episodesOf(listed) ?: return listed
+        if (seasonHasAiredEpisode(episodes, todayYmd)) return listed
+        listed--
+        checks++
+    }
+    return listed
+}
+
+/** How long the season column waits for the season check before listing every season. */
+private const val SEASON_CHECK_TIMEOUT_MS = 3_000L
+
+/**
+ * How many times this screen has come into view: once when it opens, then on
+ * every return to it -- from the player, the screensaver, standby. Work keyed
+ * on it is redone whenever the viewer comes back.
+ */
+@Composable
+private fun rememberResumeCount(): Int {
+    var count by remember { mutableIntStateOf(0) }
+    val owner = LocalLifecycleOwner.current
+    DisposableEffect(owner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) count++
+        }
+        owner.lifecycle.addObserver(observer)
+        onDispose { owner.lifecycle.removeObserver(observer) }
+    }
+    return count
+}
+
+/**
+ * The season column's length -- it lists Season 1 through the returned season
+ * ([watchableSeasonCount]). Null until the first check answers; the column
+ * waits for it, so a season is never shown and then taken away.
+ *
+ * Checked again on every resume ([resumeCount]). A season whose first episode
+ * airs while the app is open is listed the next time the viewer comes back to
+ * this screen, with nothing to expire: each check asks the endpoint the episode
+ * grid uses, and reads today's date fresh.
+ *
+ * FAILS OPEN. A check that fails or runs past [SEASON_CHECK_TIMEOUT_MS] lists
+ * every season (or keeps the list it had): an empty season on the list is the
+ * old behaviour, while a season left off with episodes in it is unreachable.
+ */
+@Composable
+private fun rememberListedSeasons(
+    tmdbId: Int,
+    seasonCount: Int,
+    resumeCount: Int,
+    repository: EpisodesRepository,
+): Int? {
+    var listed by remember(tmdbId, seasonCount) { mutableStateOf<Int?>(null) }
+    LaunchedEffect(tmdbId, seasonCount, resumeCount) {
+        if (seasonCount <= 0) return@LaunchedEffect
+        val counted = withTimeoutOrNull(SEASON_CHECK_TIMEOUT_MS) {
+            watchableSeasonCount(seasonCount, currentYmd()) { season ->
+                seasonEpisodesForCheck(repository, tmdbId, season)
+            }
+        }
+        listed = (counted ?: listed ?: seasonCount).coerceIn(1, seasonCount)
+    }
+    return listed
+}
+
+/**
+ * One season's episodes for the season check, or null when the check could not
+ * be made. A 404 is an answer, not a failure: the backend has no such season,
+ * so there is nothing in it to watch. Anything else is unknown.
+ */
+private suspend fun seasonEpisodesForCheck(
+    repository: EpisodesRepository,
+    tmdbId: Int,
+    season: Int,
+): List<Episode>? = try {
+    repository.getSeasonEpisodes(tmdbId, season).episodes
+} catch (e: kotlinx.coroutines.CancellationException) {
+    throw e
+} catch (e: retrofit2.HttpException) {
+    if (e.code() == 404) emptyList() else null
+} catch (e: Exception) {
+    null
+}
+
 private fun formatEpisodeAirDate(raw: String?): String {
     val s = raw?.trim().orEmpty()
     if (s.length < 10) return ""
@@ -998,6 +1203,22 @@ fun TVShowsDetailsScreenContent(
 
     var selectedEpisodeOverlayIndex by remember { mutableIntStateOf(-1) }
 
+    // ── THE WAY PAST THE UNAIRED GATE ─────────────────────────────────
+    //
+    // Which unaired episode has been pressed once, and so will go through on the
+    // next press. -1 for none.
+    //
+    // WHY AN OVERRIDE EXISTS AT ALL. isEpisodeUnaired is a PREDICTION made on
+    // this device from TMDB's air_date -- it is not a fact reported by the
+    // sources that would actually serve the episode. The two can disagree:
+    // provisional simulcast dates, a schedule that moved, a source that has the
+    // file early. Without a way past, one wrong date removes an episode with no
+    // appeal, and that is the only thing in this app that cannot be retried.
+    //
+    // A SECOND PRESS, not a longer one: it needs no new gesture to learn, it
+    // cannot happen by accident, and the first press has already said why.
+    var unairedArmedIndex by remember { mutableIntStateOf(-1) }
+
     // ✅ Focus requesters for overlay buttons.
     // Pool sized to the largest provider set we might show — the tv source list
     // (the anime overlay shows fewer). Deriving the size from getStreamingSources()
@@ -1048,33 +1269,35 @@ fun TVShowsDetailsScreenContent(
     val extrasFocusRequester = remember { FocusRequester() }
     val trailerFocusRequester = remember { FocusRequester() }
 
-    // The bottom-right browser button. Two routes lead to it -- DOWN off an
-    // episode tile, and RIGHT off a right-column provider button -- and both
-    // were dead ends that consumed the key and went nowhere.
-    val browserFocusRequester = remember { FocusRequester() }
+    // The playback-method setting used to be reached from a browser button in
+    // this screen's bottom-right corner. It now lives in Settings > Playback
+    // method, so the button, the routes into it and the overlay are all gone
+    // from here. PlaybackPrefs is still READ below -- only the way to change it
+    // moved.
 
-    // The playback-settings overlay the browser button opens.
-    var showPlaybackSettings by remember { mutableStateOf(false) }
-
-    // Anime shows never get the browser button. Their DuB/SuB buttons go through
-    // the Miruro flow, which has no ExoPlayer-vs-website fork at all -- the
-    // setting the button opens would have nothing to act on, so offering it
-    // would be a control that visibly does nothing.
-    val isAnimeTitle = remember(genres, originalLanguage) {
-        isJapaneseAnimation(genres, originalLanguage)
+    // Armed state is a MOMENT, not a mode. Someone who presses once, reads the
+    // notice and walks away should not find the episode silently pressable when
+    // they come back -- the second press has to be a deliberate answer to the
+    // first, which means it has to be soon after it.
+    LaunchedEffect(unairedArmedIndex) {
+        if (unairedArmedIndex >= 0) {
+            delay(UNAIRED_OVERRIDE_WINDOW_MS)
+            unairedArmedIndex = -1
+        }
     }
 
-    // How to get BACK out. Set by whichever route just handed focus over, read
-    // by the button's LEFT/UP. A plain holder rather than state: nothing draws
-    // from it, so writing it must not recompose the screen.
-    val browserReturnFocus = remember { arrayOfNulls<(() -> Unit)>(1) }
+    // Today's date and the season list are both re-read every time this screen
+    // comes back into view, so an episode or a season that airs while the app
+    // is open unlocks without reopening the show.
+    val resumeCount = rememberResumeCount()
 
-    /** Hand focus to the corner button, remembering the way back. */
-    fun focusBrowserButton(returnTo: () -> Unit) {
-        browserReturnFocus[0] = returnTo
-        BlueHiveApplication.playHoverSound()
-        browserFocusRequester.requestFocus()
-    }
+    // Today's date, read once per resume. Per card it would be the same answer
+    // recomputed on every recomposition of a scrolling row.
+    val todayYmd = remember(resumeCount) { currentYmd() }
+
+    // How many seasons the season column lists, from Season 1: the newest ones
+    // with nothing aired yet are left off. Null until the first check answers.
+    val listedSeasons = rememberListedSeasons(tmdbId, numberOfSeasons, resumeCount, episodesRepository)
 
     // Set true by the focused episode tile's onFocusChanged (see Edit 3).
     // Lets the initial-focus effect below confirm focus actually landed
@@ -1294,7 +1517,41 @@ fun TVShowsDetailsScreenContent(
     // No retry loop here on purpose. The server caches per episode and
     // deduplicates concurrent requests, so a second attempt from the client would
     // just re-ask for the same cached answer.
-    suspend fun extractAndPlay(src: TVShowsDetailsScreenCompose.StreamingSource) {
+    // Which chain step the player currently on screen came from. Read when it
+    // reports a playback failure, so the chain continues counting rather than
+    // restarting — otherwise a source that dies in the player would get the
+    // full attempt budget all over again.
+    var chainAttempt by remember { mutableIntStateOf(1) }
+
+    // Set by the launcher below, consumed by the LaunchedEffect further down.
+    //
+    // A HOP THROUGH STATE, not a direct call: the launcher must be created
+    // during composition, which is before extractAndPlay exists, and its
+    // callback is not a coroutine. Parking the name here lets a LaunchedEffect
+    // — which is both later and suspendable — do the actual work.
+    // (dead source, where it died in ms) -- the next source starts there.
+    var playbackFailedSource by remember { mutableStateOf<Pair<String, Long>?>(null) }
+
+    val playerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == HlsPlayerActivity.RESULT_SOURCE_FAILED) {
+            val atMs = result.data?.getLongExtra(HlsPlayerActivity.EXTRA_FAILED_AT_MS, 0L) ?: 0L
+            result.data?.getStringExtra(HlsPlayerActivity.EXTRA_FAILED_SOURCE)
+                ?.takeIf { it.isNotBlank() }
+                ?.let { playbackFailedSource = it to atMs }
+        }
+    }
+
+    suspend fun extractAndPlay(
+        src: TVShowsDetailsScreenCompose.StreamingSource,
+        /** 1 for the source the viewer pressed; higher for each chain step. */
+        attempt: Int = 1,
+        /** The sources already tried and failed, oldest first. */
+        tried: List<String> = emptyList(),
+        /** Where to start, in ms: 0 for a press, the dead source's spot for a failover. */
+        startAtMs: Long = 0L,
+    ) {
         extractCancelled = false
         isExtracting     = true
         isVidFastExtract = true
@@ -1345,7 +1602,45 @@ fun TVShowsDetailsScreenContent(
             val reason = parseExtractReason(resp)
             Log.e("scraper-vidfast", "extraction failed (http=$code reason=$reason src=${src.name}) " +
                     "${result.exceptionOrNull()?.javaClass?.simpleName ?: ""}")
-            extractionError = extractionErrorMessage(code, reason, src.name, "episode")
+            // ── FAILOVER ────────────────────────────────────────────────
+            // Walk down the chain rather than hand the viewer an error. The
+            // order is sources.conf's ORDER, so the fallback and the buttons
+            // can never disagree.
+            //
+            // extractCancelled is already checked above, and BACK cancels
+            // extractJob outright — which kills this recursion with it, so a
+            // viewer who backs out mid-chain is not followed by three more
+            // attempts finishing in the background.
+            val next = if (SourceCatalog.failoverEnabled && attempt < SourceCatalog.maxAttempts) {
+                SourceCatalog.nextInChain(
+                    BlueHiveApplication.appContext, "tv", tmdbId,
+                    pendingSeason, pendingEpisode, src.name,
+                ) { usesBackendExtraction(it) }
+            } else null
+
+            if (next != null) {
+                Log.e("scraper-vidfast",
+                      "failover ${attempt}/${SourceCatalog.maxAttempts}: " +
+                      "${src.name} failed ($reason) -> trying ${next.name}")
+                // Put the flags back up BEFORE recursing: they were cleared
+                // above for the success path, and leaving them down would blink
+                // the overlay off and on between attempts.
+                isExtracting     = true
+                isVidFastExtract = true
+                extractPending   = true
+                extractStage     = 1
+                vidFastStatus    = "${src.coverName} didn\u2019t work \u2014 trying ${next.label}\u2026"
+                extractAndPlay(
+                    TVShowsDetailsScreenCompose.StreamingSource(next.label, next.name, next.url),
+                    attempt + 1,
+                    tried + src.name,
+                    startAtMs,
+                )
+                return
+            }
+
+            extractionError =
+                extractionErrorMessage(code, reason, src.name, "episode", tried + src.name)
             return
         }
 
@@ -1359,7 +1654,10 @@ fun TVShowsDetailsScreenContent(
                 "cached=${body.cached} expires_in=${body.expires_in}s " +
                 "extract=${tookMs}ms referer=${body.referer}")
 
-        context.startActivity(
+        // launch(), not startActivity(): the result is how a playback failure
+        // gets back here to continue the chain.
+        chainAttempt = attempt
+        playerLauncher.launch(
             Intent(context, HlsPlayerActivity::class.java)
                 .putExtra("M3U8_URL", body.m3u8)
                 // DIRECT FIRST, relay only after a confirmed failure. Re-extracting
@@ -1396,7 +1694,54 @@ fun TVShowsDetailsScreenContent(
                 // The site's own English caption when the extractor saw one; the
                 // player falls back to OpenSubtitles when it's null, as before.
                 .putExtra("SUBTITLE_URL",   body.subtitle_url)
+                .putExtra(HlsPlayerActivity.EXTRA_START_AT_MS, startAtMs)
         )
+    }
+
+    // ── FAILOVER, PLAYBACK HALF ─────────────────────────────────────────────
+    // The extraction half lives inside extractAndPlay; this is the other case
+    // it cannot see — a source that handed over a perfectly good-looking url
+    // and then died in the player. The backend never learns that happened,
+    // because it stops at the url; only the player knows, and it reports the
+    // dead source back through its activity result.
+    //
+    // Same walk, same order, same budget as the extraction half: both call
+    // nextInChain, so the two can never disagree about what comes next.
+    //
+    // THE NEXT STEP RUNS IN THE SCREEN'S SCOPE, NOT THIS EFFECT'S. Clearing the
+    // key below recomposes and cancels this effect, so an extraction called
+    // straight from it died at its first suspension -- and runCatching read the
+    // cancellation as a failed extraction and raced down the chain. Held in
+    // extractJob so BACK cancels it like any other attempt.
+    LaunchedEffect(playbackFailedSource) {
+        val (failed, atMs) = playbackFailedSource ?: return@LaunchedEffect
+        playbackFailedSource = null
+
+        val next = if (SourceCatalog.failoverEnabled &&
+                       chainAttempt < SourceCatalog.maxAttempts) {
+            SourceCatalog.nextInChain(
+                BlueHiveApplication.appContext, "tv", tmdbId,
+                pendingSeason, pendingEpisode, failed,
+            ) { usesBackendExtraction(it) }
+        } else null
+
+        if (next == null) {
+            Log.e("scraper-vidfast",
+                  "playback failed on $failed — chain exhausted, staying put")
+            return@LaunchedEffect
+        }
+        Log.e("scraper-vidfast",
+              "failover ${chainAttempt}/${SourceCatalog.maxAttempts} (playback): " +
+              "$failed died in the player at ${atMs}ms -> trying ${next.name}")
+        val step = chainAttempt + 1
+        extractJob = coroutineScope.launch {
+            extractAndPlay(
+                TVShowsDetailsScreenCompose.StreamingSource(next.label, next.name, next.url),
+                step,
+                listOf(failed),
+                atMs,
+            )
+        }
     }
 
     /**
@@ -1564,7 +1909,7 @@ fun TVShowsDetailsScreenContent(
             val proxied = animeRelayUrl(
                 m3u8 = m3u8, tmdbId = tmdbId, mediaType = "anime_tv",
                 title = mediaTitle, profileId = favoriteProfileId,
-                sourceName = if (pendingDub) "Miruro (Dub)" else "Miruro (Sub)",
+                sourceName = miruroSourceLabel(null, capNames?.getOrNull(capDef)),
                 season = pendingSeason, episode = pendingEpisode,
             )
             Log.d("scraper", "M Extract → direct=$m3u8  (relay fallback ready)")
@@ -1584,7 +1929,7 @@ fun TVShowsDetailsScreenContent(
                     .putExtra("SEASON_NUMBER",  pendingSeason)
                     .putExtra("EPISODE_NUMBER", pendingEpisode)
                     .putExtra("EPISODE_NAME",   pendingEpisodeName)
-                    .putExtra("SOURCE_NAME",    if (pendingDub) "Miruro (Dub)" else "Miruro (Sub)")
+                    .putExtra("SOURCE_NAME",    miruroSourceLabel(null, capNames?.getOrNull(capDef)))
                     // Carried so a mid-episode token expiry can re-extract the SAME
                     // track — see MoviesDetailsScreenCompose for the measurement that
                     // made this necessary.
@@ -1796,7 +2141,7 @@ fun TVShowsDetailsScreenContent(
                 // would mislabel every dub playback. `playingDub`, not `dub`: a
                 // last-resort sub is recorded as the sub it is, which is the whole
                 // point of knowing the difference.
-                .putExtra("SOURCE_NAME",    if (playingDub) "Miruro (Dub)" else "Miruro (Sub)")
+                .putExtra("SOURCE_NAME",    miruroSourceLabel(body.servers, server))
                 // Carried so a mid-episode token expiry can re-extract the SAME track.
                 // `playingDub`, not `dub`, for the same reason SOURCE_NAME uses it.
                 // SERVER is best-effort: null just means "no preference".
@@ -1984,12 +2329,13 @@ fun TVShowsDetailsScreenContent(
     LaunchedEffect(showNoDub) {
         if (showNoDub) { delay(2500); showNoDub = false }
     }
-    LaunchedEffect(showServerPicker) {
-        if (showServerPicker) {
-            delay(30_000)
-            if (showServerPicker) { showServerPicker = false; showDefaultPrompt = true }
-        }
-    }
+
+    // NO AUTO-DISMISS. This used to close itself after 30s and drop the viewer
+    // back on the default-server prompt. Reading six provider names, deciding,
+    // and walking a D-pad there is easily slower than that -- and the dialog
+    // vanishing mid-decision looks like the app crashed, then silently undoes
+    // the choice they were making. A picker closes when it is picked or backed
+    // out of; BackHandler already covers the second.
     LaunchedEffect(showServerError) {
         if (showServerError) { delay(2500); showServerError = false }
     }
@@ -2081,6 +2427,17 @@ fun TVShowsDetailsScreenContent(
             } else {
                 loadSeasonEpisodes(selectedSeason)
             }
+        }
+    }
+
+    // The season check can leave off the selected season -- the screen was
+    // opened on a season with nothing aired. Move to the newest listed one, so
+    // the grid never shows a season the column does not.
+    LaunchedEffect(listedSeasons) {
+        val listed = listedSeasons ?: return@LaunchedEffect
+        if (selectedSeason > listed) {
+            selectedSeason = listed
+            loadSeasonEpisodes(listed)
         }
     }
 
@@ -2378,8 +2735,12 @@ fun TVShowsDetailsScreenContent(
             )
 
                     // 🔴 Inline Seasons LazyRow (no separate TVSeasonsRow composable)
-                    if (numberOfSeasons > 0) {
-                        val seasons = remember(numberOfSeasons) { (1..numberOfSeasons).toList() }
+                    // Lists Season 1..listedSeasons, so a season with nothing
+                    // aired yet never renders. Waits for that answer rather than
+                    // listing every season and then dropping one.
+                    val listed = listedSeasons ?: 0
+                    if (numberOfSeasons > 0 && listed > 0) {
+                        val seasons = remember(listed) { (1..listed).toList() }
                         val listState = seasonsListState
 
                         Box(
@@ -2591,6 +2952,13 @@ fun TVShowsDetailsScreenContent(
                                 // costs nothing during D-pad navigation.
                                 val isWatched = (selectedSeason to episode.episodeNumber) in watchedEpisodes
 
+                                // Still FOCUSABLE when unaired -- people want to read what is
+                                // coming -- but not pressable. See the scrim below and the
+                                // Enter branch above.
+                                val isUnaired = remember(episode.airDate, todayYmd) {
+                                    isEpisodeUnaired(episode.airDate, todayYmd)
+                                }
+
                                 // Try the episode still first, fallback to show's backdropUrl
                                 val stillUrl = episode.stillImageUrl ?: backdropUrl
 
@@ -2630,6 +2998,11 @@ fun TVShowsDetailsScreenContent(
                                             if (state.hasFocus) {
                                                 lastFocusedEpisodeIndex = index
                                                 episodeFocusLanded = true  // confirms initial focus actually landed
+                                                // Arming belongs to ONE episode. Landing on a
+                                                // different one drops it, so a press here can
+                                                // never be the second half of a pair begun on a
+                                                // neighbour three cards away.
+                                                if (unairedArmedIndex != index) unairedArmedIndex = -1
                                             }
                                         }
 
@@ -2642,7 +3015,7 @@ fun TVShowsDetailsScreenContent(
                                                                 selectedEpisodeOverlayIndex = -1
                                                                 true
                                                             }
-                                                            numberOfSeasons > 1 && seasonFocusRequesters.isNotEmpty() -> {
+                                                            (listedSeasons ?: numberOfSeasons) > 1 && seasonFocusRequesters.isNotEmpty() -> {
                                                                 val seasonIdx = (selectedSeason - 1)
                                                                     .coerceIn(0, seasonFocusRequesters.lastIndex)
                                                                 BlueHiveApplication.playHoverSound()
@@ -2663,8 +3036,20 @@ fun TVShowsDetailsScreenContent(
 
 
                                                     Key.Enter, Key.NumPadEnter, Key.DirectionCenter -> {
-                                                        BlueHiveApplication.playClickSound()
-                                                        selectedEpisodeOverlayIndex = index
+                                                        if (isUnaired && unairedArmedIndex != index) {
+                                                            // REFUSED, NOT IGNORED. Silence here is
+                                                            // indistinguishable from a dropped press,
+                                                            // and the answer to that is to press again
+                                                            // harder. The sound says the box heard it
+                                                            // -- and the notice says what a second
+                                                            // press will do.
+                                                            BlueHiveApplication.playErrorSound()
+                                                            unairedArmedIndex = index
+                                                        } else {
+                                                            BlueHiveApplication.playClickSound()
+                                                            unairedArmedIndex = -1
+                                                            selectedEpisodeOverlayIndex = index
+                                                        }
                                                         true
                                                     }
 
@@ -2675,20 +3060,9 @@ fun TVShowsDetailsScreenContent(
                                                             providerFocusRequesters.firstOrNull()?.requestFocus()
                                                             true
                                                         } else {
-                                                            // DOWN off a tile lands on the browser button in the
-                                                            // corner. It used to be swallowed with no move at all.
-                                                            // Coming back scrolls this tile in first -- the row may
-                                                            // have moved, and a requester on an unplaced tile is not
-                                                            // attached, so a bare requestFocus() would silently no-op.
-                                                            focusBrowserButton {
-                                                                coroutineScope.launch {
-                                                                    episodesRowState.scrollToItem(index)
-                                                                    awaitFrame()
-                                                                    episodeFocusRequesters
-                                                                        .getOrNull(index)
-                                                                        ?.requestFocus()
-                                                                }
-                                                            }
+                                                            // Nothing below a tile now that the corner button is
+                                                            // gone. Consumed with no move, so the press is silent
+                                                            // rather than sending focus somewhere arbitrary.
                                                             true
                                                         }
                                                     }
@@ -2827,6 +3201,45 @@ fun TVShowsDetailsScreenContent(
                                             }
                                         }
 
+
+                                        // ✅ UNAIRED — dark scrim over the still, saying why.
+                                        //
+                                        // Over the still rather than instead of it: the card still
+                                        // has to read as the episode it is, so the artwork stays
+                                        // visible underneath. Drawn after the badge and the watched
+                                        // fold so it covers both, and before the select overlay,
+                                        // which an unaired episode can never reach anyway -- the
+                                        // press that raises it is refused above.
+                                        if (isUnaired) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .matchParentSize()
+                                                    .clip(episodeShape)
+                                                    .background(Color(0xD9101014))
+                                                    // Border re-added ON TOP, same as the select
+                                                    // overlay does, or the scrim squares the corners.
+                                                    .border(
+                                                        width = 1.1.dp,
+                                                        color = Color(0xFF505050),
+                                                        shape = episodeShape
+                                                    ),
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                Text(
+                                                    text = "EPISODE NOT AVAILABLE",
+                                                    fontFamily = passionFont,
+                                                    fontSize = 15.sp,
+                                                    lineHeight = 17.sp,
+                                                    color = Color(0xFFD6D6DB),
+                                                    maxLines = 2,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                    textAlign = TextAlign.Center,
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .padding(horizontal = 12.dp)
+                                                )
+                                            }
+                                        }
 
                                         if (isEpisodeSelectOverlay) {  // overlay for when a episode is selected
                                             Box(
@@ -2994,15 +3407,30 @@ fun TVShowsDetailsScreenContent(
                     initialValue = emptyList(),
                     mediaType, mediaId, selectedSeason, episodeNumber, genres, originalLanguage
                 ) {
-                    value = if (isJapaneseAnimation(genres, originalLanguage)) {
-                        buildJapaneseAnimationSources(
+                    if (isJapaneseAnimation(genres, originalLanguage)) {
+                        value = buildJapaneseAnimationSources(
                             mediaType     = mediaType,
                             tmdbId        = mediaId,
                             seasonNumber  = selectedSeason,
                             episodeNumber = episodeNumber,
                         ) { c, n, u -> TVShowsDetailsScreenCompose.StreamingSource(c, n, u) }
                     } else {
-                        getStreamingSources(
+                        // READ FIRST, REFRESH SECOND, READ AGAIN. The first read
+                        // is synchronous and fills the buttons immediately from
+                        // cache; the refresh then upgrades them if the server has
+                        // changed since. Fetching before the first assignment
+                        // would make every title wait on the network to draw its
+                        // own buttons, which is a worse trade than being one
+                        // screen late to a kill switch.
+                        value = getStreamingSources(
+                            mediaType = mediaType,
+                            mediaId = mediaId,
+                            seasonNumber = selectedSeason,
+                            episodeNumber = episodeNumber
+                        )
+                        com.example.bluehive.api.SourceCatalog
+                            .warm(BlueHiveApplication.appContext ?: return@produceState)
+                        value = getStreamingSources(
                             mediaType = mediaType,
                             mediaId = mediaId,
                             seasonNumber = selectedSeason,
@@ -3028,6 +3456,9 @@ fun TVShowsDetailsScreenContent(
                         AnimeEpisodeProviderButtons(
                             passionFont     = passionFont,
                             miruroUrl       = miruroUrl,
+                            // Empty means produceState has not finished; once it
+                            // has, the list always holds at least VidFast.
+                            resolving       = episodeSources.isEmpty(),
                             focusRequesters = providerFocusRequesters,
                             onDub = { url ->
                                 val epName = selectedEpisode.title
@@ -3113,11 +3544,6 @@ fun TVShowsDetailsScreenContent(
 
                                 episodeFocusRequesters[targetIndex].requestFocus()
                             },
-                            onExitToCorner = { fromIndex ->
-                                focusBrowserButton {
-                                    providerFocusRequesters.getOrNull(fromIndex)?.requestFocus()
-                                }
-                            }
                         )
                     }
                 }
@@ -3178,21 +3604,27 @@ fun TVShowsDetailsScreenContent(
         //  Anime DuB/SuB overlays — last so they render on top of everything
         // ════════════════════════════════════════════════════════════════════
         if (isExtracting) {
-            ExtractionLoadingOverlay(
-                // VidFast: the extractor's OWN words, broadcast as it works.
-                // Anime: estimated labels, since Miruro's extractor doesn't report.
-                status = vidFastStatus.ifBlank {
-                    when (extractStage) {
-                        0, 1 -> "Locating stream source…"
-                        2    -> "Loading stream source…"
-                        3    -> "Preparing video player…"
-                        else -> "Almost there…"
-                    }
-                },
-                stage = extractStage,
-                // Amber line: "Failure on first extraction — attempting retry 2/2".
-                note  = null
-            )
+            // TRAPPED, like the server check below it. Without this the episode
+            // tile behind the scrim keeps focus and eats BACK twice — once to
+            // close the episode overlay, once to jump to the season column —
+            // before a third press reaches the BackHandler that cancels.
+            ExtractionFocusTrap {
+                ExtractionLoadingOverlay(
+                    // VidFast: the extractor's OWN words, broadcast as it works.
+                    // Anime: estimated labels, since Miruro's extractor doesn't report.
+                    status = vidFastStatus.ifBlank {
+                        when (extractStage) {
+                            0, 1 -> "Locating stream source…"
+                            2    -> "Loading stream source…"
+                            3    -> "Preparing video player…"
+                            else -> "Almost there…"
+                        }
+                    },
+                    stage = extractStage,
+                    // Amber line: "Failure on first extraction — attempting retry 2/2".
+                    note  = null
+                )
+            }
         }
 
         // Actionable failure (currently: an ISP/router filter blocking the source).
@@ -3242,23 +3674,7 @@ fun TVShowsDetailsScreenContent(
             // so the existing BackHandler can still cancel an enumeration that
             // hangs. Without that exemption this overlay becomes a trap with no
             // way out on a remote that has no other keys.
-            val checkingFocus = remember { FocusRequester() }
-            LaunchedEffect(Unit) {
-                awaitFrame()
-                try { checkingFocus.requestFocus() } catch (_: Exception) {}
-            }
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .focusRequester(checkingFocus)
-                    .focusable()
-                    .onPreviewKeyEvent { ev ->
-                        when (ev.key) {
-                            Key.Back, Key.Escape -> false
-                            else -> true
-                        }
-                    }
-            ) {
+            ExtractionFocusTrap {
                 ExtractionLoadingOverlay(
                     status = "Checking the site for available servers…",
                     stage  = 2
@@ -3340,7 +3756,6 @@ fun TVShowsDetailsScreenContent(
         if (showServerPicker && serverOptions.isNotEmpty()) {
             ServerPickerOverlay(
                 servers      = serverOptions,
-                defaultIndex = serverDefaultIdx,
                 audioLabel   = if (pendingDub) "Dub" else "Sub",
                 onSelect     = { serverName ->
                     showServerPicker = false
@@ -3367,6 +3782,31 @@ fun TVShowsDetailsScreenContent(
             )
         }
 
+        // Says what the first press did and what a second will do. Carries the
+        // date so the viewer can judge for themselves whether we have it wrong --
+        // which is the entire point of offering the override.
+        if (unairedArmedIndex >= 0) {
+            val armedDate = formatEpisodeAirDate(
+                episodes.getOrNull(unairedArmedIndex)?.airDate
+            )
+            Text(
+                if (armedDate.isNotEmpty())
+                    "This episode airs $armedDate — press again to try anyway"
+                else
+                    "This episode hasn't aired yet — press again to try anyway",
+                color = Color.White,
+                fontSize = 18.sp,
+                fontFamily = dongleRegular,
+                textAlign = TextAlign.Center,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 70.dp)
+                    .widthIn(max = 720.dp)
+                    .background(Color(0xE6000000), RoundedCornerShape(10.dp))
+                    .padding(horizontal = 26.dp, vertical = 12.dp)
+            )
+        }
+
         if (showNotYetAvailable) {
             Text(
                 "This show isn't in our search engines yet — it's brand new, so check back in a week or so",
@@ -3384,54 +3824,6 @@ fun TVShowsDetailsScreenContent(
         }
 
 
-        // Bottom-right corner. Declared last so it draws above everything
-        // else on the page.
-        // Hidden while Extras is showing the recommended row. That row occupies
-        // the lower half of the page, so the button would sit on top of it, and
-        // the two routes INTO the button -- the episode tiles and the provider
-        // grid -- are themselves inside the !isExtrasToggled branch and gone.
-        // Leaving it visible would mean a control that can be seen and not
-        // reached.
-        //
-        // Nothing can be stranded by this: toggling Extras requires focus on the
-        // Extras button, so the browser button is never focused at the moment it
-        // disappears.
-        if (!isExtrasToggled && !isAnimeTitle) {
-            BrowserCornerButton(
-                focusRequester = browserFocusRequester,
-                onExit = { browserReturnFocus[0]?.invoke() },
-                onClick = { showPlaybackSettings = true },
-                modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .padding(end = BROWSER_BUTTON_MARGIN, bottom = BROWSER_BUTTON_MARGIN)
-            )
-        }
-
-        // Declared LAST so its BackHandler is the most recently added enabled
-        // one and therefore wins over the Extras collapse and the overlay
-        // handlers above it, which is what makes Back close this first.
-        if (showPlaybackSettings) {
-            PlaybackSettingsOverlay(
-                askEachTime = PlaybackPrefs.askPlayerEachTime,
-                onChoose = { ask ->
-                    PlaybackPrefs.setAskPlayerEachTime(context, ask)
-                    showPlaybackSettings = false
-                    // Focus has to be put back by hand: the overlay took it, and
-                    // the button it came from is in a corner nothing points at.
-                    coroutineScope.launch {
-                        awaitFrame()
-                        try { browserFocusRequester.requestFocus() } catch (_: Exception) {}
-                    }
-                },
-                onDismiss = {
-                    showPlaybackSettings = false
-                    coroutineScope.launch {
-                        awaitFrame()
-                        try { browserFocusRequester.requestFocus() } catch (_: Exception) {}
-                    }
-                },
-            )
-        }
 
     }
 }
@@ -3925,7 +4317,23 @@ fun TVShowsRewindButton(
 ) {
     ModularButton(
         textConfig = ModularButtonTextConfig(
-            text = "<",
+            // ── A REAL SEEK ICON, NOT A CHEVRON ──────────────────────
+            // "<" and ">" are less-than and greater-than: punctuation that
+            // happens to point. They read as paging, which is not what these
+            // do -- both seek the trailer by exactly 10 seconds.
+            //
+            // A DOUBLE TRIANGLE, not the player band's circular "10". Both
+            // seek by SEEK_INCREMENT_MS (10s), so the numbered asset was
+            // accurate -- but at 14dp on a button this size the digits are
+            // detail nobody reads, while two triangles carry the direction on
+            // their own. The band keeps the numbered version, where it is
+            // large enough for the 10 to be worth printing.
+            //
+            // `text` still carries the label: it is unused for drawing when
+            // iconRes is set, and becomes the icon's contentDescription.
+            text = "Rewind 10 seconds",
+            iconRes = R.drawable.ic_seek_rewind,
+            iconSize = 14.dp,
         ),
         isToggleable = false,
         fontFamily = fontFamily,
@@ -3991,7 +4399,23 @@ fun TVShowsFastForwardButton(
 ) {
     ModularButton(
         textConfig = ModularButtonTextConfig(
-            text = ">",
+            // ── A REAL SEEK ICON, NOT A CHEVRON ──────────────────────
+            // "<" and ">" are less-than and greater-than: punctuation that
+            // happens to point. They read as paging, which is not what these
+            // do -- both seek the trailer by exactly 10 seconds.
+            //
+            // A DOUBLE TRIANGLE, not the player band's circular "10". Both
+            // seek by SEEK_INCREMENT_MS (10s), so the numbered asset was
+            // accurate -- but at 14dp on a button this size the digits are
+            // detail nobody reads, while two triangles carry the direction on
+            // their own. The band keeps the numbered version, where it is
+            // large enough for the 10 to be worth printing.
+            //
+            // `text` still carries the label: it is unused for drawing when
+            // iconRes is set, and becomes the icon's contentDescription.
+            text = "Forward 10 seconds",
+            iconRes = R.drawable.ic_seek_forward,
+            iconSize = 14.dp,
         ),
         isToggleable = false,
         fontFamily = fontFamily,
@@ -4059,7 +4483,6 @@ private fun EpisodeProviderInlineButtons(
     focusRequesters: List<FocusRequester>,
     onSourceSelected: (TVShowsDetailsScreenCompose.StreamingSource) -> Unit,
     onBack: () -> Unit,   // ✅ NEW
-    onExitToCorner: (Int) -> Unit,
 ) {
     val safeSources = remember {
         mutableStateListOf<TVShowsDetailsScreenCompose.StreamingSource>()
@@ -4112,7 +4535,6 @@ private fun EpisodeProviderInlineButtons(
                         focusRequesters = focusRequesters,
                         onClick = { onSourceSelected(source) },
                         onBack = onBack,
-                        onExitToCorner = onExitToCorner,
                     )
                 }
             }
@@ -4133,12 +4555,6 @@ private fun EpisodeOverlayStreamerButton(
     focusRequesters: List<FocusRequester>,
     onClick: () -> Unit,
     onBack: () -> Unit,
-    /**
-     * Leaving the grid for the browser button in the corner: RIGHT off the right
-     * column, or DOWN off the bottom row. Receives this button's index so the
-     * corner button knows where to send focus back to.
-     */
-    onExitToCorner: (Int) -> Unit,
 ) {
     // 🔹 manual x tweak just for certain names
     val labelOffsetX = when (source.name) {
@@ -4187,11 +4603,9 @@ private fun EpisodeOverlayStreamerButton(
                         if (target >= 0) {
                             focusRequesters.getOrNull(target)?.requestFocus()
                             BlueHiveApplication.playHoverSound()
-                        } else {
-                            // Right column (and a lone trailing button): RIGHT was a
-                            // dead end. Leave the grid for the corner button instead.
-                            onExitToCorner(index)
                         }
+                        // Right column (and a lone trailing button): RIGHT is a
+                        // dead end again now the corner button is gone.
                         true
                     }
 
@@ -4216,12 +4630,9 @@ private fun EpisodeOverlayStreamerButton(
                         if (target < total) {
                             focusRequesters.getOrNull(target)?.requestFocus()
                             BlueHiveApplication.playHoverSound()
-                        } else {
-                            // Bottom row: nothing below it inside the grid, so DOWN
-                            // was consumed with no move. Hand off to the corner
-                            // button, same as RIGHT does off the right column.
-                            onExitToCorner(index)
                         }
+                        // Bottom row: nothing below it inside the grid, so DOWN
+                        // is consumed with no move.
                         true
                     }
 
@@ -4342,13 +4753,53 @@ fun SeasonButton(
 @Composable
 private fun AnimeEpisodeProviderButtons(
     passionFont: FontFamily,
-    miruroUrl: String?,                                            // null if AniList resolve failed
+    miruroUrl: String?,                                            // null while resolving OR if unmapped
+    /**
+     * The source list has not arrived yet.
+     *
+     * THIS IS WHAT SEPARATES "not yet" FROM "not there", and without it the two
+     * were the same thing: miruroUrl is null in both cases, so a press made in
+     * the second before the AniList resolve landed reported the episode as
+     * unavailable — and the identical press a moment later worked. The list is
+     * empty only while loading (it always carries VidFast once built), so its
+     * emptiness is the signal.
+     */
+    resolving: Boolean,
     focusRequesters: List<FocusRequester>,                         // [0]=DuB, [1]=SuB
     onDub: (String) -> Unit,
     onSub: (String) -> Unit,
-    onUnavailable: () -> Unit,                                     // fired when miruroUrl is null (no mapping yet)
+    onUnavailable: () -> Unit,                                     // genuinely has no mapping
     onBack: () -> Unit,
 ) {
+    /** A press made too early. true = dub, false = sub, null = none waiting. */
+    var queued by remember { mutableStateOf<Boolean?>(null) }
+
+    // REMEMBERED, NOT REFUSED. The viewer pressed a button; the right answer is
+    // to honour it when the url shows up, not to tell them the episode does not
+    // exist because the network was a beat behind their thumb.
+    //
+    // Re-runs whenever the url or the resolving flag changes, which cancels the
+    // delay below — so the bounded wait only expires if nothing ever arrived.
+    LaunchedEffect(queued, miruroUrl, resolving) {
+        val want = queued ?: return@LaunchedEffect
+        if (miruroUrl != null) {
+            queued = null
+            if (want) onDub(miruroUrl) else onSub(miruroUrl)
+            return@LaunchedEffect
+        }
+        if (!resolving) {           // list arrived and carries no Miruro: real
+            queued = null
+            onUnavailable()
+            return@LaunchedEffect
+        }
+        // Still resolving. Wait, but not forever — a resolve that never
+        // finishes must not leave the button looking dead.
+        delay(8_000)
+        if (queued != null) {
+            queued = null
+            onUnavailable()
+        }
+    }
     // Auto-focus DuB when the overlay opens (matches EpisodeProviderInlineButtons).
     LaunchedEffect(Unit) {
         delay(50)
@@ -4383,7 +4834,13 @@ private fun AnimeEpisodeProviderButtons(
                         else               -> false
                     }
                 },
-                onClick = { if (miruroUrl != null) onDub(miruroUrl) else onUnavailable() }
+                onClick = {
+                    when {
+                        miruroUrl != null -> onDub(miruroUrl)
+                        resolving -> queued = true      // honour it when it lands
+                        else -> onUnavailable()
+                    }
+                }
             )
             AnimeOverlayButton(
                 text = "Watch in Japanese",
@@ -4401,7 +4858,13 @@ private fun AnimeEpisodeProviderButtons(
                         else               -> false
                     }
                 },
-                onClick = { if (miruroUrl != null) onSub(miruroUrl) else onUnavailable() }
+                onClick = {
+                    when {
+                        miruroUrl != null -> onSub(miruroUrl)
+                        resolving -> queued = false     // honour it when it lands
+                        else -> onUnavailable()
+                    }
+                }
             )
         }
     }

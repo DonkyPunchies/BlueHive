@@ -111,7 +111,8 @@ import kotlinx.coroutines.withTimeout
  *
  *   onGoToTop          Go back to the top of the page - the radio button for
  *                      the next tab along, which is where UP from the first
- *                      shelf already lands.
+ *                      shelf already lands, with the rows back on their first
+ *                      shelf.
  *
  *   onRestoreRowFocus  Put focus back on the exact title card it came from.
  *                      Called ONLY when the overlay is dismissed with back,

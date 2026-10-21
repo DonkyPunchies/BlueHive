@@ -15,8 +15,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,7 +26,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -37,6 +34,7 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -47,6 +45,8 @@ import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import com.example.bluehive.searchBarComponent.HoneycombNamePopup
+import com.example.bluehive.searchBarComponent.hiveBackdropBlur
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -100,6 +100,36 @@ private val MANAGE_AVATAR_DRAWABLE_MAP: Map<String, Int> = mapOf(
     "avatar4" to R.drawable.avatar4,
     "avatar5" to R.drawable.avatar5,
     "avatar6" to R.drawable.avatar6,
+    "avatar7" to R.drawable.avatar7,
+    "avatar8" to R.drawable.avatar8,
+    "avatar9" to R.drawable.avatar9,
+    "avatar10" to R.drawable.avatar10,
+    "avatar11" to R.drawable.avatar11,
+    "avatar12" to R.drawable.avatar12,
+    "avatar13" to R.drawable.avatar13,
+    "avatar14" to R.drawable.avatar14,
+    "avatar15" to R.drawable.avatar15,
+    "avatar16" to R.drawable.avatar16,
+    "avatar17" to R.drawable.avatar17,
+    "avatar18" to R.drawable.avatar18,
+    "avatar19" to R.drawable.avatar19,
+    "avatar20" to R.drawable.avatar20,
+    "avatar21" to R.drawable.avatar21,
+    "avatar22" to R.drawable.avatar22,
+    "avatar23" to R.drawable.avatar23,
+    "avatar24" to R.drawable.avatar24,
+    "avatar25" to R.drawable.avatar25,
+    "avatar26" to R.drawable.avatar26,
+    "avatar27" to R.drawable.avatar27,
+    "avatar28" to R.drawable.avatar28,
+    "avatar29" to R.drawable.avatar29,
+    "avatar30" to R.drawable.avatar30,
+    "avatar31" to R.drawable.avatar31,
+    "avatar32" to R.drawable.avatar32,
+    "avatar33" to R.drawable.avatar33,
+    "avatar34" to R.drawable.avatar34,
+    "avatar35" to R.drawable.avatar35,
+    "avatar36" to R.drawable.avatar36,
 )
 
 private fun resolveManageAvatarDrawable(resName: String?): Int =
@@ -361,12 +391,27 @@ fun ProfileManageScreen(
     var notYoursWasOpened by remember { mutableStateOf(false) }
     val deleteFocus       = remember { FocusRequester() }
 
+    // ── Navigation sounds ─────────────────────────────────────────────────
+    // Both sounds mean "you moved". Focus being PUT somewhere -- the opening
+    // focus, or an overlay handing it back to the button that opened it -- is
+    // not a move, so every programmatic request below runs through
+    // restoreFocusSilently and the screen stays quiet across it. The profile
+    // picker draws the same line, for the same reason.
+    var navSoundArmed by remember { mutableStateOf(false) }
+
+    suspend fun restoreFocusSilently(target: () -> Unit) {
+        navSoundArmed = false
+        awaitFrame()
+        runCatching { target() }
+        awaitFrame()
+        navSoundArmed = true
+    }
+
     LaunchedEffect(notYours) {
         if (notYours != null) {
             notYoursWasOpened = true
         } else if (notYoursWasOpened) {
-            awaitFrame()
-            runCatching { notYoursReturn?.requestFocus() }
+            restoreFocusSilently { notYoursReturn?.requestFocus() }
         }
     }
 
@@ -382,8 +427,6 @@ fun ProfileManageScreen(
 
     var showNameEditor by remember { mutableStateOf(false) }
     var nameEditorText by remember { mutableStateOf("") }
-    val nameFieldRequester = remember { FocusRequester() }
-    val confirmFocus = remember { FocusRequester() }
 
     // ── Detail panel button focus requesters (lifted so overlays can return focus)
     val changeImageFocus  = remember { FocusRequester() }
@@ -401,8 +444,7 @@ fun ProfileManageScreen(
         if (showRecoverOverlay) {
             recoverOverlayWasOpened = true
         } else if (recoverOverlayWasOpened) {
-            awaitFrame()
-            try { recoverBtnFocus.requestFocus() } catch (_: Exception) {}
+            restoreFocusSilently { recoverBtnFocus.requestFocus() }
         }
     }
 
@@ -413,40 +455,23 @@ fun ProfileManageScreen(
             awaitFrame()
             avatarPickerFocusRequesters[0].requestFocus()
         } else if (avatarPickerWasOpened) {
-            awaitFrame()
-            try {
-                changeImageFocus.requestFocus()
-            } catch (_: Exception) {
-            }
+            restoreFocusSilently { changeImageFocus.requestFocus() }
         }
     }
 
-    // Focus the text field when the name editor opens; return to Change Name btn when it closes
+    // The name keyboard takes the focus itself when it opens; closing it
+    // returns the focus to the Change Name button.
     LaunchedEffect(showNameEditor) {
         if (showNameEditor) {
             nameEditorWasOpened = true
-            awaitFrame()
-            nameFieldRequester.requestFocus()
         } else if (nameEditorWasOpened) {
-            awaitFrame()
-            try {
-                changeNameFocus.requestFocus()
-            } catch (_: Exception) {
-            }
+            restoreFocusSilently { changeNameFocus.requestFocus() }
         }
     }
 
-    // Focus the text field when the name editor opens; return to Change Name btn when it closes
     LaunchedEffect(showNameEditor) {
-        if (showNameEditor) {
-            awaitFrame()
-            nameFieldRequester.requestFocus()
-        } else {
-            awaitFrame()
-            try {
-                changeNameFocus.requestFocus()
-            } catch (_: Exception) {
-            }
+        if (!showNameEditor) {
+            restoreFocusSilently { changeNameFocus.requestFocus() }
         }
     }
 
@@ -572,8 +597,11 @@ fun ProfileManageScreen(
 
     LaunchedEffect(profiles.size) {
         if (profiles.isNotEmpty() && focusRequesters.isNotEmpty()) {
-            awaitFrame()
-            focusRequesters[0].requestFocus()
+            restoreFocusSilently { focusRequesters[0].requestFocus() }
+        } else {
+            // No grid to land on, so nothing takes focus by itself here: the
+            // first move the user makes is a real one.
+            navSoundArmed = true
         }
     }
 
@@ -581,21 +609,34 @@ fun ProfileManageScreen(
         modifier = Modifier
             .fillMaxSize()
             .onKeyEvent { event ->
-                if (event.type == KeyEventType.KeyUp && event.key == Key.Back) {
-                    when {
-                        showAvatarPicker -> {
-                            showAvatarPicker = false; true
-                        }
+                if (event.key != Key.Back) return@onKeyEvent false
 
-                        showNameEditor -> {
-                            showNameEditor = false; true
-                        }
+                // BOTH EDGES ARE CONSUMED, and the screen answers Back itself
+                // rather than letting it fall through to the Activity.
+                //
+                // Returning false here used to hand the press to Compose, which
+                // answers an unconsumed Back by clearing focus and swallowing
+                // it. From the detail buttons that was invisible, but from the
+                // profile grid it cost a press: the first Back only emptied the
+                // focus, and the second -- with nothing focused for Compose to
+                // clear -- was the one that reached the Activity and closed the
+                // screen. Owning the key keeps one press meaning one thing
+                // wherever focus happens to be.
+                if (event.type != KeyEventType.KeyUp) return@onKeyEvent true
 
-                        showDeleteConfirm  -> { showDeleteConfirm  = false; true }
-                        showRecoverOverlay -> { showRecoverOverlay = false; true }
-                        else               -> false
+                when {
+                    showAvatarPicker   -> { showAvatarPicker   = false; true }
+                    showNameEditor     -> { showNameEditor     = false; true }
+                    showDeleteConfirm  -> { showDeleteConfirm  = false; true }
+                    showRecoverOverlay -> { showRecoverOverlay = false; true }
+                    // Dismiss the refusal, not the screen underneath it.
+                    notYours != null   -> { notYours = null; true }
+                    else               -> {
+                        BlueHiveApplication.playBackOutSound()
+                        onBack()
+                        true
                     }
-                } else false
+                }
             }
     ) {
 
@@ -603,13 +644,16 @@ fun ProfileManageScreen(
             painter = painterResource(id = R.drawable.manage_profiles_screen),
             contentDescription = null,
             contentScale = ContentScale.Crop,
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier
+                .fillMaxSize()
+                .hiveBackdropBlur(showNameEditor),
         )
 
         // ── Background content — focus blocked while any overlay is open ──────
         Box(
             modifier = Modifier
                 .fillMaxSize()
+                .hiveBackdropBlur(showNameEditor)
                 .focusProperties {
                     canFocus =
                         !showAvatarPicker && !showNameEditor && !showDeleteConfirm &&
@@ -669,6 +713,11 @@ fun ProfileManageScreen(
                                                 },
                                             anyCardFocused = focusedIndex >= 0,
                                             isSelected     = selectedIndex == index,
+                                            onFocusGained  = {
+                                                if (navSoundArmed) {
+                                                    BlueHiveApplication.playProfileSwapSound()
+                                                }
+                                            },
                                             onFocusChanged = { focused ->
                                                 focusedIndex = if (focused) index else -1
                                                 if (focused)                                                if (focused) flipManageTo(row / MANAGE_ROWS_PER_PAGE)
@@ -748,7 +797,13 @@ fun ProfileManageScreen(
                             showRecoverOverlay = true
                         }
                     },
-                    onReturn         = { onBack() },
+                    onReturn         = {
+                        BlueHiveApplication.playBackOutSound()
+                        onBack()
+                    },
+                    onButtonFocusGained = {
+                        if (navSoundArmed) BlueHiveApplication.playNavClickSound()
+                    },
                 )
             } else if (profiles.isEmpty() && peerProfiles.isEmpty()) {
                 // No profiles — show minimal panel with just recover and return
@@ -770,7 +825,13 @@ fun ProfileManageScreen(
                             showRecoverOverlay = true
                         }
                     },
-                    onReturn        = { onBack() },
+                    onReturn        = {
+                        BlueHiveApplication.playBackOutSound()
+                        onBack()
+                    },
+                    onButtonFocusGained = {
+                        if (navSoundArmed) BlueHiveApplication.playNavClickSound()
+                    },
                 )
             }
         }
@@ -788,139 +849,35 @@ fun ProfileManageScreen(
             AvatarPickerPanel(
                 offsetX = 198.dp,
                 offsetY = 133.dp,
+                // Nothing behind the scrim is focusable, so an escape off the
+                // edge of this grid lands nowhere at all.
+                trapFocus = true,
                 selectedAvatarRes = currentRes,
                 onAvatarSelected = { newRes -> changeSelectedAvatar(newRes) },
                 focusRequesters = avatarPickerFocusRequesters,
             )
         }
 
-        // ── Name editor overlay ───────────────────────────────────────────────
+        // ── Name editor: the honeycomb keyboard ───────────────────────────────
+        //
+        // Done saves through changeSelectedName; BACK closes without saving, as
+        // the old dialog did. It closes at once rather than after the save
+        // answers, so the keyboard never hangs on screen over a slow request.
         if (showNameEditor) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color(0xCC000000))
+                    .background(Color(0x73000000))
             )
-
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier.fillMaxSize(),
-            ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier
-                        .background(color = Color(0xFF121213), shape = RoundedCornerShape(12.dp))
-                        .border(
-                            width = 1.dp,
-                            color = Color(0xFF3A3737),
-                            shape = RoundedCornerShape(12.dp)
-                        )
-                        .padding(horizontal = 32.dp, vertical = 24.dp)
-                        .width(320.dp),
-                ) {
-                    // Preview
-                    Text(
-                        text = nameEditorText.ifEmpty { "Enter a name..." },
-                        color = if (nameEditorText.isEmpty()) Color(0xFF555555) else Color.White,
-                        fontFamily = AppTypography.interSemiBold,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 22.sp,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
-                    )
-
-                    // Input field
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(36.dp)
-                            .background(color = Color(0xFF1E1E1F), shape = RoundedCornerShape(6.dp))
-                            .border(
-                                width = 1.dp,
-                                color = Color(0xFF3A3737),
-                                shape = RoundedCornerShape(6.dp)
-                            )
-                            .padding(horizontal = 12.dp),
-                        contentAlignment = Alignment.CenterStart,
-                    ) {
-                        BasicTextField(
-                            value = nameEditorText,
-                            onValueChange = { if (it.length <= 15) nameEditorText = it },
-                            singleLine = true,
-                            cursorBrush = SolidColor(Color.White),
-                            textStyle = TextStyle(
-                                color = Color.White,
-                                fontSize = 14.sp,
-                                fontFamily = AppTypography.interSemiBold,
-                            ),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .focusRequester(nameFieldRequester),
-                        )
-                    }
-
-                    // Char count
-                    Text(
-                        text = "${nameEditorText.length}/15",
-                        color = Color(0xFF666666),
-                        fontSize = 11.sp,
-                        modifier = Modifier
-                            .align(Alignment.End)
-                            .padding(top = 4.dp, bottom = 16.dp),
-                    )
-
-                    // Confirm button
-                    ModularButton(
-                        textConfig = ModularButtonTextConfig(text = "Confirm", fontSize = 12f),
-                        isToggleable = false,
-                        fontFamily = AppTypography.interBold,
-                        focusRequester = confirmFocus,
-                        onClick = { changeSelectedName(nameEditorText) },
-                        modifier = Modifier.align(Alignment.CenterHorizontally)
-                            .offset(x = 12.dp),
-                        dimensions = ModularButtonDimensions(
-                            mainWidth = 120.dp,
-                            mainHeight = 27.dp,
-                            mainYOffset = 6.5.dp,
-                            secondWidth = 120.dp,
-                            secondHeight = 12.dp,
-                            secondYOffset = 26.dp,
-                            mainCornerRadius = 7f,
-                            secondCornerRadius = 8f,
-                            shadowHeight = 12.dp,
-                            glowWidth = 138.dp,
-                            glowHeight = 41.dp,
-                        ),
-                        colors = ModularButtonColors(
-                            mainDefault = Color(0xFF1E2854),
-                            mainToggled = Color(0xFF2644A6),
-                            mainFocused = Color(0xFF2644A6),
-                            secondDefault = Color(0xFF151C3A),
-                            secondFocused = Color(0xFF282C57),
-                            textFocused = Color(0xFFDADADA),
-                            textUnfocused = Color(0xFF868686),
-                            textUnfocusedToggled = Color(0xFF868686),
-                            textToggledFocus = Color(0xFFDADADA),
-                        ),
-                        glowConfig = ModularButtonGlowConfig(
-                            enabled = true,
-                            defaultRes = R.drawable.button_focus_wide_glow,
-                            offsetX = (-9).dp,
-                            offsetY = 7.dp,
-                            cornerRadius = 100.dp,
-                            fadeOutDurationMillis = 200,
-                            fadeInDurationMillis = 400,
-                        ),
-                        animationConfig = ModularButtonAnimationConfig(
-                            pressOffset = 3.5.dp,
-                            textOffsetDefault = 7.9.dp,
-                            textOffsetPressed = 9.9.dp,
-                            durationMillis = 110,
-                            bounceBackDelayMillis = 200,
-                        ),
-                    )
-                }
-            }
+            HoneycombNamePopup(
+                initialText = nameEditorText,
+                maxLength   = 15,
+                onDone      = { name ->
+                    showNameEditor = false
+                    changeSelectedName(name)
+                },
+                onDismiss   = { showNameEditor = false },
+            )
         }
 
 
@@ -1346,11 +1303,15 @@ fun ManageProfileCard(
     anyCardFocused: Boolean,
     isSelected:     Boolean,
     onFocusChanged: (Boolean) -> Unit,
+    // Fired only on a GAIN -- never on a loss, and never on a recomposition
+    // reporting the state it already had. Carries the profile-swap sound.
+    onFocusGained:  () -> Unit = {},
     modifier:       Modifier = Modifier,
     // "owner" / "member", or null for no triangle -- as on the picker.
     seat:           String?  = null,
 ) {
     var isFocused by remember { mutableStateOf(false) }
+    val currentOnFocusGained by rememberUpdatedState(onFocusGained)
 
     val glowAlpha by animateFloatAsState(
         targetValue   = if (isFocused) 1f else 0f,
@@ -1364,8 +1325,11 @@ fun ManageProfileCard(
         label         = "manageCardScale",
     )
 
+    // Lifted twice, a tenth each time: 0.4 -> 0.44 -> 0.484. This screen dims by
+    // alpha rather than by a tint over the top, so the number climbs where the
+    // other two fall, for the same result.
     val avatarAlpha by animateFloatAsState(
-        targetValue   = if (isFocused) 1f else 0.4f,
+        targetValue   = if (isFocused) 1f else 0.484f,
         animationSpec = tween(durationMillis = 250),
         label         = "avatarAlpha",
     )
@@ -1425,8 +1389,14 @@ fun ManageProfileCard(
                 .clip(RoundedCornerShape(MANAGE_CARD_CORNER))
                 .focusRequester(focusRequester)
                 .onFocusChanged {
+                    // Compare BEFORE assigning: onFocusChanged also fires on
+                    // recompositions carrying the state it already had, and a
+                    // bare "if (it.isFocused) play()" would re-fire the sound
+                    // while the card simply sat there.
+                    val gained = it.isFocused && !isFocused
                     isFocused = it.isFocused
                     onFocusChanged(it.isFocused)
+                    if (gained) currentOnFocusGained()
                 }
                 .focusable()
                 .pointerInput(Unit) {
@@ -1451,19 +1421,16 @@ fun ManageProfileCard(
                     .fillMaxSize()
                     .clip(RoundedCornerShape(MANAGE_CARD_CORNER)),
             )
-
-            Image(
-                painter            = painterResource(id = R.drawable.check_mark),
-                contentDescription = null,
-                modifier           = Modifier
-                    .size(MANAGE_CHECKMARK_SIZE)
-                    .alpha(checkmarkAlpha),
-            )
         }
 
-        // Seat triangle. A layer of its own that takes the card's focus scale
+        // Marks ON the card rather than part of it: the seat triangle and the
+        // selection tick. A layer of its own that takes the card's focus scale
         // and rounded clip but NOT its dimming (the avatar rests at 40%), so
-        // the seat reads at full strength on every card, as on the picker.
+        // both read at full strength on every card, as on the picker.
+        //
+        // The tick lived inside the dimmed box until now, which meant the one
+        // card that was actually chosen announced it at 40% opacity -- the mark
+        // faded out exactly when it had something to say.
         Box(
             modifier = Modifier
                 .size(MANAGE_CARD_SIZE)
@@ -1478,6 +1445,15 @@ fun ManageProfileCard(
                 focused  = isFocused,
                 side     = PROFILE_SEAT_TRIANGLE_SIZE,
                 modifier = Modifier.align(Alignment.TopStart),
+            )
+
+            Image(
+                painter            = painterResource(id = R.drawable.check_mark),
+                contentDescription = null,
+                modifier           = Modifier
+                    .size(MANAGE_CHECKMARK_SIZE)
+                    .align(Alignment.Center)
+                    .alpha(checkmarkAlpha),
             )
         }
 
@@ -1521,6 +1497,9 @@ fun SelectedProfileDetailPanel(
     onDelete:         () -> Unit,
     onRecover:        () -> Unit,
     onReturn:         () -> Unit,
+    // One hook for all five buttons -- they are one row of controls and they
+    // all make the same sound when focus arrives.
+    onButtonFocusGained: () -> Unit = {},
 ) {
     val returnFocus = remember { FocusRequester() }
     val backToGrid  = Modifier.focusProperties { left = gridFocus }
@@ -1602,15 +1581,16 @@ fun SelectedProfileDetailPanel(
         )
 
         DetailBtnChangeImage(focusRequester = changeImageFocus, onClick = onChangeImage,
-                             restricted = !isOwn, modifier = backToGrid)
+                             restricted = !isOwn, modifier = backToGrid,
+                             onFocusGained = onButtonFocusGained)
         DetailBtnChangeName(focusRequester = changeNameFocus,   onClick = onChangeName,
-                            modifier = backToGrid)
+                            modifier = backToGrid, onFocusGained = onButtonFocusGained)
         DetailBtnDelete(focusRequester = deleteFocus,           onClick = onDelete,
-                        restricted = !isOwn)
+                        restricted = !isOwn, onFocusGained = onButtonFocusGained)
         DetailBtnRecoverProfile(focusRequester = recoverBtnFocus, onClick = onRecover,
-                                modifier = backToGrid)
+                                modifier = backToGrid, onFocusGained = onButtonFocusGained)
         DetailBtnReturn(focusRequester = returnFocus,           onClick = onReturn,
-                        modifier = backToGrid)
+                        modifier = backToGrid, onFocusGained = onButtonFocusGained)
     }
 }
 
@@ -1623,6 +1603,7 @@ fun EmptyProfileActionPanel(
     returnFocus:     FocusRequester,
     onRecover:       () -> Unit,
     onReturn:        () -> Unit,
+    onButtonFocusGained: () -> Unit = {},
 ) {
     Box(
         modifier = Modifier.offset(x = DETAIL_PANEL_OFFSET_X, y = DETAIL_PANEL_OFFSET_Y)
@@ -1642,8 +1623,10 @@ fun EmptyProfileActionPanel(
             modifier   = Modifier.offset(x = 0.dp, y = 68.dp),
         )
 
-        DetailBtnRecoverProfile(focusRequester = recoverBtnFocus, onClick = onRecover)
-        DetailBtnReturn(focusRequester = returnFocus,             onClick = onReturn)
+        DetailBtnRecoverProfile(focusRequester = recoverBtnFocus, onClick = onRecover,
+                                onFocusGained = onButtonFocusGained)
+        DetailBtnReturn(focusRequester = returnFocus,             onClick = onReturn,
+                        onFocusGained = onButtonFocusGained)
     }
 }
 
@@ -1657,6 +1640,7 @@ fun EmptyProfileActionPanel(
 private fun DetailBtnChangeImage(
     focusRequester: FocusRequester,
     onClick: () -> Unit,
+    onFocusGained: () -> Unit = {},
     restricted: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
@@ -1674,6 +1658,7 @@ private fun DetailBtnChangeImage(
         fontFamily      = AppTypography.interBold,
         focusRequester  = focusRequester,
         onClick         = onClick,
+        onFocusGained   = onFocusGained,
         modifier        = Modifier.offset(x = 0.dp, y = offsetY).then(modifier),
         dimensions      = ModularButtonDimensions(
             mainWidth          = width,
@@ -1722,6 +1707,7 @@ private fun DetailBtnChangeImage(
 private fun DetailBtnChangeName(
     focusRequester: FocusRequester,
     onClick: () -> Unit,
+    onFocusGained: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val offsetY = 130.dp
@@ -1738,6 +1724,7 @@ private fun DetailBtnChangeName(
         fontFamily      = AppTypography.interBold,
         focusRequester  = focusRequester,
         onClick         = onClick,
+        onFocusGained   = onFocusGained,
         modifier        = Modifier.offset(x = 0.dp, y = offsetY).then(modifier),
         dimensions      = ModularButtonDimensions(
             mainWidth          = width,
@@ -1788,6 +1775,7 @@ private fun DetailBtnChangeName(
 private fun DetailBtnReturn(
     focusRequester: FocusRequester,
     onClick: () -> Unit,
+    onFocusGained: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val width = 132.dp
@@ -1803,6 +1791,7 @@ private fun DetailBtnReturn(
         fontFamily      = AppTypography.interBold,
         focusRequester  = focusRequester,
         onClick         = onClick,
+        onFocusGained   = onFocusGained,
         modifier        = Modifier.offset(x = 0.dp, y = 187.dp).then(modifier),
         dimensions      = ModularButtonDimensions(
             mainWidth          = width,
@@ -1853,6 +1842,7 @@ private fun DetailBtnReturn(
 private fun DetailBtnDelete(
     focusRequester: FocusRequester,
     onClick: () -> Unit,
+    onFocusGained: () -> Unit = {},
     restricted: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
@@ -1870,6 +1860,7 @@ private fun DetailBtnDelete(
         fontFamily      = AppTypography.interBold,
         focusRequester  = focusRequester,
         onClick         = onClick,
+        onFocusGained   = onFocusGained,
         modifier        = Modifier.offset(x = 140.dp, y = offsetY).then(modifier),
         dimensions      = ModularButtonDimensions(
             mainWidth          = width,
@@ -1919,6 +1910,7 @@ private fun DetailBtnDelete(
 private fun DetailBtnRecoverProfile(
     focusRequester: FocusRequester,
     onClick: () -> Unit,
+    onFocusGained: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val offsetY = 245.dp
@@ -1930,6 +1922,7 @@ private fun DetailBtnRecoverProfile(
         fontFamily      = AppTypography.interBold,
         focusRequester  = focusRequester,
         onClick         = onClick,
+        onFocusGained   = onFocusGained,
         modifier        = Modifier.offset(x = 140.dp, y = offsetY).then(modifier),
         dimensions      = ModularButtonDimensions(
             mainWidth          = width,

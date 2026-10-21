@@ -8,6 +8,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -20,7 +21,12 @@ import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.*
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.imageResource
@@ -29,6 +35,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.bluehive.R
+import kotlinx.coroutines.android.awaitFrame
 import kotlin.math.*
 
 
@@ -72,6 +79,53 @@ object BeeLogo {
  *               after appearing. Rendered in amber so it reads as a warning
  *               rather than progress.
  */
+/**
+ * Hold focus while an extraction runs, and let only BACK out.
+ *
+ * WHY IT IS NEEDED: ExtractionLoadingOverlay paints a full-screen scrim and
+ * nothing else. It takes no focus, so the control underneath keeps it, and on a
+ * d-pad every key still reaches the screen behind the scrim — including BACK,
+ * which never gets as far as the BackHandler that would cancel the extraction.
+ *
+ * WHAT THAT COST, measured on the TV detail screen: cancelling took THREE
+ * presses. The first went to the focused episode tile, whose own Key.Back
+ * branch closed the episode overlay and consumed the key. The second went to
+ * the same tile, took its next branch and moved focus to the season column,
+ * consuming again. Only the third landed on a control with no Back handler of
+ * its own, fell through to the dispatcher, and stopped the extraction. From the
+ * outside that reads as the overlay losing focus and wandering off on its own.
+ *
+ * BACK AND ESCAPE PASS THROUGH ON PURPOSE — `false` means not consumed. They
+ * are the only way out, and swallowing them would turn this into a trap with no
+ * exit on a remote that has no other keys. Everything else is swallowed so the
+ * screen underneath cannot be navigated while it is covered.
+ *
+ * The focus request is a frame late because the Box has to be laid out before
+ * it can take focus; a requestFocus() in the same frame is simply dropped.
+ */
+@Composable
+fun ExtractionFocusTrap(content: @Composable () -> Unit) {
+    val trap = remember { FocusRequester() }
+    LaunchedEffect(Unit) {
+        awaitFrame()
+        try { trap.requestFocus() } catch (_: Exception) {}
+    }
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .focusRequester(trap)
+            .focusable()
+            .onPreviewKeyEvent { ev ->
+                when (ev.key) {
+                    Key.Back, Key.Escape -> false
+                    else -> true
+                }
+            }
+    ) {
+        content()
+    }
+}
+
 @Composable
 fun ExtractionLoadingOverlay(status: String, stage: Int, note: String? = null) {
     val inf = rememberInfiniteTransition(label = "loader")

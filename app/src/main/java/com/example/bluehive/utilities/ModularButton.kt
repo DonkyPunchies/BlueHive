@@ -27,6 +27,8 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.foundation.layout.size
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -306,7 +308,25 @@ data class ModularButtonTextConfig(
     val text: String,
     val toggledText: String? = null,
     val fontSize: Float = 12f,
-    val offsetX: Dp = 0.dp
+    val offsetX: Dp = 0.dp,
+
+    /**
+     * Draw this drawable instead of [text].
+     *
+     * Added for symbols no font can be trusted with. A play triangle is a glyph
+     * every font has; a pause that reads correctly at 11sp is not -- U+25AE
+     * doubled looked like a snout, U+2016 merged into one bar, and spacing them
+     * apart needed the button widened around the workaround.
+     *
+     * It renders in the SAME box as the text, so it inherits the press offset
+     * and the focus colour: an icon overlaid on the button from outside would
+     * sit still while the button moved under it.
+     *
+     * TINTED WITH THE LABEL COLOUR, so an icon button and a text button light up
+     * identically on focus. Supply a white or single-colour asset.
+     */
+    val iconRes: Int? = null,
+    val iconSize: Dp = 12.dp,
 )
 
 @Immutable
@@ -721,16 +741,27 @@ fun ModularButton(
                         handleButtonClick()
                     }
             ) {
-                Text(
-                    text = labelText,
-                    color = labelColor,
-                    fontSize = textConfig.fontSize.sp,
-                    fontFamily = fontFamily,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier
-                        .offset(y = textYOffset, x = textConfig.offsetX)
-                        .semantics { contentDescription = labelText }
-                )
+                if (textConfig.iconRes != null) {
+                    Image(
+                        painter = painterResource(id = textConfig.iconRes),
+                        contentDescription = labelText,
+                        colorFilter = ColorFilter.tint(labelColor),
+                        modifier = Modifier
+                            .size(textConfig.iconSize)
+                            .offset(y = textYOffset, x = textConfig.offsetX)
+                    )
+                } else {
+                    Text(
+                        text = labelText,
+                        color = labelColor,
+                        fontSize = textConfig.fontSize.sp,
+                        fontFamily = fontFamily,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier
+                            .offset(y = textYOffset, x = textConfig.offsetX)
+                            .semantics { contentDescription = labelText }
+                    )
+                }
             }
         }
     }

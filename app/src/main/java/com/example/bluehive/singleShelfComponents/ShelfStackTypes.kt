@@ -32,30 +32,6 @@ enum class ContentShelf {
     ANIME_NEW_SEASON,
 }
 
-/**
- * Tracks exactly where focus should be when returning to a shelf
- */
-data class ShelfFocusMemory(
-    var lastFocusedTmdbId: Int = -1,
-    var lastListIndex: Int = 0,
-    var lastAbsoluteIndex: Int = 0,
-    var lastPageNumber: Int = 0,
-    var isValid: Boolean = false
-) {
-    fun save(tmdbId: Int, listIndex: Int, absoluteIndex: Int, pageNumber: Int) {
-        lastFocusedTmdbId = tmdbId
-        lastListIndex = listIndex
-        lastAbsoluteIndex = absoluteIndex
-        lastPageNumber = pageNumber
-        isValid = true
-        android.util.Log.d("FOCUS_MEMORY", "💾 Saved: tmdb=$tmdbId, listIdx=$listIndex, abs=$absoluteIndex, page=$pageNumber")
-    }
-
-    fun clear() {
-        isValid = false
-        android.util.Log.d("FOCUS_MEMORY", "🗑️ Cleared memory")
-    }
-}
 
 /**
  * Manages a sliding window of pages in memory

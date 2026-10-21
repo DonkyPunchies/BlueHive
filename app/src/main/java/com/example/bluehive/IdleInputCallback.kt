@@ -37,12 +37,15 @@ class IdleInputCallback(private val delegate: Window.Callback) : Window.Callback
         // produce a stream of repeats — counting all of them would be identical in
         // effect and three times the volume. The write is two volatile stores, so
         // this is about honesty in the logs rather than cost.
-        if (event.action == KeyEvent.ACTION_DOWN) IdleWatcher.noteInteraction()
+        if (event.action == KeyEvent.ACTION_DOWN) {
+            IdleWatcher.noteInteraction(
+                "${KeyEvent.keyCodeToString(event.keyCode)} dev=${event.deviceId}")
+        }
         return delegate.dispatchKeyEvent(event)
     }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
-        if (event.action == MotionEvent.ACTION_DOWN) IdleWatcher.noteInteraction()
+        if (event.action == MotionEvent.ACTION_DOWN) IdleWatcher.noteInteraction("touch")
         return delegate.dispatchTouchEvent(event)
     }
 

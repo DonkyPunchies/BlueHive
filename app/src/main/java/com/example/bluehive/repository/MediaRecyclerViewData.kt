@@ -2,7 +2,6 @@ package com.example.bluehive.repository
 
 import android.util.Log
 import com.example.bluehive.api.ApiClient
-import com.example.bluehive.demo.DemoData
 import com.example.bluehive.models.MediaBrowseResponse
 import com.example.bluehive.models.MediaItem
 import com.example.bluehive.models.WatchProvider
@@ -150,20 +149,6 @@ class MediaRecyclerViewData {
 
 
 
-    // Used only in review mode to provide a decent logo per provider tab
-    private fun providerNameToLogoUrl(providerName: String): String {
-        return when (providerName) {
-            "Netflix" -> "https://upload.wikimedia.org/wikipedia/commons/0/08/Netflix_2015_logo.svg"
-            "Prime Video" -> "https://upload.wikimedia.org/wikipedia/commons/f/f1/Prime_Video.png"
-            "Disney+" -> "https://upload.wikimedia.org/wikipedia/commons/3/3e/Disney%2B_logo.svg"
-            "Hulu" -> "https://upload.wikimedia.org/wikipedia/commons/e/e4/Hulu_Logo.svg"
-            "Max", "HBO Max" -> "https://upload.wikimedia.org/wikipedia/commons/1/17/HBO_Max_Logo.svg"
-            "Apple TV+" -> "https://upload.wikimedia.org/wikipedia/commons/1/1b/Apple_TV%2B_logo.svg"
-            "Paramount+" -> "https://upload.wikimedia.org/wikipedia/commons/9/98/Paramount%2B_logo.svg"
-            "Peacock" -> "https://upload.wikimedia.org/wikipedia/commons/d/d3/NBCUniversal_Peacock_Logo.svg"
-            else -> ""
-        }
-    }
 
 
 
@@ -419,9 +404,16 @@ class MediaRecyclerViewData {
 
     /**
      * "New This Season" — anime (both tv AND movies, mixed) whose most recent
-     * release falls within the last 4 months, ordered by popularity within that
-     * window. media_type is omitted so the backend returns both types in one
-     * popularity-sorted result.
+     * release falls within the last 4 months, NEWEST EPISODE FIRST.
+     *
+     * Was sorted by popularity, which made the name a lie: a show whose last
+     * episode aired in June sat above one that aired the same morning, purely
+     * on popularity, and the order barely moved from week to week. latest_release
+     * orders by the same date the window filters on, so the row finally answers
+     * the question it is titled after. The backend breaks ties on rating and
+     * drops anything not yet aired.
+     *
+     * media_type is omitted so the backend returns both types in one result.
      */
     suspend fun loadNewThisSeasonAnime(
         page: Int,
@@ -439,7 +431,11 @@ class MediaRecyclerViewData {
                 releasedAfter    = fourMonthsAgo,
                 limit            = pageSize,
                 offset           = offset,
-                sortBy           = "popularity"
+                // Must stay a key the browse endpoint's order_map knows.
+                // resolve_order falls back to popularity for anything it does
+                // not recognise, silently -- that is how the Top Rated shelf
+                // spent months sorted by the wrong thing.
+                sortBy           = "latest_release"
             )
             Log.d(TAG, "✅ Anime new-season returned ${response.items.size} items (offset=$offset)")
             response

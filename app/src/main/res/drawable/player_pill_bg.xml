@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The background every control in the band wears.
+
+    IT EXISTS TO KILL THE GREEN RECTANGLE. Without an explicit background, an
+    ImageButton takes ?android:attr/selectableItemBackground from the activity's
+    theme, and under Theme.Black.NoTitleBar.Fullscreen that is the platform's
+    holo focus highlight: the green box in the screenshots, the one thing in the
+    player that matches nothing else in the app.
+
+    Focused state first. A state list takes the FIRST matching item, so an
+    unqualified item placed above state_focused would swallow it.
+-->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+
+  <item android:state_focused="true">
+    <shape android:shape="rectangle">
+      <corners android:radius="10dp"/>
+      <solid android:color="#4D4477FF"/>
+      <stroke android:width="2dp" android:color="#FF4477FF"/>
+    </shape>
+  </item>
+
+  <item android:state_pressed="true">
+    <shape android:shape="rectangle">
+      <corners android:radius="10dp"/>
+      <solid android:color="#334477FF"/>
+    </shape>
+  </item>
+
+  <item>
+    <shape android:shape="rectangle">
+      <corners android:radius="10dp"/>
+      <solid android:color="#14FFFFFF"/>
+    </shape>
+  </item>
+
+</selector>

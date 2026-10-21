@@ -44,11 +44,10 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.LocalActivity
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.foundation.focusable
 import com.example.bluehive.api.ApiClient
+import com.example.bluehive.api.SourceCatalog
 import com.example.bluehive.api.ExtractOutcome
 import com.example.bluehive.api.FavoriteRequest
-import com.example.bluehive.api.WatchHistoryRequest
 import com.example.bluehive.utilities.AppShapes
 import androidx.compose.ui.text.style.TextAlign
 import com.example.bluehive.sidebarComponents.FavoritesScreenActivity
@@ -57,19 +56,18 @@ import com.example.bluehive.searchBarComponent.SearchBarActivity
 import com.example.bluehive.api.isJapaneseAnimation
 import com.example.bluehive.api.buildJapaneseAnimationSources
 import com.example.bluehive.webview.miruro.MiruroPlayerActivity
-import java.net.URLEncoder
 import com.example.bluehive.auth.SessionManager
 import android.app.Activity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import com.example.bluehive.webview.miruro.MiruroExtractorActivity
 import com.example.bluehive.webview.BeeLogo
+import com.example.bluehive.webview.ExtractionFocusTrap
 import com.example.bluehive.webview.ExtractionLoadingOverlay
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.android.awaitFrame
 import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.RoundedCornerShape
-import com.example.bluehive.webview.vidapi.VidApiExtractorActivity
 import com.example.bluehive.webview.hls.HlsExtract
 import com.example.bluehive.webview.hls.HlsPlayerActivity
 import com.example.bluehive.api.extractStreamAwait
@@ -102,10 +100,6 @@ class MoviesDetailsScreenCompose : ComponentActivity() {
         val coverName: String,
         val name: String,
         val url: String,
-        // true → play via the headless m3u8 extractor (ExoPlayer); false → the
-        // WebView player. A property of the source, not its display name, so
-        // renaming the button can't route it to the wrong path.
-        val useExtractor: Boolean = false
     )
 
     companion object {
@@ -392,7 +386,16 @@ class MoviesDetailsScreenCompose : ComponentActivity() {
 }
 
 
+/**
+ * The source buttons for this film. Backend-owned — see the twin on the TV
+ * screen for the full note, and SourceCatalog for the fallback chain.
+ */
 private fun getStreamingSources(mediaType: String, mediaId: Int): List<MoviesDetailsScreenCompose.StreamingSource> {
+    if (mediaType.equals("movie", true)) {
+        return com.example.bluehive.api.SourceCatalog
+            .sources(BlueHiveApplication.appContext, "movie", mediaId)
+            .map { MoviesDetailsScreenCompose.StreamingSource(it.label, it.name, it.url) }
+    }
     return when(mediaType) {
         "movie" -> listOf(
             MoviesDetailsScreenCompose.StreamingSource(
@@ -426,14 +429,6 @@ private fun getStreamingSources(mediaType: String, mediaId: Int): List<MoviesDet
                 "Queen Stream",
                 "VidFast",
                 "https://vidfast.pro/movie/$mediaId?autoPlay=true",
-                // hls.js embed → headless m3u8 extraction + ExoPlayer, with the
-                // GeckoView embed kept as the fallback (see the extractor result
-                // handler). Verified on-device: the manifest is captured in ~35s
-                // via both the JS hook and the network intercept, with no DRM or
-                // license traffic. Playing it in ExoPlayer instead of keeping a
-                // full browser engine resident for the whole film is the point —
-                // GeckoView is what OOM-killed the 2 GB box.
-                useExtractor = true
             ),
             MoviesDetailsScreenCompose.StreamingSource(
                 "Purple Stream",
@@ -458,14 +453,6 @@ private fun getStreamingSources(mediaType: String, mediaId: Int): List<MoviesDet
 
 
 @UnstableApi
-/**
- * Extraction attempts before handing off to the GeckoView embed. See
- * VIDFAST_MAX_ATTEMPTS in TVShowsDetailsScreenCompose for the measured reasoning:
- * these sites time out intermittently and the same title extracts fine seconds
- * later, so one free retry beats a browser engine resident for the whole film.
- */
-private const val VIDAPI_MAX_ATTEMPTS = 2
-
 @Composable
 fun MoviesDetailsScreenContent(
     mediaTitle: String,
@@ -561,6 +548,9 @@ fun MoviesDetailsScreenContent(
 
     var isExtractingTrailer by remember { mutableStateOf(false) }
     var isExtracting   by remember { mutableStateOf(false) }
+    // Which attempt of the failover chain is on screen. Exists to re-key the
+    // stage timer further down; see the comment there.
+    var extractAttempt by remember { mutableIntStateOf(0) }
 
     // ── BACK during an extraction ───────────────────────────────────────
     //
@@ -594,31 +584,12 @@ fun MoviesDetailsScreenContent(
     // Same flow the TV screen already has: picking one raises a two-button choice
     // instead of playing immediately — ExoPlayer (server-side m3u8 extraction,
     // light + resume-capable) or Gecko (the embed, as before).
-    //
-    // Deliberately NOT reusing `useExtractor`: that flag means the ON-DEVICE
-    // VidApi extractor activity, which is a different mechanism (activity-for-
-    // result vs. a suspend HTTP call) with different failure handling. Overloading
-    // it would send VidFast through VidApi's retry/fallback machinery.
     var backendChoiceFor by remember { mutableStateOf<MoviesDetailsScreenCompose.StreamingSource?>(null) }
 
-    // ── Browser button (bottom-right corner) ────────────────────────────────
-    // Mirrors the TV details screen. The composable itself is shared
-    // (utilities/BrowserCornerButton.kt) so the two cannot drift.
-    val browserFocusRequester = remember { FocusRequester() }
-
-    // How to get BACK out. Set by whichever route handed focus over, read by the
-    // button's LEFT/UP. A plain holder rather than state: nothing draws from it,
-    // so writing it must not recompose the screen.
-    val browserReturnFocus = remember { arrayOfNulls<(() -> Unit)>(1) }
-
-    var showPlaybackSettings by remember { mutableStateOf(false) }
-
-    /** Hand focus to the corner button, remembering the way back. */
-    fun focusBrowserButton(returnTo: () -> Unit) {
-        browserReturnFocus[0] = returnTo
-        BlueHiveApplication.playHoverSound()
-        browserFocusRequester.requestFocus()
-    }
+    // The playback-method setting used to be reached from a browser button in
+    // this screen's bottom-right corner, mirroring the TV screen. Both now point
+    // at Settings > Playback method instead. PlaybackPrefs is still READ below --
+    // only the way to change it moved.
     var isBackendExtract by remember { mutableStateOf(false) }
     var backendStatus    by remember { mutableStateOf("") }
     /** Non-null shows ExtractionErrorOverlay — a failure the user can act on. */
@@ -667,7 +638,6 @@ fun MoviesDetailsScreenContent(
     }
 
     // Extractor m3u8-extraction error reason (shown as a toast; auto-dismisses).
-    var vidApiError by remember { mutableStateOf<String?>(null) }
 
     // Back closes whichever picker/prompt is open instead of leaving the screen.
     //
@@ -798,7 +768,7 @@ fun MoviesDetailsScreenContent(
             val proxied = animeRelayUrl(
                 m3u8 = m3u8, tmdbId = tmdbId, mediaType = "anime_movie",
                 title = mediaTitle, profileId = favoriteProfileId,
-                sourceName = if (pendingDub) "Miruro (Dub)" else "Miruro (Sub)",
+                sourceName = miruroSourceLabel(null, capNames?.getOrNull(capDef)),
             )
             Log.d("scraper", "M Extract → direct=$m3u8  (relay fallback ready)")
             // ── Record the watch ────────────────────────────────────────
@@ -819,7 +789,7 @@ fun MoviesDetailsScreenContent(
                     .putExtra("MEDIA_ID",    tmdbId.toString())
                     .putExtra("MEDIA_TYPE",  mediaType)
                     .putExtra("MEDIA_TITLE", mediaTitle)
-                    .putExtra("SOURCE_NAME", if (pendingDub) "Miruro (Dub)" else "Miruro (Sub)")
+                    .putExtra("SOURCE_NAME", miruroSourceLabel(null, capNames?.getOrNull(capDef)))
                     // AUDIO EXISTS ONLY FOR MID-PLAYBACK RE-EXTRACTION, and it is not
                     // optional. Miruro signs its segment URLs with a token that dies
                     // after roughly nine minutes — MEASURED 2026-08-27, Mushoku Tensei
@@ -911,133 +881,25 @@ fun MoviesDetailsScreenContent(
         }
     }
 
+    // Which chain step the player currently on screen came from. Read when it
+    // reports a playback failure, so the chain keeps counting rather than
+    // restarting -- see the TV screen's twin.
+    var chainAttempt by remember { mutableIntStateOf(1) }
 
+    // Set by the launcher below, consumed by the LaunchedEffect after
+    // startBuiltInPlayer. A hop through state because the launcher has to exist
+    // before extractAndPlayMovie does, and its callback is not a coroutine.
+    // (dead source, where it died in ms) -- the next source starts there.
+    var playbackFailedSource by remember { mutableStateOf<Pair<String, Long>?>(null) }
 
-    // ── Extractor-source m3u8 extraction (movies only) ───────────────────────
-    // Reuses the isExtracting/extractStage overlay. Separate launcher from the
-    // Miruro one so the anime flow is untouched. The source name + embed URL are
-    // captured at launch so the result callback can label watch-history correctly
-    // and pass EMBED_URL for CDN failover (token refresh on a mid-play error).
-    var vidApiSourceName by remember { mutableStateOf("VidApi") }
-    var vidApiEmbedUrl   by remember { mutableStateOf<String?>(null) }
-
-    // The source we were extracting, kept so a FAILED extraction can fall back to
-    // the GeckoView embed instead of dead-ending on an error. Extraction is the
-    // fast/light path; the embed is the one that always works. A user CANCEL does
-    // NOT fall back — backing out is a deliberate "no".
-    var extractFallbackSource by remember {
-        mutableStateOf<MoviesDetailsScreenCompose.StreamingSource?>(null)
-    }
-
-    // ── Extraction retry ─────────────────────────────────────────────────────
-    // Mirrors the TV screen (see VIDFAST_MAX_ATTEMPTS there for the measured
-    // reasoning): these sites fail intermittently, so one free retry beats
-    // dropping the user into the heavyweight embed for the whole film.
-    var vidApiAttempt   by remember { mutableIntStateOf(0) }
-    var vidApiNote      by remember { mutableStateOf<String?>(null) }
-    // State hop — a launcher can't relaunch itself from inside its own callback.
-    var vidApiRetryUrl  by remember { mutableStateOf<Pair<String, String>?>(null) }
-
-    /**
-     * A failed extraction gets one more go. Posts the relaunch to [vidApiRetryUrl]
-     * and shows the amber banner; once the attempts are spent it simply STOPS.
-     *
-     * There is deliberately no GeckoView hand-off any more. The embed is a whole
-     * browser engine resident for the entire film — the thing this extractor exists
-     * to avoid — so a dead source now returns the user to the details screen with
-     * the source buttons still focused rather than silently downgrading them into
-     * the heavy player. Chaining to other sites is the planned replacement.
-     */
-    val giveUpOrRetry: (String) -> Unit = { why ->
-        val src = extractFallbackSource
-        if (vidApiAttempt < VIDAPI_MAX_ATTEMPTS && src != null) {
-            vidApiAttempt += 1
-            Log.w("scraper-vidapi", "⚠️ extraction failed ($why) — retry $vidApiAttempt/$VIDAPI_MAX_ATTEMPTS")
-            vidApiNote = if (vidApiAttempt == 2) {
-                "Failure on first extraction — attempting retry 2/$VIDAPI_MAX_ATTEMPTS"
-            } else {
-                "Failure on attempt ${vidApiAttempt - 1} — " +
-                    "attempting retry $vidApiAttempt/$VIDAPI_MAX_ATTEMPTS"
-            }
-            vidApiRetryUrl = vidApiSourceName to src.url
-            // Hold the overlay up and rewind it: the result handler cleared these a
-            // few lines up, and the user should see one continuous load, not a flash
-            // back to the details screen and a second overlay. Leaving extractPending
-            // set also blocks a double-fire while the retry is in flight.
-            isExtracting   = true
-            extractPending = true
-            extractStage   = 1
-        } else {
-            // Out of attempts. isExtracting was already cleared by the caller, so the
-            // overlay is gone and the details screen is simply back.
-            Log.w("scraper-vidapi",
-                  "🛑 extraction failed after $vidApiAttempt attempt(s) ($why) — " +
-                      "stopping, staying on details")
-            vidApiNote            = null
-            vidApiAttempt         = 0
-            extractFallbackSource = null
-        }
-    }
-
-    // English subtitle fetch, kicked off in parallel with extraction when a VidApi
-    // source is played.
-    val vidApiExtractorLauncher = rememberLauncherForActivityResult(
+    val playerLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        isExtracting   = false
-        extractPending = false
-        if (result.resultCode == Activity.RESULT_OK) {
-            val data     = result.data
-            val m3u8     = data?.getStringExtra(VidApiExtractorActivity.RESULT_M3U8)
-            val referer  = data?.getStringExtra(VidApiExtractorActivity.RESULT_REFERER)
-            val ua       = data?.getStringExtra(VidApiExtractorActivity.RESULT_UA)
-            if (!m3u8.isNullOrBlank()) {
-                // Direct CDN play. Captions are fetched ON DEMAND in the player when
-                // the CC button is pressed, so we just pass the tmdb id along (the
-                // extractor's own RESULT_SUBTITLE — vaplayer's thumbnail track — is
-                // intentionally unused).
-                Log.d("scraper-vidapi", "▶️ direct CDN play: $m3u8")
-                // Watch history is logged by the PLAYER on confirmed playback (see
-                // HlsPlayerActivity.onIsPlayingChanged), not here. Logging on a
-                // successful extract counted a watch even when the stream never
-                // played — a dead CDN, a failed re-extract, or the user backing out.
-                context.startActivity(
-                    Intent(context, HlsPlayerActivity::class.java)
-                        .putExtra("M3U8_URL", m3u8)
-                        .putExtra("REFERER", referer)
-                        .putExtra("UA", ua)
-                        .putExtra("TMDB_ID", tmdbId)         // for on-demand caption fetch
-                        // EMBED_URL lets the player re-extract a fresh token on a
-                        // mid-play CDN error (important for token'd embeds).
-                        .putExtra("EMBED_URL", vidApiEmbedUrl)
-                        // Extractor to re-run on a mid-play CDN failure (the player
-                        // no longer hardcodes one — see HlsExtract).
-                        .putExtra(HlsExtract.EXTRA_EXTRACTOR_CLASS,
-                                  VidApiExtractorActivity::class.java.name)
-                        .putExtra("PROFILE_ID",  favoriteProfileId)
-                        .putExtra("MEDIA_TYPE",  mediaType)
-                        .putExtra("MEDIA_TITLE", mediaTitle)
-                        .putExtra("SOURCE_NAME", vidApiSourceName)
-                )
-                vidApiAttempt = 0
-                vidApiNote    = null
-            } else {
-                Log.e("scraper-vidapi", "OK result but no m3u8")
-                giveUpOrRetry("no m3u8 captured")
-            }
-        } else {
-            val data   = result.data
-            val failed = data?.getBooleanExtra(VidApiExtractorActivity.RESULT_FAILED, false) == true
-            val reason = data?.getStringExtra(VidApiExtractorActivity.RESULT_REASON)
-            when {
-                failed -> { Log.w("scraper-vidapi", "failed: $reason"); giveUpOrRetry(reason ?: "extraction failed") }
-                // Back button — a deliberate "no". No fallback, and no retry either.
-                else   -> {
-                    Log.w("scraper-vidapi", "user cancelled")
-                    vidApiAttempt = 0
-                    vidApiNote    = null
-                }
-            }
+        if (result.resultCode == HlsPlayerActivity.RESULT_SOURCE_FAILED) {
+            val atMs = result.data?.getLongExtra(HlsPlayerActivity.EXTRA_FAILED_AT_MS, 0L) ?: 0L
+            result.data?.getStringExtra(HlsPlayerActivity.EXTRA_FAILED_SOURCE)
+                ?.takeIf { it.isNotBlank() }
+                ?.let { playbackFailedSource = it to atMs }
         }
     }
 
@@ -1058,12 +920,26 @@ fun MoviesDetailsScreenContent(
      * No retry loop: the server caches per title and deduplicates concurrent
      * requests, so a second client attempt just re-asks for the same answer.
      */
-    suspend fun extractAndPlayMovie(src: MoviesDetailsScreenCompose.StreamingSource) {
+    suspend fun extractAndPlayMovie(
+        src: MoviesDetailsScreenCompose.StreamingSource,
+        /** 1 for the source the viewer pressed; higher for each chain step. */
+        attempt: Int = 1,
+        /** The sources already tried and failed, oldest first. */
+        tried: List<String> = emptyList(),
+        /** Where to start, in ms: 0 for a press, the dead source's spot for a failover. */
+        startAtMs: Long = 0L,
+    ) {
         extractCancelled = false
         isExtracting     = true
         isBackendExtract = true
         extractPending   = true
         extractStage     = 1
+        // EVERY attempt stamps this, not only the failover ones. Setting it only
+        // on failover left it holding the previous title's last attempt number,
+        // so the first failover of the NEXT title could write the same value,
+        // fail to change the key, and freeze the stage dots -- the exact bug
+        // this field exists to prevent.
+        extractAttempt   = attempt
         backendStatus    = "Finding your stream…"
 
         // Display name IS the backend key once lowercased — see usesBackendExtraction.
@@ -1103,7 +979,33 @@ fun MoviesDetailsScreenContent(
             val reason = parseExtractReason(resp)
             Log.e("scraper-vidfast", "movie extraction failed (http=$code reason=$reason src=${src.name}) " +
                     "${result.exceptionOrNull()?.javaClass?.simpleName ?: ""}")
-            extractionError = extractionErrorMessage(code, reason, src.name, "movie")
+            // Failover — see the twin on the TV screen for the full note.
+            val next = if (SourceCatalog.failoverEnabled && attempt < SourceCatalog.maxAttempts) {
+                SourceCatalog.nextInChain(
+                    BlueHiveApplication.appContext, "movie", mediaId, 0, 0, src.name,
+                ) { usesBackendExtraction(it) }
+            } else null
+
+            if (next != null) {
+                Log.e("scraper-vidfast",
+                      "failover ${attempt}/${SourceCatalog.maxAttempts}: " +
+                      "${src.name} failed ($reason) -> trying ${next.name}")
+                isExtracting     = true
+                isBackendExtract = true
+                extractPending   = true
+                extractStage     = 1
+                backendStatus    = "${src.coverName} didn\u2019t work \u2014 trying ${next.label}\u2026"
+                extractAndPlayMovie(
+                    MoviesDetailsScreenCompose.StreamingSource(next.label, next.name, next.url),
+                    attempt + 1,
+                    tried + src.name,
+                    startAtMs,
+                )
+                return
+            }
+
+            extractionError =
+                extractionErrorMessage(code, reason, src.name, "movie", tried + src.name)
             return
         }
 
@@ -1111,7 +1013,11 @@ fun MoviesDetailsScreenContent(
                 "playlist=${runCatching { android.net.Uri.parse(body.m3u8).host }.getOrNull()} " +
                 "cached=${body.cached} expires_in=${body.expires_in}s extract=${tookMs}ms")
 
-        context.startActivity(
+        // launch(), not startActivity(): the result is how a playback failure
+        // gets back here to continue the chain. This was startActivity until
+        // 2026-10-19, so a movie that died in the player never failed over.
+        chainAttempt = attempt
+        playerLauncher.launch(
             Intent(context, HlsPlayerActivity::class.java)
                 .putExtra("M3U8_URL", body.m3u8)
                 // DIRECT FIRST, relay only after a confirmed failure. Re-extracting
@@ -1147,6 +1053,7 @@ fun MoviesDetailsScreenContent(
                 .putExtra("MEDIA_TITLE", mediaTitle)
                 .putExtra("SOURCE_NAME", src.name)
                 .putExtra("SUBTITLE_URL", body.subtitle_url)
+                .putExtra(HlsPlayerActivity.EXTRA_START_AT_MS, startAtMs)
         )
     }
 
@@ -1158,68 +1065,61 @@ fun MoviesDetailsScreenContent(
         extractJob = coroutineScope.launch { extractAndPlayMovie(src) }
     }
 
+    // ── FAILOVER, PLAYBACK HALF ─────────────────────────────────────────────
+    // The extraction half lives inside extractAndPlayMovie; this is the case it
+    // cannot see -- a source whose url looked fine and then died in the player,
+    // which only the player knows and reports through its activity result.
+    //
+    // MEASURED 2026-10-19, In the Beginning: VidNest died at 1:30, the player
+    // reported the dead source, and nothing here was listening -- the viewer was
+    // left on the buttons while MoviesAPI had the film the whole time.
+    //
+    // THE NEXT STEP RUNS IN THE SCREEN'S SCOPE, NOT THIS EFFECT'S. Clearing the
+    // key below recomposes and cancels this effect, so an extraction started
+    // inside it would die at its first suspension -- and runCatching would read
+    // that cancellation as a failed extraction and race down the whole chain.
+    // Holding it in extractJob also lets BACK cancel it like any other attempt.
+    LaunchedEffect(playbackFailedSource) {
+        val (failed, atMs) = playbackFailedSource ?: return@LaunchedEffect
+        playbackFailedSource = null
 
-    val launchVidApiExtract: (String, String) -> Unit = { name, url ->
-        Log.d("scraper-vidapi", "$name Extract → $url")
-        // Inside the launcher rather than at its call sites: this is reached
-        // from the DuB/SuB prompt, the SERVER PICKER and the failover retry,
-        // and a future caller should not have to remember. Idempotent.
-        stopTrailer()
-        if (!isExtracting && !extractPending && !isCheckingServers) {
-            extractPending = true
-            vidApiSourceName = name          // label watch-history + failover with this
-            vidApiEmbedUrl   = url           // embed URL for CDN failover re-extraction
-            coroutineScope.launch {
-                delay(200)
-                isExtracting = true
-                try { BlueHiveApplication.coilImageLoader.memoryCache?.clear() } catch (_: Exception) {}
-                vidApiExtractorLauncher.launch(
-                    Intent(context, VidApiExtractorActivity::class.java)
-                        .putExtra(VidApiExtractorActivity.EXTRA_URL, url)
-                )
-            }
+        val next = if (SourceCatalog.failoverEnabled &&
+                       chainAttempt < SourceCatalog.maxAttempts) {
+            SourceCatalog.nextInChain(
+                BlueHiveApplication.appContext, "movie", mediaId, 0, 0, failed,
+            ) { usesBackendExtraction(it) }
+        } else null
+
+        if (next == null) {
+            Log.e("scraper-vidfast",
+                  "movie playback failed on $failed — chain exhausted, staying put")
+            return@LaunchedEffect
+        }
+        Log.e("scraper-vidfast",
+              "failover ${chainAttempt}/${SourceCatalog.maxAttempts} (playback): " +
+              "$failed died in the player at ${atMs}ms -> trying ${next.name}")
+        val step = chainAttempt + 1
+        extractJob = coroutineScope.launch {
+            extractAndPlayMovie(
+                MoviesDetailsScreenCompose.StreamingSource(next.label, next.name, next.url),
+                step,
+                listOf(failed),
+                atMs,
+            )
         }
     }
 
-    // Performs the relaunch posted by retryOrFallback.
-    //
-    // Launches the extractor directly rather than going back through
-    // launchVidApiExtract: that helper guards on !isExtracting && !extractPending,
-    // and retryOrFallback deliberately leaves both set so the overlay never blinks
-    // out. Routing through it would either fight the guard or require dropping the
-    // overlay for the 200ms it waits.
-    LaunchedEffect(vidApiRetryUrl) {
-        val (_, url) = vidApiRetryUrl ?: return@LaunchedEffect
-        // Do NOT clear vidApiRetryUrl here - it is this effect's KEY, so writing it
-        // cancels this coroutine mid-delay and the retry never launches. Cleared
-        // after the launch instead.
-        // Let the failed extractor process die before the next WebView spawns —
-        // two browser engines at once is the memory spike we can't afford.
-        delay(500)
-        Log.d("scraper-vidapi", "🔁 relaunching extractor (attempt $vidApiAttempt) → $url")
-        try { BlueHiveApplication.coilImageLoader.memoryCache?.clear() } catch (_: Exception) {}
-        vidApiExtractorLauncher.launch(
-            Intent(context, VidApiExtractorActivity::class.java)
-                .putExtra(VidApiExtractorActivity.EXTRA_URL, url)
-        )
-        vidApiRetryUrl = null
-    }
 
     // ── BACK cancels an extraction in progress ───────────────────────
-    // The extractor Activity handles BACK while it is in front, but the loading
-    // overlay also covers windows where THIS screen is focused (the gap before a
-    // retry launches, and the moments around the extractor process starting and
-    // dying). BACK there used to fall through and leave the details screen
-    // entirely. Nulling vidApiRetryUrl also tears down a queued retry.
+    // The loading overlay covers windows where THIS screen is focused -- the gap
+    // between failover attempts, and the moments around a request starting and
+    // finishing. BACK there used to fall through and leave the details screen
+    // entirely.
     BackHandler(enabled = isExtracting || extractPending) {
         Log.d("scraper-vidapi", "↩️ back during extraction — cancelling")
         extractCancelled      = true
         extractJob?.cancel()
         extractJob            = null
-        vidApiRetryUrl        = null
-        vidApiAttempt         = 0
-        vidApiNote            = null
-        extractFallbackSource = null
         extractPending        = false
         isExtracting          = false
         extractStage          = 0
@@ -1322,7 +1222,7 @@ fun MoviesDetailsScreenContent(
                 // watch history and relay_sessions record, so a hardcoded "Sub"
                 // would mislabel every dub playback. `playingDub`, not `dub`: a
                 // last-resort sub is recorded as the sub it is.
-                .putExtra("SOURCE_NAME", if (playingDub) "Miruro (Dub)" else "Miruro (Sub)")
+                .putExtra("SOURCE_NAME", miruroSourceLabel(body.servers, server))
                 // See the on-device site above for why AUDIO is carried. `playingDub`
                 // rather than `dub` for the same reason SOURCE_NAME uses it: a
                 // last-resort sub must re-extract as the sub it actually is.
@@ -1485,10 +1385,6 @@ fun MoviesDetailsScreenContent(
     }
 
 
-    LaunchedEffect(vidApiError) {
-        if (vidApiError != null) { delay(3500); vidApiError = null }
-    }
-
     LaunchedEffect(tmdbId, mediaType, favoriteProfileId) {
         if (favoriteProfileId != -1) {
             try {
@@ -1524,18 +1420,67 @@ fun MoviesDetailsScreenContent(
                 episodeNumber = null,
             ) { c, n, u -> MoviesDetailsScreenCompose.StreamingSource(c, n, u) }
         }
-        // non-anime: initialValue already holds the 5 sources; nothing to do.
+        else {
+            // initialValue already holds the cached list, so the buttons are
+            // already on screen. Refresh and re-read so a source switched off on
+            // the server reaches a session that never backgrounds. Throttled
+            // inside warm(); usually a no-op.
+            com.example.bluehive.api.SourceCatalog
+                .warm(BlueHiveApplication.appContext ?: return@produceState)
+            value = getStreamingSources(mediaType, mediaId)
+        }
+    }
+
+    /**
+     * A DuB/SuB press made before the AniList resolve landed. true = dub.
+     *
+     * WHY IT EXISTS: `sources` starts empty and fills asynchronously, so the
+     * size check the buttons use could not tell "not resolved yet" from "this
+     * title has no Miruro mapping" — both read as too few sources. A press in
+     * that window reported the episode unavailable, and the same press a
+     * second later worked. Empty means still loading; a resolved list always
+     * carries VidFast, so it is never empty.
+     */
+    var queuedAnimePress by remember { mutableStateOf<Boolean?>(null) }
+
+    LaunchedEffect(queuedAnimePress, sources) {
+        val want = queuedAnimePress ?: return@LaunchedEffect
+        if (sources.size > 2) {
+            queuedAnimePress = null
+            lastStreamFocusRequester =
+                if (want) animeDubFocusRequester else animeSubFocusRequester
+            pendingUrl = sources[2].url
+            pendingDub = want
+            showDefaultPrompt = true
+            return@LaunchedEffect
+        }
+        if (sources.isNotEmpty()) {          // resolved, and carries no Miruro
+            queuedAnimePress = null
+            showNotYetAvailable = true
+            return@LaunchedEffect
+        }
+        // Still resolving. Bounded, so a resolve that never completes cannot
+        // leave the button looking dead.
+        delay(8_000)
+        if (queuedAnimePress != null) {
+            queuedAnimePress = null
+            showNotYetAvailable = true
+        }
     }
 
 
 
-    // Keyed on vidApiAttempt as well as isExtracting: a retry deliberately keeps
-    // isExtracting true (no overlay blink), so without the attempt key this effect
-    // would NOT restart and the dots would sit frozen at stage 1 for the whole
-    // second attempt — reading as a hang. Unlike the TV screen, these stages are
-    // timer-driven (the VidApi extractor broadcasts no progress), so something has
-    // to re-drive them.
-    LaunchedEffect(isExtracting, vidApiAttempt) {
+    // KEYED ON extractAttempt AS WELL AS isExtracting. A failover keeps the
+    // overlay up on purpose (no blink between sources), so isExtracting may not
+    // visibly transition between one attempt and the next -- and without a second
+    // key this effect would not restart, leaving the dots frozen at stage 1 for
+    // the whole of the next attempt, which reads as a hang.
+    //
+    // It used to key on the ON-DEVICE retry counter, which the backend path never
+    // incremented, so the dots really did freeze during a backend failover.
+    // extractAndPlayMovie stamps extractAttempt on entry, so every attempt --
+    // first or nth -- changes the key.
+    LaunchedEffect(isExtracting, extractAttempt) {
         if (isExtracting) {
             extractStage = 1
             delay(900);  extractStage = 2
@@ -1562,15 +1507,12 @@ fun MoviesDetailsScreenContent(
     }
 
     // 30s on the picker → close it and send the user back to the Yes/No prompt.
-    LaunchedEffect(showServerPicker) {
-        if (showServerPicker) {
-            delay(30_000)
-            if (showServerPicker) {          // still up → no pick was made
-                showServerPicker = false
-                showDefaultPrompt = true
-            }
-        }
-    }
+    // NO AUTO-DISMISS. This used to close itself after 30s and drop the viewer
+    // back on the default-server prompt. Reading six provider names, deciding,
+    // and walking a D-pad there is easily slower than that -- and the dialog
+    // vanishing mid-decision looks like the app crashed, then silently undoes
+    // the choice they were making. A picker closes when it is picked or backed
+    // out of; BackHandler already covers the second.
 
     LaunchedEffect(showServerError) {
         if (showServerError) {
@@ -2136,10 +2078,13 @@ fun MoviesDetailsScreenContent(
                             pendingUrl = sources[2].url
                             pendingDub = true
                             showDefaultPrompt = true
+                        } else if (sources.isEmpty()) {
+                            // Still resolving — honour the press when it lands.
+                            queuedAnimePress = true
                         } else {
-                            // No AniList mapping yet → no Miruro/M Extract source was
-                            // built, so there is nothing to scrape. Say so instead of
-                            // silently doing nothing.
+                            // Resolved, and still no Miruro/M Extract source: this
+                            // title genuinely has no AniList mapping yet. Say so
+                            // instead of silently doing nothing.
                             Log.w("scraper", "DuB pressed but no Miruro source (tmdb=$mediaId) — unmapped")
                             showNotYetAvailable = true
                         }
@@ -2157,6 +2102,8 @@ fun MoviesDetailsScreenContent(
                             pendingUrl = sources[2].url
                             pendingDub = false
                             showDefaultPrompt = true
+                        } else if (sources.isEmpty()) {
+                            queuedAnimePress = false
                         } else {
                             Log.w("scraper", "SuB pressed but no Miruro source (tmdb=$mediaId) — unmapped")
                             showNotYetAvailable = true
@@ -2191,18 +2138,6 @@ fun MoviesDetailsScreenContent(
                         disableLeftSound  = aloneInRow || col == 0, // left column / lone centered → mute left edge
                         disableRightSound = aloneInRow || col == 1, // right column / lone centered → mute right edge
                         disableDownSound  = i + 2 >= sources.size,  // no button directly below → mute down
-                        // RIGHT off the right column and DOWN off the bottom row
-                        // both used to dead-end. They now reach the corner button,
-                        // matching the TV screen. Only wired when the button is
-                        // actually on screen, so the edges stay silent dead ends
-                        // on an anime title exactly as before.
-                        onExitToCorner = if (!isAnime) {
-                            {
-                                focusBrowserButton {
-                                    streamerFocus.getOrNull(i)?.requestFocus()
-                                }
-                            }
-                        } else null,
                         onClick = {
                             // No stopTrailer() here. A backend-extracted source only
                             // raises the ExoPlayer/Gecko prompt below, and the trailer
@@ -2211,33 +2146,22 @@ fun MoviesDetailsScreenContent(
                             // Remember which button launched this so focus comes back
                             // here when the player exits (THE RULE).
                             lastStreamFocusRequester = streamerFocus[i]
-                            // Extractor sources → headless m3u8 extraction + ExoPlayer
-                            // (overlay shows progress); everything else keeps the WebView
-                            // path. Keyed off the source flag, not its name/slot.
+                            // Backend-extracted sources -> m3u8 + ExoPlayer (the
+                            // overlay shows progress); anything the backend cannot
+                            // extract keeps the WebView embed.
                             if (usesBackendExtraction(source.name)) {
-                                // Raise the ExoPlayer-vs-Gecko prompt. Checked
-                                // BEFORE useExtractor so a source can never take
-                                // both paths if it somehow carries the flag too.
+                                // Raise the ExoPlayer-vs-Gecko prompt.
                                 if (PlaybackPrefs.askPlayerEachTime) {
                                     backendChoiceFor = source
                                 } else {
                                     // Prompt turned off in the playback settings
-                                    // (reached from the TV details screen): take
-                                    // its default answer. The setting is global,
+                                    // (Settings > Playback method): take its
+                                    // default answer. The setting is global,
                                     // so it has to apply here too -- a viewer who
                                     // turned the prompt off would otherwise still
                                     // meet it on every film.
                                     startBuiltInPlayer(source)
                                 }
-                            } else if (source.useExtractor) {
-                                // Remember it so a failed extraction can fall back
-                                // to this same source's embed.
-                                extractFallbackSource = source
-                                // Fresh play → attempt 1, no stale retry banner.
-                                vidApiAttempt = 1
-                                vidApiNote    = null
-                                stopTrailer()
-                                launchVidApiExtract(source.name, source.url)
                             } else {
                                 stopTrailer()
                                 onStreamingSourceSelected(source)
@@ -2270,16 +2194,20 @@ fun MoviesDetailsScreenContent(
 
         // Instant extraction overlay — last in Box so it renders on top of everything
         if (isExtracting) {
-            ExtractionLoadingOverlay(
-                status = when (extractStage) {
-                    0, 1 -> "Locating stream source…"
-                    2    -> "Loading stream source…"
-                    3    -> "Preparing video player…"
-                    else -> "Almost there…"
-                },
-                stage = extractStage,
-                note  = vidApiNote
-            )
+            // TRAPPED, like the server check below it — see ExtractionFocusTrap.
+            // Untrapped, the focused source button behind the scrim swallows the
+            // first BACK for its own onBack and the extraction keeps running.
+            ExtractionFocusTrap {
+                ExtractionLoadingOverlay(
+                    status = when (extractStage) {
+                        0, 1 -> "Locating stream source…"
+                        2    -> "Loading stream source…"
+                        3    -> "Preparing video player…"
+                        else -> "Almost there…"
+                    },
+                    stage = extractStage,
+                )
+            }
         }
 
         // "No dub available" toast
@@ -2356,23 +2284,7 @@ fun MoviesDetailsScreenContent(
             //
             // BACK and Escape pass through so the existing BackHandler can still
             // cancel; swallowing them would leave no way out on a TV remote.
-            val checkingFocus = remember { FocusRequester() }
-            LaunchedEffect(Unit) {
-                awaitFrame()
-                try { checkingFocus.requestFocus() } catch (_: Exception) {}
-            }
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .focusRequester(checkingFocus)
-                    .focusable()
-                    .onPreviewKeyEvent { ev ->
-                        when (ev.key) {
-                            Key.Back, Key.Escape -> false
-                            else -> true
-                        }
-                    }
-            ) {
+            ExtractionFocusTrap {
                 ExtractionLoadingOverlay(
                     status = "Checking the site for available servers…",
                     stage  = 2
@@ -2419,7 +2331,6 @@ fun MoviesDetailsScreenContent(
         if (showServerPicker && serverOptions.isNotEmpty()) {
             ServerPickerOverlay(
                 servers      = serverOptions,
-                defaultIndex = serverDefaultIdx,
                 audioLabel   = if (pendingDub) "Dub" else "Sub",
                 onSelect     = { serverName ->
                     showServerPicker = false
@@ -2449,61 +2360,6 @@ fun MoviesDetailsScreenContent(
             )
         }
 
-        // ── Extractor error toast ───────────────────────────────────────────
-        if (vidApiError != null) {
-            Text(
-                vidApiError!!,
-                color = Color.White,
-                fontSize = 18.sp,
-                fontFamily = dongleRegular,
-                textAlign = TextAlign.Center,
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(bottom = 70.dp)
-                    .background(Color(0xE6000000), RoundedCornerShape(10.dp))
-                    .padding(horizontal = 26.dp, vertical = 12.dp)
-            )
-        }
-
-        // ── Browser button (bottom-right) ───────────────────────────────
-        // Same rules as the TV screen: hidden while Extras is showing the
-        // recommended row (it would sit on top of it, and the routes into it are
-        // themselves inside that branch), and never shown on an anime title,
-        // whose DuB/SuB flow has no ExoPlayer-vs-website fork for the setting to
-        // act on.
-        if (!isExtrasToggled && !isAnime) {
-            BrowserCornerButton(
-                focusRequester = browserFocusRequester,
-                onExit = { browserReturnFocus[0]?.invoke() },
-                onClick = { showPlaybackSettings = true },
-                modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .padding(end = BROWSER_BUTTON_MARGIN, bottom = BROWSER_BUTTON_MARGIN)
-            )
-        }
-
-        // Declared LAST so its BackHandler is the most recently added enabled one
-        // and therefore beats the Extras collapse above it.
-        if (showPlaybackSettings) {
-            PlaybackSettingsOverlay(
-                askEachTime = PlaybackPrefs.askPlayerEachTime,
-                onChoose = { ask ->
-                    PlaybackPrefs.setAskPlayerEachTime(context, ask)
-                    showPlaybackSettings = false
-                    coroutineScope.launch {
-                        awaitFrame()
-                        try { browserFocusRequester.requestFocus() } catch (_: Exception) {}
-                    }
-                },
-                onDismiss = {
-                    showPlaybackSettings = false
-                    coroutineScope.launch {
-                        awaitFrame()
-                        try { browserFocusRequester.requestFocus() } catch (_: Exception) {}
-                    }
-                },
-            )
-        }
 
     }   // ← Box closes here
 }   // ← MoviesDetailsScreenContent closes here
@@ -2741,7 +2597,23 @@ fun MoviesRewindButton(
 ) {
     ModularButton(
         textConfig = ModularButtonTextConfig(
-            text = "<",
+            // ── A REAL SEEK ICON, NOT A CHEVRON ──────────────────────
+            // "<" and ">" are less-than and greater-than: punctuation that
+            // happens to point. They read as paging, which is not what these
+            // do -- both seek the trailer by exactly 10 seconds.
+            //
+            // A DOUBLE TRIANGLE, not the player band's circular "10". Both
+            // seek by SEEK_INCREMENT_MS (10s), so the numbered asset was
+            // accurate -- but at 14dp on a button this size the digits are
+            // detail nobody reads, while two triangles carry the direction on
+            // their own. The band keeps the numbered version, where it is
+            // large enough for the 10 to be worth printing.
+            //
+            // `text` still carries the label: it is unused for drawing when
+            // iconRes is set, and becomes the icon's contentDescription.
+            text = "Rewind 10 seconds",
+            iconRes = R.drawable.ic_seek_rewind,
+            iconSize = 14.dp,
         ),
         isToggleable = false,
         fontFamily = fontFamily,
@@ -2807,7 +2679,23 @@ fun MoviesFastForwardButton(
 ) {
     ModularButton(
         textConfig = ModularButtonTextConfig(
-            text = ">",
+            // ── A REAL SEEK ICON, NOT A CHEVRON ──────────────────────
+            // "<" and ">" are less-than and greater-than: punctuation that
+            // happens to point. They read as paging, which is not what these
+            // do -- both seek the trailer by exactly 10 seconds.
+            //
+            // A DOUBLE TRIANGLE, not the player band's circular "10". Both
+            // seek by SEEK_INCREMENT_MS (10s), so the numbered asset was
+            // accurate -- but at 14dp on a button this size the digits are
+            // detail nobody reads, while two triangles carry the direction on
+            // their own. The band keeps the numbered version, where it is
+            // large enough for the 10 to be worth printing.
+            //
+            // `text` still carries the label: it is unused for drawing when
+            // iconRes is set, and becomes the icon's contentDescription.
+            text = "Forward 10 seconds",
+            iconRes = R.drawable.ic_seek_forward,
+            iconSize = 14.dp,
         ),
         isToggleable = false,
         fontFamily = fontFamily,
@@ -2876,9 +2764,6 @@ fun MoviesStreamerButton(
     disableRightSound: Boolean = false,
     disableUpSound: Boolean = false,
     disableDownSound: Boolean = false,
-    /** Non-null only when the corner browser button is on screen. Fires when the
-     *  viewer presses RIGHT off the right column or DOWN off the bottom row. */
-    onExitToCorner: (() -> Unit)? = null,
     onClick: () -> Unit
 ) {
     ModularButton(
@@ -2905,9 +2790,7 @@ fun MoviesStreamerButton(
                         }
                         Key.DirectionRight -> {
                             if (disableRightSound) {
-                                // Right edge. Used to be a plain dead end; now it
-                                // hands off to the corner button when there is one.
-                                onExitToCorner?.invoke()
+                                // Right edge: a plain dead end, no sound, no move.
                                 true
                             } else {
                                 BlueHiveApplication.playHoverSound()
@@ -2924,16 +2807,7 @@ fun MoviesStreamerButton(
                         }
                         Key.DirectionDown -> {
                             if (disableDownSound) {
-                                // Bottom row. Routed explicitly rather than left to
-                                // Compose's own directional search, which has to
-                                // cross most of the page to find the corner and is
-                                // not reliable over that distance.
-                                if (onExitToCorner != null) {
-                                    onExitToCorner.invoke()
-                                    true
-                                } else {
-                                    false   // no button: unchanged, no sound
-                                }
+                                false   // bottom row: nothing below, no sound
                             } else {
                                 BlueHiveApplication.playHoverSound()
                                 false

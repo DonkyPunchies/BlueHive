@@ -162,11 +162,6 @@ class SessionManager private constructor(context: Context) {
     /** Remember which host app launched us (see [hostPackage]). Written with
      *  commit() so it's on disk before the launch flow hands off and before any
      *  background token refresh needs it. */
-    fun setHostPackage(pkg: String) {
-        val success = prefs.edit().putString(KEY_HOST_PACKAGE, pkg).commit()
-        if (success) Log.d(TAG, "Host package set to $pkg")
-        else Log.e(TAG, "❌ Host package write FAILED")
-    }
 
     /** Remember which profile was just selected, so the next cold-start
      *  warm-up can prefetch its personalized rows immediately. */

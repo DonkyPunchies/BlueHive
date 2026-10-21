@@ -185,7 +185,14 @@ fun HomeScreenTrailerSectionCompose(
     }
 
     // Back exits Selected -> Focused and returns focus to hitbox (only if video not visible)
+    // Leaving Selected is a back-out: it undoes the press that entered, and the
+    // panel visibly changes state (the shadow clears). Without it the only exit
+    // from the carousel was silent while the way in spoke.
+    //
+    // NOT on the isVideoVisible handler above -- that one closes a PLAYING
+    // trailer, where a sound would land on top of the audio it is interrupting.
     BackHandler(enabled = !isVideoVisible && trailerState is TrailerFrameState.Selected) {
+        BlueHiveApplication.playBackOutSound()
         trailerState = TrailerFrameState.Focused
         hitboxFocusRequester.requestFocus()
     }
@@ -232,7 +239,15 @@ fun HomeScreenTrailerSectionCompose(
             contentScale = ContentScale.FillBounds
         )
 
-        // Shadow (ONLY disappears when Selected)
+        // Shadow — visible ONLY when Selected.
+        //
+        // INVERTED FROM ITS ORIGINAL SENSE, matching the Continue Watching
+        // panel. The focus overlay is drawn for BOTH Focused and Selected, so
+        // this shadow is the only thing separating "I am on this panel" from
+        // "I am inside it" -- and inside is the state worth marking, because it
+        // is where LEFT/RIGHT stop moving between sections and start turning
+        // the carousel. Spending the effect at rest and removing it on entry
+        // said the least at the moment something actually changed.
         Image(
             painter = painterResource(id = R.drawable.trailer_frame_shadow),
             contentDescription = "Trailer frame shadow",
@@ -240,7 +255,7 @@ fun HomeScreenTrailerSectionCompose(
                 .offset(x = shadowX, y = shadowY)
                 .width(shadowW)
                 .height(shadowH)
-                .graphicsLayer(alpha = if (trailerState is TrailerFrameState.Selected) 0f else 1f),
+                .graphicsLayer(alpha = if (trailerState is TrailerFrameState.Selected) 1f else 0f),
             contentScale = ContentScale.FillBounds
         )
 
@@ -328,10 +343,40 @@ fun HomeScreenTrailerSectionCompose(
                     }
 
                     when (event.key) {
-                        Key.DirectionUp, Key.DirectionDown, Key.DirectionRight -> {
+                        // RIGHT lands on the trending frame, which announces
+                        // nothing on arrival, so this side speaks for the move.
+                        Key.DirectionRight -> {
                             BlueHiveApplication.playHoverSound()
                             false
                         }
+
+                        // DOWN IS SILENT HERE ON PURPOSE -- it is the one
+                        // direction that lands on something which DOES announce
+                        // itself. `down` is wired to requesterFor(neighborOf(
+                        // selectedTab)), which is always one of the three radio
+                        // buttons, and each of those plays radioNavSound on
+                        // focus gain.
+                        //
+                        // Speaking here as well played button_navigation.mp3
+                        // TWICE for one press: playHoverSound and
+                        // playNavClickSound are the same sample at the same
+                        // volume, and they keep separate debounce clocks, so
+                        // neither one swallowed the other. Audible as a stutter
+                        // on a move people make constantly.
+                        Key.DirectionDown -> false
+
+                        // UP IS AN EDGE. This frame sits at the top of the
+                        // content area with nothing above it; measured, focus
+                        // does not move. The sound said "you went somewhere" to
+                        // a viewer looking at an unchanged screen, which reads
+                        // as the box having missed the press rather than as the
+                        // press having nowhere to go.
+                        //
+                        // Consumed rather than passed through, so no directional
+                        // search can quietly take focus somewhere off-screen-up
+                        // instead.
+                        Key.DirectionUp -> true
+
                         else -> false
                     }
                 }
@@ -341,6 +386,7 @@ fun HomeScreenTrailerSectionCompose(
                     indication = null
                 ) {
                     if (trailerState !is TrailerFrameState.Selected) {
+                        BlueHiveApplication.playClickSound()
                         trailerState = TrailerFrameState.Selected
                         pendingEnterSelected = true
                     }

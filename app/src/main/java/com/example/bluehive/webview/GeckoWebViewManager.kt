@@ -95,14 +95,6 @@ object GeckoWebViewManager {
         }
     }
 
-    /**
-     * The runtime if it has already been started, else null.
-     *
-     * Does NOT initialise — callers that need a runtime must call [initialize]
-     * first, on the main thread. Used by GeckoExtractorActivity, which needs the
-     * runtime directly rather than a session so it can install its extension.
-     */
-    fun runtimeOrNull(): GeckoRuntime? = geckoRuntime
 
     /**
      * ✅ NEW: Get a FRESH session each time

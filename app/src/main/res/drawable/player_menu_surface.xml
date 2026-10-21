@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The card the player's settings popup is drawn on.
+
+    THE INSETS ARE THE POSITIONING. media3 anchors that popup to the settings
+    button and offsets it by exactly `-popupHeight - exo_settings_offset`, so its
+    bottom edge lands 18dp off the screen: band height 60 minus a 40dp gear
+    centred in it, less the 8dp offset. That is on top of the scrubber and the
+    episode title. There is no API to move it, the offset dimen is read once in
+    PlayerControlView's constructor, and shadowing that dimen would also shrink
+    the popup's own max width and height, which are computed from it.
+
+    So the WINDOW stays where media3 puts it and the CARD floats inside it: 106dp
+    of bottom inset lifts the visible edge to 124dp, clear of the scrubber (which
+    tops out at 84dp) and of the title strip above it (92 to 112dp). 44dp on the
+    right pulls it off the screen edge and onto the same gutter the band's
+    controls use, since the window itself is clamped flush right by the window
+    manager whatever x offset media3 asks for.
+
+    The RecyclerView's padding has to match these insets or the rows will not
+    land inside the card. See exo_styled_settings_list.xml.
+-->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:insetBottom="106dp"
+    android:insetRight="44dp">
+
+  <shape android:shape="rectangle">
+    <corners android:radius="14dp"/>
+    <solid android:color="#F20B0E15"/>
+    <stroke android:width="1dp" android:color="#1FFFFFFF"/>
+  </shape>
+
+</inset>

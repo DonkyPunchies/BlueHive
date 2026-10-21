@@ -297,6 +297,14 @@ class MainWebViewer : AppCompatActivity() {
                     )
                 }
 
+                // NO WEB PAGE GETS THE MICROPHONE OR THE CAMERA.
+                //
+                // This used to grant both to any page that asked, and was
+                // harmless only by accident: BlueHive held no RECORD_AUDIO, so
+                // Android refused underneath. Voice search (2026-10-15) asks
+                // for the microphone, and once a viewer allows it this delegate
+                // would have handed it straight to whatever page was loaded.
+                // Nothing BlueHive opens in the browser needs either.
                 override fun onMediaPermissionRequest(
                     session: GeckoSession,
                     uri: String,
@@ -304,9 +312,7 @@ class MainWebViewer : AppCompatActivity() {
                     audio: Array<out GeckoSession.PermissionDelegate.MediaSource>?,
                     callback: GeckoSession.PermissionDelegate.MediaCallback
                 ) {
-                    if (!isFinishing && !shutdownInitiated) {
-                        callback.grant(video?.firstOrNull(), audio?.firstOrNull())
-                    }
+                    callback.reject()
                 }
             }
         }

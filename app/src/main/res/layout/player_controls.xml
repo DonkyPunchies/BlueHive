@@ -1,0 +1,286 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The control bar BOTH players wear: one band across the bottom.
+
+    SHARED BY HlsPlayerActivity AND MiruroPlayerActivity, which is the whole
+    point of the file. They used to carry a bar each, and the anime one was
+    still media3's stock layout with a quality button bolted on, so every fix
+    made here had to be made twice or it was simply absent from half the app.
+
+    The quality picker is the one control only one of them has, and it is
+    declared GONE: MiruroPlayerActivity reveals it, the HLS player leaves it
+    alone. Hiding a control the owner does not want beats two layouts that
+    drift.
+
+    THE ROOT MUST STAY `merge`. PlayerControlView inflates this into itself with
+    root=this, and PlayerControlView is a FrameLayout, so every layout_gravity
+    below is a FrameLayout gravity. A wrapper view here would change the gravity
+    and sizing of everything.
+
+    ids ARE A CONTRACT, three ways:
+      1. @id, never @+id, for every exo_ id. @+id mints a NEW id in the app's R,
+         media3's findViewById misses it, and the control is inert with no error.
+      2. exo_basic_controls MUST stay a LinearLayout. injectSubtitleControls does
+         findViewById of that id as a LinearLayout and inserts the Subtitles
+         button at index 0. Absent, the elvis bails and the ENTIRE subtitle
+         feature loses its only entry point, silently. A different ViewGroup type
+         is a ClassCastException on the first controller show.
+      3. Widget TYPES are fixed by media3's own fields: exo_play_pause, exo_rew
+         and exo_ffwd are ImageView; exo_position and exo_duration are TextView;
+         exo_progress must implement TimeBar, and attachTimeBarFocusTint narrows
+         that further by casting to the concrete DefaultTimeBar.
+
+    THE BAND IS 60dp BECAUSE media3 SAYS SO. PlayerControlViewLayoutManager
+    slides exo_bottom_bar by a hardcoded translation read from the library dimen
+    exo_styled_bottom_bar_height (60dp), never from the band's measured height.
+    A taller band would leave its top strip painted on the picture for the whole
+    two second hide animation and then blink out. Shadowing that dimen in the app
+    was considered and rejected: media3's own stock layout reads it too, so the
+    loading screen and both trailer players would have grown a 118dp bar.
+
+    PREVIOUS AND NEXT ARE DELIBERATELY ABSENT. The timeline has exactly one media
+    item, so media3 leaves Next permanently disabled at a third alpha and unable
+    to take focus, and wires Previous to a seek back to 00:00 that throws the
+    viewer to the start of the episode. They are dead in the stock bar today;
+    they are not reproduced here.
+
+    exo_extra_controls and the overflow pair are absent on purpose:
+    onLayoutWidthChanged returns early when they are null, which disables the
+    eviction that moves the LEADING children of exo_basic_controls behind a
+    chevron. The injected Subtitles button sits at index 0, so it would have been
+    the first thing to vanish.
+-->
+<merge xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+
+  <!-- media3 lays this out to fill the whole view and fades it with the show and
+       hide animation. Transparent on purpose: the visible scrim is the gradient
+       on the band, so the picture is never dimmed outside it. -->
+  <View android:id="@id/exo_controls_background"
+      android:layout_width="0dp"
+      android:layout_height="0dp"
+      android:background="@android:color/transparent"/>
+
+  <!-- Kept and EMPTY. media3 measures it for the minimal mode threshold and
+       animates it; with the transport moved into the band it has no children. -->
+  <LinearLayout android:id="@id/exo_center_controls"
+      android:layout_width="wrap_content"
+      android:layout_height="wrap_content"
+      android:layout_gravity="center"
+      android:orientation="horizontal"
+      android:background="@android:color/transparent"/>
+
+  <!-- THE TITLE STRIP, a sibling of the band rather than a child of it.
+       Inside the band it would have to fit in 60dp alongside the scrubber and
+       the transport row, and the band cannot grow: media3 slides it out by a
+       hardcoded 60dp, so a taller one leaves its top strip painted on the
+       picture for the whole hide animation.
+       Out here it is not translated by media3 at all, so the activity sets its
+       visibility directly from the controller listener — which is also why it
+       starts GONE: nothing should flash on screen before the first show. -->
+  <LinearLayout android:id="@+id/player_title_strip"
+      android:layout_width="match_parent"
+      android:layout_height="wrap_content"
+      android:layout_gravity="bottom"
+      android:layout_marginStart="44dp"
+      android:layout_marginEnd="44dp"
+      android:layout_marginBottom="92dp"
+      android:baselineAligned="true"
+      android:orientation="horizontal"
+      android:visibility="gone">
+
+    <TextView android:id="@+id/player_title_show"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:ellipsize="end"
+        android:includeFontPadding="false"
+        android:maxLines="1"
+        android:maxWidth="520dp"
+        android:shadowColor="#CC000000"
+        android:shadowDx="0.0"
+        android:shadowDy="1.0"
+        android:shadowRadius="5.0"
+        android:textColor="#FFFFFFFF"
+        android:textSize="17sp"
+        android:textStyle="bold"/>
+
+    <TextView android:id="@+id/player_title_episode"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="10dp"
+        android:layout_weight="1"
+        android:ellipsize="end"
+        android:includeFontPadding="false"
+        android:maxLines="1"
+        android:shadowColor="#CC000000"
+        android:shadowDx="0.0"
+        android:shadowDy="1.0"
+        android:shadowRadius="5.0"
+        android:textColor="#B3C6D2E8"
+        android:textSize="14sp"/>
+
+  </LinearLayout>
+
+  <FrameLayout android:id="@id/exo_bottom_bar"
+      android:layout_width="match_parent"
+      android:layout_height="60dp"
+      android:layout_gravity="bottom"
+      android:background="@drawable/player_band_scrim"
+      android:layoutDirection="ltr">
+
+    <!-- LEFT: transport, then the time read-out. media3 wires no nextFocus at
+         all, so this row's order IS the d-pad order: back, play, forward, then
+         across the gap to the Subtitles pill and the gear. -->
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center_vertical|start"
+        android:layout_marginStart="44dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:layoutDirection="ltr">
+
+      <ImageButton android:id="@id/exo_rew"
+          android:layout_width="44dp"
+          android:layout_height="44dp"
+          android:background="@drawable/player_pill_bg"
+          android:scaleType="centerInside"
+          android:src="@drawable/ic_player_rew10"
+          android:contentDescription="@string/exo_controls_rewind_description"/>
+
+      <ImageButton android:id="@id/exo_play_pause"
+          android:layout_width="44dp"
+          android:layout_height="44dp"
+          android:layout_marginStart="8dp"
+          android:layout_marginEnd="8dp"
+          android:background="@drawable/player_pill_bg"
+          android:scaleType="centerInside"/>
+
+      <ImageButton android:id="@id/exo_ffwd"
+          android:layout_width="44dp"
+          android:layout_height="44dp"
+          android:background="@drawable/player_pill_bg"
+          android:scaleType="centerInside"
+          android:src="@drawable/ic_player_ffwd10"
+          android:contentDescription="@string/exo_controls_fastforward_description"/>
+
+      <!-- exo_position is media3's. The number beside it is OURS and counts
+           DOWN, which media3 has no concept of. exo_duration stays in the tree
+           but GONE so media3's binding still has a view to write into. -->
+      <LinearLayout android:id="@id/exo_time"
+          android:layout_width="wrap_content"
+          android:layout_height="wrap_content"
+          android:layout_marginStart="18dp"
+          android:gravity="center_vertical"
+          android:orientation="horizontal"
+          android:layoutDirection="ltr">
+
+        <TextView android:id="@id/exo_position"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:includeFontPadding="false"
+            android:textColor="#FFE8EEFA"
+            android:textSize="14sp"/>
+
+        <TextView android:id="@+id/player_time_remaining"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:includeFontPadding="false"
+            android:textColor="#B3C6D2E8"
+            android:textSize="14sp"/>
+
+        <TextView android:id="@id/exo_duration"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:visibility="gone"/>
+
+      </LinearLayout>
+
+    </LinearLayout>
+
+    <!-- RIGHT. This is the row injectSubtitleControls adds the Subtitles pill
+         to, at index 0, so the pill lands to the LEFT of the gear. It must stay
+         a LinearLayout. -->
+    <LinearLayout android:id="@id/exo_basic_controls"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center_vertical|end"
+        android:layout_marginEnd="44dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:layoutDirection="ltr">
+
+      <!-- ANIME ONLY, so it starts GONE and MiruroPlayerActivity shows it.
+           @+id because this one is ours, not media3's; it is wired by hand in
+           that activity rather than auto-bound by PlayerControlView.
+
+           After the Subtitles button, which the activity injects at index 0,
+           and before the gear: quality and captions are both things you change
+           about THIS stream, and the gear is everything else. -->
+      <ImageButton android:id="@+id/quality_button"
+          android:layout_width="40dp"
+          android:layout_height="40dp"
+          android:layout_marginStart="10dp"
+          android:background="@drawable/player_pill_bg"
+          android:scaleType="centerInside"
+          android:src="@drawable/ic_video_quality"
+          android:visibility="gone"
+          android:contentDescription="Video quality"/>
+
+      <ImageButton android:id="@id/exo_settings"
+          android:layout_width="40dp"
+          android:layout_height="40dp"
+          android:layout_marginStart="10dp"
+          android:background="@drawable/player_pill_bg"
+          android:scaleType="centerInside"
+          android:src="@drawable/exo_styled_controls_settings"
+          android:contentDescription="@string/exo_controls_settings_description"/>
+
+    </LinearLayout>
+
+  </FrameLayout>
+
+  <!-- THE SCRUBBER, declared rather than left as exo_progress_placeholder so its
+       colours, height and thumb are stated in one place. It stays a concrete
+       DefaultTimeBar because attachTimeBarFocusTint casts to that class: any
+       other TimeBar turns the focus tint into a ClassCastException a frame after
+       the player opens.
+
+       A SIBLING of the band, not a child, because media3 translates both by the
+       same amount on hide; nested, it would travel twice as far. Its parent must
+       hand out MarginLayoutParams, which FrameLayout does.
+
+       Margins are 36dp against the band's 44dp because DefaultTimeBar insets its
+       own track by half the thumb width on each side, so 36 plus 8 lands the
+       track flush with the buttons above it.
+
+       THE MARGIN IS THE THUMB'S FLOOR, NOT THE TRACK'S. DefaultTimeBar
+       measures wrap_content as exactly touch_target_height (26dp) and centres
+       the 5dp track inside it, so the thumb owns the full 26dp and the margin
+       positions its BOTTOM. The band's buttons are 44dp centred in 60dp, so
+       they reach 52dp; the title sits at 92dp and its descenders come down to
+       meet it. That leaves a 40dp corridor between 52 and 92 for a 26dp thumb.
+       58dp rather than a dead-centre 59 because the text needs the air more
+       than the buttons do: the thumb's unfocused ring is 22dp drawn inside the
+       26dp box, so the visible gap is 10dp to the text and 8dp to the buttons.
+
+       NO android:background. A background here draws a focus box the full width
+       of the screen, which reads as a highlighted row rather than a selected
+       control; focus is carried by the thumb's own state list, which media3
+       feeds the view's drawable state. -->
+  <androidx.media3.ui.DefaultTimeBar android:id="@id/exo_progress"
+      android:layout_width="match_parent"
+      android:layout_height="wrap_content"
+      android:layout_gravity="bottom"
+      android:layout_marginStart="36dp"
+      android:layout_marginEnd="36dp"
+      android:layout_marginBottom="58dp"
+      app:bar_gravity="center"
+      app:bar_height="5dp"
+      app:buffered_color="#4DFFFFFF"
+      app:played_color="#FF4477FF"
+      app:scrubber_drawable="@drawable/player_scrubber_thumb"
+      app:unplayed_color="#29FFFFFF"/>
+
+</merge>

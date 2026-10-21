@@ -120,7 +120,6 @@ class UnifiedShelfFocusTracker {
 
     fun cardTmdbId(shelf: ContentShelf): Int = cardRecords[shelf]?.tmdbId ?: -1
 
-    fun cardListIndex(shelf: ContentShelf): Int = cardRecords[shelf]?.listIndex ?: -1
 
     // ──────────────────────────────────────────────────────────────────────
     //  CARD-focus request channel (epoch per shelf)

@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    One row of the settings card. The band's player_pill_bg, with the resting
+    state taken out.
+
+    SAME REASON THAT DRAWABLE EXISTS: media3's row layout asks for
+    ?android:attr/selectableItemBackground, and under this activity's theme that
+    resolves to the platform's holo highlight — the green rectangle around
+    "Speed" in the screenshots.
+
+    Transparent at rest, unlike the band's controls. A pill in the band has to
+    read as pressable while nothing is focused; a row in an open menu does not,
+    and filling all of them would leave the card looking like a stack of buttons
+    rather than a list.
+
+    Focused state first: a state list takes the FIRST match, so an unqualified
+    item above state_focused would swallow it.
+-->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+
+  <item android:state_focused="true">
+    <shape android:shape="rectangle">
+      <corners android:radius="10dp"/>
+      <solid android:color="#4D4477FF"/>
+      <stroke android:width="2dp" android:color="#FF4477FF"/>
+    </shape>
+  </item>
+
+  <item android:state_pressed="true">
+    <shape android:shape="rectangle">
+      <corners android:radius="10dp"/>
+      <solid android:color="#334477FF"/>
+    </shape>
+  </item>
+
+  <item>
+    <shape android:shape="rectangle">
+      <corners android:radius="10dp"/>
+      <solid android:color="@android:color/transparent"/>
+    </shape>
+  </item>
+
+</selector>

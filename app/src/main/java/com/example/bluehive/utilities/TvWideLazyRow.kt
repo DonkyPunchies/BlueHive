@@ -92,6 +92,12 @@ fun TvWideLazyRow(
     // below so a peek row re-entering the window can never grab card focus
     // with a stale epoch — this is what stops the card-vs-row drift.
     isFocusedShelf: Boolean = false,
+    // Whether focus is inside the shelf stack this row belongs to. Being the
+    // focused shelf is not the same thing: the stack can be moved to a row
+    // while focus is up on the tabs (ShelfStack's scrollToShelf), and a row
+    // coming back into the window as the focused one must not pull focus down
+    // from there. A lambda, read inside the effects, so it costs no recomposition.
+    stackHasFocus: () -> Boolean = { true },
     onFocusRestored: () -> Unit = {},
     onNavigateToRightModule: (() -> Unit)? = null,
     // WHAT HAPPENS AT THE LEFT EDGE OF THE ROW.
@@ -135,6 +141,16 @@ fun TvWideLazyRow(
     val backgroundPainter = painterResource(id = R.drawable.titlecard_base)
     val focusedPainter = painterResource(id = R.drawable.titlecard_focused)
     val shadowPainter = painterResource(id = R.drawable.titlecard_shadow)
+
+    // AN EMPTY ROW USED TO DRAW ITS FRAME ANYWAY: two rails and two end caps
+    // around nothing, which reads as a broken shelf rather than as "no titles
+    // here". A row can legitimately come back empty -- a seasonal window with
+    // nothing in it, a provider with no matches -- and that should look
+    // deliberate.
+    //
+    // Kept while a load is in flight, so a row that is merely filling does not
+    // flash its frame off and straight back on.
+    val showRowFrame = items.isNotEmpty() || isPageLoading
 
     val baseCardModifier = remember {
         Modifier.focusable()
@@ -204,27 +220,29 @@ fun TvWideLazyRow(
         }
 
         Box {
-            Image(
-                painter = painterResource(id = R.drawable.left_lower_body),
-                contentDescription = null,
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .width(2.25.dp)
-                    .height(167.dp)
-                    .offset(x = leftLowerBodyOffsetX, y = leftLowerBodyOffsetY),
-                contentScale = ContentScale.Fit
-            )
+            if (showRowFrame) {
+                Image(
+                    painter = painterResource(id = R.drawable.left_lower_body),
+                    contentDescription = null,
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .width(2.25.dp)
+                        .height(167.dp)
+                        .offset(x = leftLowerBodyOffsetX, y = leftLowerBodyOffsetY),
+                    contentScale = ContentScale.Fit
+                )
 
-            Image(
-                painter = painterResource(id = R.drawable.right_lower_body),
-                contentDescription = null,
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .width(2.25.dp)
-                    .height(167.dp)
-                    .offset(x = rightLowerBodyOffsetX, y = rightLowerBodyOffsetY),
-                contentScale = ContentScale.Fit
-            )
+                Image(
+                    painter = painterResource(id = R.drawable.right_lower_body),
+                    contentDescription = null,
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .width(2.25.dp)
+                        .height(167.dp)
+                        .offset(x = rightLowerBodyOffsetX, y = rightLowerBodyOffsetY),
+                    contentScale = ContentScale.Fit
+                )
+            }
 
             Box(
                 modifier = Modifier
@@ -546,27 +564,29 @@ fun TvWideLazyRow(
                 }
             }
 
-            Image(
-                painter = painterResource(id = R.drawable.left_upper_body),
-                contentDescription = null,
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .width(25.4.dp)
-                    .height(193.dp)
-                    .offset(x = leftUpperBodyOffsetX, y = leftUpperBodyOffsetY),
-                contentScale = ContentScale.Fit
-            )
+            if (showRowFrame) {
+                Image(
+                    painter = painterResource(id = R.drawable.left_upper_body),
+                    contentDescription = null,
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .width(25.4.dp)
+                        .height(193.dp)
+                        .offset(x = leftUpperBodyOffsetX, y = leftUpperBodyOffsetY),
+                    contentScale = ContentScale.Fit
+                )
 
-            Image(
-                painter = painterResource(id = R.drawable.right_upper_body),
-                contentDescription = null,
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .width(25.4.dp)
-                    .height(193.dp)
-                    .offset(x = rightUpperBodyOffsetX, y = rightUpperBodyOffsetY),
-                contentScale = ContentScale.Fit
-            )
+                Image(
+                    painter = painterResource(id = R.drawable.right_upper_body),
+                    contentDescription = null,
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .width(25.4.dp)
+                        .height(193.dp)
+                        .offset(x = rightUpperBodyOffsetX, y = rightUpperBodyOffsetY),
+                    contentScale = ContentScale.Fit
+                )
+            }
         }
     }
 
@@ -587,6 +607,9 @@ fun TvWideLazyRow(
         // handles all re-entry focus; this effect only needs to run for
         // in-session pagination restoration while the row is already focused.
         if (!isFocusedShelf) return@LaunchedEffect
+        // Nor while focus is outside the stack -- a page landing, or the row
+        // being brought back by scrollToShelf, must not take focus off the tabs.
+        if (!stackHasFocus()) return@LaunchedEffect
 
         val pending = pendingFocusTmdbId()
         if (pending > 0 && items.isNotEmpty()) {
@@ -618,6 +641,7 @@ fun TvWideLazyRow(
     LaunchedEffect(cardFocusEpoch) {
         if (cardFocusEpoch == 0) return@LaunchedEffect      // never triggered yet
         if (!isFocusedShelf) return@LaunchedEffect          // stale re-entry guard
+        if (!stackHasFocus()) return@LaunchedEffect         // focused shelf, focus elsewhere
         if (items.isEmpty()) return@LaunchedEffect
 
         // Which card: the saved one (by tmdbId, survives pagination), else

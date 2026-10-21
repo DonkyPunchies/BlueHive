@@ -34,6 +34,12 @@ data class AnimeResolveResponse(
     val episode: Int?,
     @SerializedName("anilist_id")       val anilistId: Int,
     @SerializedName("anilist_episode")  val anilistEpisode: Int?,
+    // What Miruro addresses this entry by. It used to BE the AniList id, and in
+    // October 2026 became an opaque 32-character key — /watch/1575?ep=4 now
+    // 404s, and it 404s as a normal-looking page, so nothing announced itself
+    // as broken. Nullable: the backend resolves it best-effort, and null just
+    // means Miruro does not carry the title.
+    @SerializedName("miruro_id")        val miruroId: String? = null,
     val span: Int,                  // >1 => one TMDB ep merges multiple AniList eps
     val exact: Boolean,
 )
@@ -95,9 +101,16 @@ suspend fun <T> buildJapaneseAnimationSources(
         null
     }
 
-    val miruroUrl = resolved?.let {
-        if (mediaType == "movie") "https://www.miruro.tv/watch/${it.anilistId}"
-        else "https://www.miruro.tv/watch/${it.anilistId}?ep=${it.anilistEpisode ?: 1}"
+    // Built from miruroId, NOT anilistId. The slug the real site appends is
+    // left off on purpose: /watch/<id>?ep=N redirects to the slugged form and
+    // keeps the query, so the slug stays the site's business.
+    //
+    // No URL at all when the id is missing, rather than one built from the
+    // AniList id as a fallback — that URL is a guaranteed 404, and offering it
+    // would put a source in the list that cannot work.
+    val miruroUrl = resolved?.miruroId?.let { mid ->
+        if (mediaType == "movie") "https://www.miruro.tv/watch/${'$'}mid"
+        else "https://www.miruro.tv/watch/${'$'}mid?ep=${'$'}{resolved.anilistEpisode ?: 1}"
     }
 
     // 1) Miruro

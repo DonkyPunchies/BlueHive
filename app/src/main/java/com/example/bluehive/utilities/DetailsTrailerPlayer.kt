@@ -11,6 +11,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
@@ -101,7 +104,7 @@ fun DetailsTrailerPlayer(
     }
 
     // Create ExoPlayer when streamUrl becomes available
-    LaunchedEffect(streamUrl) {
+    LaunchedEffect(streamUrl, exoPlayer == null) {
         if (streamUrl != null && exoPlayer == null) {
             Log.d("DetailsTrailerPlayer", "Creating ExoPlayer with stream: $streamUrl")
 
@@ -158,6 +161,44 @@ fun DetailsTrailerPlayer(
                 exoPlayer?.pause()
             }
         }
+    }
+
+    // ── HAND THE DECODERS BACK WHILE OFF SCREEN ─────────────────────────────
+    //
+    // onDispose alone was not enough. Launching the real player puts a new
+    // ACTIVITY on top; this composable never leaves composition, so the trailer
+    // kept an audio and a video decoder for the whole episode.
+    //
+    // MEASURED 2026-10-10 on a 2 GB box, from the framework's own accounting:
+    //
+    //   ResourceManagerMetrics: Concurrent Codec Usage for Process[pid(32013)]
+    //     Peak { AudioDec[ SW: 2 ]  VideoDec[ SW: 2 ]  HW: 1 }
+    //
+    // Two audio decoders in one process, with only one stream playing. The
+    // system then reclaimed the AAC decoder out from under the real player --
+    // ERROR_CODE_DECODING_RESOURCES_RECLAIMED, twice in ninety minutes, each
+    // forcing a rebuild mid-episode. Nothing external took it; we did.
+    //
+    // ON_STOP, not ON_PAUSE: a dialog over the details screen pauses it, and
+    // tearing the trailer down behind a prompt the viewer is about to dismiss
+    // would be visible. ON_STOP means genuinely not on screen.
+    //
+    // Safe to rebuild on return: the player is constructed with
+    // playWhenReady = false and only ever plays from the isPlaying effect, so
+    // coming back from an episode does not start a trailer.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP && exoPlayer != null) {
+                Log.d("DetailsTrailerPlayer", "off screen — releasing trailer decoders")
+                exoPlayer?.stop()
+                exoPlayer?.release()
+                exoPlayer = null
+                playerReady = false
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     // Cleanup when composable leaves composition

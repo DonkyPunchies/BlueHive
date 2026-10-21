@@ -5,6 +5,7 @@ import android.content.Intent
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -21,7 +22,6 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -38,7 +38,6 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -46,10 +45,7 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.ui.platform.SoftwareKeyboardController
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
@@ -66,17 +62,18 @@ import com.example.bluehive.TVShowsDetailsScreenCompose
 import com.example.bluehive.api.ApiClient
 import com.example.bluehive.models.MediaItem
 import com.example.bluehive.utilities.AppTypography
+import com.example.bluehive.utilities.ConfirmationOverlay
 import com.example.bluehive.utilities.TvWideLazyRow
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.android.awaitFrame
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 
 private const val TAG = "SearchBar"
+
+/** Rows fetched per search, shared between the movies and TV rows. */
+private const val SEARCH_LIMIT = 60
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Launch helper
@@ -96,6 +93,9 @@ fun openSearchScreen(context: Context, profileId: Int = -1, initialQuery: String
 
 class SearchBarActivity : ComponentActivity() {
 
+    /** Whether the "leave the search screen?" prompt is up. */
+    private var showExitConfirm by mutableStateOf(false)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -105,10 +105,28 @@ class SearchBarActivity : ComponentActivity() {
             systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
 
+        // ── BACK ASKS FIRST ──────────────────────────────────────────────────
+        //
+        // Leaving this screen throws away a typed query and a list of results,
+        // and BACK is the same button that steps out of the keyboard and out of
+        // a details screen — so it gets pressed here by reflex, and the only way
+        // back is to type the whole search again.
+        //
+        // ONLY THE PRESSES THAT REACH THE ACTIVITY ARE CAUGHT, which is exactly
+        // the set that should be. A BACK while the honeycomb keyboard is open is
+        // taken by SearchBarScreen's own handler -- it closes the keyboard, or
+        // leaves search when there are no results behind it -- and never arrives
+        // here. Everything else — a title card, the search bar at rest — falls
+        // through to this.
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                BlueHiveApplication.playBackOutSound()
-                finish()
+                if (showExitConfirm) {
+                    // A second BACK is a "no". Answering the prompt with the
+                    // same button that raised it is what anyone will try first.
+                    showExitConfirm = false
+                    return
+                }
+                showExitConfirm = true
             }
         })
 
@@ -116,10 +134,19 @@ class SearchBarActivity : ComponentActivity() {
         val initialQuery = intent.getStringExtra("INITIAL_QUERY") ?: ""
 
         setContent {
+            // The prompt is rendered INSIDE SearchBarScreen, not here: dismissing
+            // it has to put focus back where it was, and only that composable
+            // holds the focus requesters to put it back with.
             SearchBarScreen(
-                profileId    = profileId,
-                initialQuery = initialQuery,
-                onMediaClick = { media, query -> openDetailsScreen(media, profileId, query) }
+                profileId       = profileId,
+                initialQuery    = initialQuery,
+                showExitConfirm = showExitConfirm,
+                onExitConfirmed = {
+                    BlueHiveApplication.playBackOutSound()
+                    finish()
+                },
+                onExitDismissed = { showExitConfirm = false },
+                onMediaClick    = { media, query -> openDetailsScreen(media, profileId, query) }
             )
         }
     }
@@ -189,25 +216,63 @@ private val ROW_GAP                = 0.dp        // vertical gap between the two
 private val SECOND_ROW_OFFSET_Y    = FIRST_ROW_OFFSET_Y + ROW_SECTION_HEIGHT + ROW_GAP
 
 
+/**
+ * Which part of the screen had the D-pad when the exit prompt went up.
+ *
+ * REMEMBERED BECAUSE THE OVERLAY TAKES FOCUS AND CANNOT GIVE IT BACK. Compose
+ * hands focus to whatever it finds first once the overlay leaves the tree,
+ * which is the movies row — so dismissing the prompt from the TV row, or from
+ * the search bar, dropped the viewer somewhere they had not been.
+ */
+private enum class SearchFocusRegion { SearchBar, MoviesRow, TvRow }
+
 @Composable
 fun SearchBarScreen(
     profileId:    Int    = -1,
     initialQuery: String = "",
+    /** Raised by the activity's BACK handler; see SearchBarActivity. */
+    showExitConfirm: Boolean = false,
+    onExitConfirmed: () -> Unit = {},
+    onExitDismissed: () -> Unit = {},
     onMediaClick: (MediaItem, String) -> Unit = { _, _ -> }
 ) {
     // ── State ──────────────────────────────────────────────────────────────────
     var query           by remember { mutableStateOf(initialQuery) }
     var uiState         by remember {
         mutableStateOf(
-            if (initialQuery.length >= 2) SearchUiState.Loading else SearchUiState.Idle
+            if (initialQuery.isNotBlank()) SearchUiState.Loading else SearchUiState.Idle
         )
     }
     var isNavigating    by remember { mutableStateOf(false) }
     var isSearchFocused by remember { mutableStateOf(false) }
-    var voiceInputDetected by remember { mutableStateOf(initialQuery.length >= 2) }
     var lastSearchedQuery by remember { mutableStateOf<String?>(null) }
+
+    // The honeycomb keyboard (HoneycombOverlay.kt) is how a search is typed or
+    // spoken. It opens by itself when there is nothing to show yet; back from a
+    // details page the results are on screen and it stays closed.
+    var showKeyboard by remember { mutableStateOf(initialQuery.isBlank()) }
+
+    /**
+     * The query the RESULTS ON SCREEN came from — which is not the same thing as
+     * what the text field currently contains.
+     *
+     * This screen is android:noHistory, so it is destroyed the moment it stops
+     * being visible. Coming back from a details page is not a resume; the
+     * details screen re-launches it and passes the query to run again. Whatever
+     * is handed over IS the restored search.
+     *
+     * `query` cannot be trusted to be that value. It is what the BAR shows, and
+     * the bar used to be blanked on purpose before each new search; the results
+     * stayed on screen throughout, so nothing looked wrong — but a title opened
+     * from there carried an empty query to the details screen, and coming back
+     * restored an empty page. The bar no longer blanks (the keyboard opens on
+     * the last search, to refine it), but the results stay pinned to their own
+     * query regardless.
+     *
+     * Only replaced by the next search that actually returns something.
+     */
+    var resultsQuery by remember { mutableStateOf(initialQuery) }
     val coroutineScope  = rememberCoroutineScope()
-    val keyboardController = LocalSoftwareKeyboardController.current
 
     // Release search result bitmaps and reset state when the composable
     // leaves the tree — mirrors the DisposableEffect pattern in History/Favorites.
@@ -216,7 +281,6 @@ fun SearchBarScreen(
             uiState           = SearchUiState.Idle
             isNavigating      = false
             isSearchFocused   = false
-            voiceInputDetected = false
             lastSearchedQuery = null
         }
     }
@@ -228,27 +292,35 @@ fun SearchBarScreen(
     val moviesRowFR       = remember { FocusRequester() }   // row-level (on focusGroup)
     val tvRowFR           = remember { FocusRequester() }   // row-level (on focusGroup)
 
+    // Where to put focus back when the exit prompt is dismissed.
+    var lastFocusedRegion by remember { mutableStateOf(SearchFocusRegion.SearchBar) }
+
+    // SNAPSHOT TAKEN WHEN THE PROMPT OPENS, not when it closes, and that is the
+    // whole trick. Dismissing the overlay makes Compose hand focus to the first
+    // focusable it finds — the movies row — which fires that row's own focus
+    // callback and overwrites lastFocusedRegion BEFORE anything gets a chance to
+    // read it. Restoring from the live value therefore always went to movies, no
+    // matter where the viewer actually was.
+    var regionAtPromptOpen by remember { mutableStateOf(SearchFocusRegion.SearchBar) }
+
     // ── Initial focus ──────────────────────────────────────────────────────────
+    // The bar -- unless the keyboard opened over the page, which takes it.
     LaunchedEffect(Unit) {
         awaitFrame()
         awaitFrame()
-        searchFieldFR.requestFocus()
+        if (!showKeyboard) searchFieldFR.requestFocus()
     }
 
     // ── Keyboard visibility ───────────────────────────────────────────────────
     // Keyboard opens on explicit press (Enter/Center), NOT on focus arrival.
     // This prevents the keyboard from popping up when D-padding back to the search bar.
 
-    // ── Debounced search ───────────────────────────────────────────────────────
-    // Only runs when voiceInputDetected is true — i.e. a multi-character
-    // chunk arrived via the speech recognizer, or the screen launched with
-    // an initial query. Manual typing leaves the flag false and the search
-    // will instead be triggered explicitly via the IME search button below.
-    // Extracted search runner — can be called from the debounced effect
-// OR from an explicit submit (IME search button). Both paths end in
-// the same API calls and state update.
+    // ── Search ─────────────────────────────────────────────────────────────────
+    // Runs when the keyboard hands over a search (Search, or a finished Voice
+    // search), and once on arrival when the screen opens with a query -- which
+    // is how a details page brings the viewer back to their results.
     suspend fun runSearch(q: String) {
-        if (q.length < 2) {
+        if (q.isBlank()) {
             uiState = SearchUiState.Idle
             return
         }
@@ -264,18 +336,19 @@ fun SearchBarScreen(
         lastSearchedQuery = q
         uiState = SearchUiState.Loading
         try {
-            val results = coroutineScope {
-                listOf(
-                    async { ApiClient.trailerApi.searchMedia(q, "movie") },
-                    async { ApiClient.trailerApi.searchMedia(q, "tv")    }
-                ).awaitAll()
-            }
-            val movies  = results[0].items
-            val tvShows = results[1].items
+            // One request fills both rows. /api/media/suggest matches partial
+            // words and ignores accents, which this keyboard needs: it types
+            // a-z only, and "pokemon" has to find "Pokémon".
+            val items   = ApiClient.trailerApi.suggestMedia(q, SEARCH_LIMIT).items
+            val movies  = items.filter { it.mediaType.equals("movie", ignoreCase = true) }
+            val tvShows = items.filter { it.mediaType.equals("tv", ignoreCase = true) }
             Log.d(TAG, "Search '$q' → ${movies.size} movies, ${tvShows.size} TV shows")
             uiState = if (movies.isEmpty() && tvShows.isEmpty()) {
                 SearchUiState.Empty(q)
             } else {
+                // Pinned to what is now on screen, so opening a title carries
+                // this term and not whatever the field has since been emptied to.
+                resultsQuery = q
                 SearchUiState.Results(movies, tvShows)
             }
         } catch (e: Exception) {
@@ -284,55 +357,131 @@ fun SearchBarScreen(
         }
     }
 
-    // Debounced search (voice path) — only runs when voiceInputDetected is true.
-    // Manual typing leaves the flag false; typed users must press the IME search
-    // button, which calls runSearch directly.
-    LaunchedEffect(query) {
-        if (query.length < 2) {
-            if (uiState !is SearchUiState.Results) uiState = SearchUiState.Idle
-            return@LaunchedEffect
-        }
-        if (!voiceInputDetected) return@LaunchedEffect
-        delay(600)
-        runSearch(query)
+    // Back from a details page, the search arrives with the intent: run it.
+    LaunchedEffect(Unit) {
+        if (initialQuery.isNotBlank()) runSearch(initialQuery.trim())
     }
 
     // ── Root layout ───────────────────────────────────────────────────────────
+    Box(Modifier.fillMaxSize()) {
+    // With the keyboard up, the page behind it blurs -- the same GPU blur home
+    // puts behind the sidebar (API 31+; older boxes just get the keyboard's dim).
+    Box(
+        Modifier
+            .fillMaxSize()
+            .hiveBackdropBlur(showKeyboard)
+    ) {
     SearchBarContent(
         uiState             = uiState,
         query               = query,
         isSearchFocused     = isSearchFocused,
+        onRegionFocused     = { lastFocusedRegion = it },
         searchFieldFR       = searchFieldFR,
         moviesRowFR         = moviesRowFR,
         tvRowFR             = tvRowFR,
         coroutineScope      = coroutineScope,
         isNavigating        = isNavigating,
         onNavigatingChanged = { isNavigating = it },
-        onQueryChanged      = { newText ->
-            val delta = newText.length - query.length
-            Log.d(TAG, "onQueryChanged: old='$query' new='$newText' delta=$delta voice=$voiceInputDetected")
-            when {
-                delta >= 4 -> voiceInputDetected = true
-                delta == 1 || delta == -1 -> {
-                    voiceInputDetected = false
-                    lastSearchedQuery = null  // new search in progress
+        onFocusChanged      = {
+            isSearchFocused = it
+            if (it) lastFocusedRegion = SearchFocusRegion.SearchBar
+        },
+        onOpenKeyboard      = { showKeyboard = true },
+        // The query behind the RESULTS, not the field's current contents — see
+        // resultsQuery. This is what the details screen hands back to re-run.
+        onMediaClick        = { media ->
+            onMediaClick(media, resultsQuery.ifBlank { query })
+        },
+    )
+    }
+
+        // ── Honeycomb keyboard ───────────────────────────────────────────────
+        //
+        // Over the page. Search (or a finished Voice search) closes it and runs
+        // the search here. Focus moves to the bar FIRST, so the keyboard leaving
+        // never hands it to whatever Compose finds next -- the same order the
+        // leave-search prompt below relies on.
+        if (showKeyboard) {
+            HoneycombKeyboardOverlay(
+                initialText = query,
+                onSearch    = { text ->
+                    runCatching { searchFieldFR.requestFocus() }
+                    showKeyboard = false
+                    query = text
+                    lastSearchedQuery = null      // an explicit search always runs
+                    coroutineScope.launch { runSearch(text) }
+                },
+            )
+        }
+
+        // BACK with the keyboard up closes it -- back to the results, or out of
+        // search altogether when there is nothing behind it to go back to.
+        BackHandler(enabled = showKeyboard) {
+            if (uiState is SearchUiState.Idle) {
+                onExitConfirmed()
+            } else {
+                BlueHiveApplication.playBackOutSound()
+                runCatching { searchFieldFR.requestFocus() }
+                showKeyboard = false
+            }
+        }
+
+        // ── Exit prompt ──────────────────────────────────────────────────────
+        //
+        // HERE RATHER THAN IN THE ACTIVITY so that dismissing it can put focus
+        // back. The requesters live in this composable, and the overlay needs
+        // to hand the D-pad to whichever of them had it — the activity has no
+        // way to reach them.
+
+        // MOVE FOCUS FIRST, THEN REMOVE THE OVERLAY — in that order, and the
+        // order is the entire fix.
+        //
+        // Restoring afterwards also works, but it is a CORRECTION rather than a
+        // prevention: taking the overlay away leaves Compose with a focused node
+        // that no longer exists, it hands the D-pad to the first focusable it
+        // can find — a movies card — and that lands on screen for the frame or
+        // two before the correction arrives. Visibly, focus flicked onto the
+        // wrong row and then jumped away.
+        //
+        // Requesting focus while the overlay is still composed moves it to the
+        // row behind, so by the time the overlay goes there is nothing for
+        // Compose to reassign and nothing to see.
+        val restoreFocusThenDismiss: () -> Unit = {
+            runCatching {
+                when (regionAtPromptOpen) {
+                    SearchFocusRegion.SearchBar -> searchFieldFR.requestFocus()
+                    SearchFocusRegion.MoviesRow -> moviesRowFR.requestFocus()
+                    SearchFocusRegion.TvRow     -> tvRowFR.requestFocus()
                 }
             }
-            // Full clears (Select-press) also reset the dedupe so a legitimate
-            // re-search of the same term after reopening the keyboard still works.
-            if (newText.isEmpty()) lastSearchedQuery = null
-            query = newText
-        },
-        onFocusChanged      = { isSearchFocused = it },
-        onSubmitTyped       = {
-            val q = query.trim()
-            if (q.length >= 2) {
-                coroutineScope.launch { runSearch(q) }
+            onExitDismissed()
+        }
+
+        // BACK while the prompt is up is dismissal too, and has to take the same
+        // path. A Compose BackHandler registers on the same dispatcher as the
+        // activity's callback and, being added later, wins while it is enabled —
+        // so the activity only ever sees the presses that RAISE the prompt.
+        BackHandler(enabled = showExitConfirm) { restoreFocusThenDismiss() }
+
+        if (showExitConfirm) {
+            ConfirmationOverlay(
+                message     = "Close search and go back to the home screen?",
+                confirmText = "Close search page",
+                cancelText  = "Keep searching",
+                onConfirm   = onExitConfirmed,
+                onCancel    = restoreFocusThenDismiss,
+            )
+        }
+
+        LaunchedEffect(showExitConfirm) {
+            if (showExitConfirm) {
+                // Read before the overlay's own focus effect runs — it awaits a
+                // frame first, and a row only reports focus it GAINS, so nothing
+                // has disturbed this yet.
+                regionAtPromptOpen = lastFocusedRegion
             }
-        },
-        onMediaClick        = { media -> onMediaClick(media, query) },
-        keyboardController  = keyboardController
-    )
+        }
+    }
 }
 
 
@@ -351,11 +500,10 @@ private fun SearchBarContent(
     coroutineScope:      CoroutineScope,
     isNavigating:        Boolean,
     onNavigatingChanged: (Boolean) -> Unit,
-    onQueryChanged:      (String) -> Unit,
     onFocusChanged:      (Boolean) -> Unit,
-    onSubmitTyped:       () -> Unit = {},
+    onRegionFocused:     (SearchFocusRegion) -> Unit = {},
+    onOpenKeyboard:      () -> Unit,
     onMediaClick:        (MediaItem) -> Unit,
-    keyboardController: SoftwareKeyboardController?,
 ) {
     Box(Modifier.fillMaxSize()) {
 
@@ -413,32 +561,22 @@ private fun SearchBarContent(
                     else -> null
                 }
 
-                // Inner text field FR — only focused on Enter/Center press to trigger keyboard
-                val textFieldFR = remember { FocusRequester() }
-                var isTextFieldActive by remember { mutableStateOf(false) }
-
-                // Invisible focusable box: receives D-pad focus WITHOUT opening keyboard
+                // THE BAR IS A BUTTON. It shows the search, and OK opens the
+                // honeycomb keyboard over the page; the system keyboard never
+                // opens here. It is not a text field, so there is no typing
+                // mode to step in and out of.
                 Box(
                     modifier = Modifier
                         .align(Alignment.CenterStart)
                         .padding(start = 42.dp)
                         .width(SEARCH_FIELD_WIDTH - 60.dp)
                         .focusRequester(searchFieldFR)
-                        .onFocusChanged { fs ->
-                            // If the wrapper loses focus entirely (not to the text field),
-                            // deactivate the text field so keyboard doesn't reappear on re-entry
-                            if (!fs.hasFocus && !fs.isFocused) {
-                                isTextFieldActive = false
-                            }
-                            onFocusChanged(fs.isFocused || fs.hasFocus)
-                        }
+                        .onFocusChanged { fs -> onFocusChanged(fs.isFocused || fs.hasFocus) }
                         .focusable()
                         .onKeyEvent { event ->
                             if (event.type != KeyEventType.KeyDown) return@onKeyEvent false
                             when (event.key) {
                                 Key.DirectionDown -> {
-                                    keyboardController?.hide()
-                                    isTextFieldActive = false
                                     val target = downTarget
                                     if (target != null) {
                                         BlueHiveApplication.playHoverSound()
@@ -446,99 +584,27 @@ private fun SearchBarContent(
                                         true
                                     } else false
                                 }
-                                Key.DirectionUp -> true
+                                Key.DirectionUp, Key.DirectionLeft, Key.DirectionRight -> true
                                 Key.Enter, Key.NumPadEnter, Key.DirectionCenter -> {
-                                    if (!isTextFieldActive) {
-                                        // First press: activate text field → opens keyboard.
-                                        // Clear any existing query so voice input fills a blank
-                                        // field (prevents "star wars" + voice → "star warsthe...").
-                                        if (query.isNotEmpty()) onQueryChanged("")
-                                        isTextFieldActive = true
-                                        textFieldFR.requestFocus()
-                                    }
+                                    BlueHiveApplication.playClickSound()
+                                    onOpenKeyboard()
                                     true
                                 }
-                                Key.Back -> {
-                                    if (isTextFieldActive) {
-                                        // Back while typing: close keyboard, return to wrapper
-                                        keyboardController?.hide()
-                                        isTextFieldActive = false
-                                        searchFieldFR.requestFocus()
-                                        true
-                                    } else false  // let it bubble to activity back handler
-                                }
-                                else -> {
-                                    // Any other key (letter keys from physical/virtual keyboard)
-                                    // while wrapper is focused — activate text field
-                                    if (!isTextFieldActive) {
-                                        isTextFieldActive = true
-                                        textFieldFR.requestFocus()
-                                    }
-                                    false  // let the key pass through to the text field
-                                }
+                                else -> false  // BACK bubbles to the activity's prompt
                             }
                         }
                 ) {
-                    BasicTextField(
-                        value         = query,
-                        onValueChange = onQueryChanged,
-                        singleLine    = true,
-                        cursorBrush   = SolidColor(Color.White),
-                        textStyle     = TextStyle(
-                            color      = Color.White,
-                            fontSize   = 30.sp,
-                            fontFamily = AppTypography.dongleRegular
-                        ),
-                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
-                            imeAction = androidx.compose.ui.text.input.ImeAction.Search
-                        ),
-                        keyboardActions = androidx.compose.foundation.text.KeyboardActions(
-                            onSearch = {
-                                // User explicitly pressed the IME search button — fire the
-                                // search immediately by arming the voice flag, which unblocks
-                                // the debounced LaunchedEffect(query).
-                                onSubmitTyped()
-                                keyboardController?.hide()
-                                isTextFieldActive = false
-                                searchFieldFR.requestFocus()
-                            }
-                        ),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .focusRequester(textFieldFR)
-                            .onKeyEvent { event ->
-                                if (event.type != KeyEventType.KeyDown) return@onKeyEvent false
-                                when (event.key) {
-                                    Key.DirectionDown -> {
-                                        keyboardController?.hide()
-                                        isTextFieldActive = false
-                                        val target = downTarget
-                                        if (target != null) {
-                                            BlueHiveApplication.playHoverSound()
-                                            target.requestFocus()
-                                            true
-                                        } else false
-                                    }
-                                    Key.DirectionUp -> {
-                                        // Close keyboard and go back to wrapper
-                                        keyboardController?.hide()
-                                        isTextFieldActive = false
-                                        searchFieldFR.requestFocus()
-                                        true
-                                    }
-                                    Key.Back -> {
-                                        keyboardController?.hide()
-                                        isTextFieldActive = false
-                                        searchFieldFR.requestFocus()
-                                        true
-                                    }
-                                    else -> false
-                                }
-                            }
+                    Text(
+                        text       = query,
+                        color      = Color.White,
+                        fontSize   = 30.sp,
+                        fontFamily = AppTypography.dongleRegular,
+                        maxLines   = 1,
+                        overflow   = TextOverflow.Ellipsis,
                     )
                 }
 
-                if (query.isEmpty() && !isSearchFocused) {
+                if (query.isEmpty()) {
                     Text(
                         text       = "Search movies, shows, cartoons or anime...",
                         color      = Color(0xFF656565),
@@ -607,10 +673,18 @@ private fun SearchBarContent(
                                 }
                             },
                             rowFocusRequester       = moviesRowFR,
+                            // The row reports which CARD has focus. Only the
+                            // row identity is kept: a Box wrapper cannot see
+                            // this, because onFocusChanged observes its own
+                            // modifier chain and the wrapper has no focus node
+                            // in it -- which is why the first attempt silently
+                            // never fired.
+                            onFocusChanged          = { _, _ ->
+                                onRegionFocused(SearchFocusRegion.MoviesRow)
+                            },
                             sectionHeight          = ROW_SECTION_HEIGHT,
                             viewportHeight         = ROW_VIEWPORT_HEIGHT,
                             onNavigateUp           = {
-                                keyboardController?.hide()
                                 searchFieldFR.requestFocus()
                             },
                             onNavigateDown         = if (hasTv) {
@@ -645,12 +719,14 @@ private fun SearchBarContent(
                                 }
                             },
                             rowFocusRequester       = tvRowFR,
+                            onFocusChanged          = { _, _ ->
+                                onRegionFocused(SearchFocusRegion.TvRow)
+                            },
                             sectionHeight          = ROW_SECTION_HEIGHT,
                             viewportHeight         = ROW_VIEWPORT_HEIGHT,
                             onNavigateUp           = {
                                 if (hasMovies) moviesRowFR.requestFocus()
                                 else {
-                                    keyboardController?.hide()
                                     searchFieldFR.requestFocus()
                                 }
                             },

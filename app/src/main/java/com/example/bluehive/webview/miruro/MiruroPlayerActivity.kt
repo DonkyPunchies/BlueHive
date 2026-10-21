@@ -64,9 +64,11 @@ import com.example.bluehive.IdleWatcher
 import okhttp3.OkHttpClient
 import java.util.concurrent.TimeUnit
 import com.example.bluehive.api.extractStreamAwait
+import com.example.bluehive.webview.hls.SubtitlePlayerActivity
+import com.example.bluehive.webview.hls.originFromReferer
 
 @UnstableApi
-class MiruroPlayerActivity : ComponentActivity() {
+class MiruroPlayerActivity : SubtitlePlayerActivity() {
 
     private val sCRAPE = "scraper"
 
@@ -74,8 +76,18 @@ class MiruroPlayerActivity : ComponentActivity() {
     // other site's player via ExoPlayerConfig so a skip feels identical.
     private val SEEK_INCREMENT_MS = ExoPlayerConfig.SEEK_INCREMENT_MS
 
-    private var player: ExoPlayer? = null
-    private var playerView: PlayerView? = null
+    /** Subtitle logs from the shared base land under this. */
+    override val TAG = "scraper-miruro"
+
+    // What the backend measures a subtitle against. lastExtractedM3u8 rather
+    // than the intent's url: a re-extraction replaces it mid-episode, and a
+    // measurement has to describe the stream currently playing.
+    override val measureStreamUrl: String get() = lastExtractedM3u8 ?: ""
+    override val measureReferer: String
+        get() = intent.getStringExtra("REFERER") ?: "https://www.miruro.tv/"
+    override val measureUserAgent: String get() = intent.getStringExtra("UA") ?: ""
+
+    // player and playerView now live in SubtitlePlayerActivity.
     private var stallWatchdogJob: kotlinx.coroutines.Job? = null
 
     // Watch history is written from HERE, on confirmed playback, rather than by the
@@ -190,6 +202,14 @@ class MiruroPlayerActivity : ComponentActivity() {
     private fun logWatchOnPlaybackConfirmed() {
         val profileId = intent.getIntExtra("PROFILE_ID", -1)
         val mediaId   = intent.getStringExtra("MEDIA_ID")?.toIntOrNull() ?: 0
+        // What the subtitle backend is keyed on. Same tmdb id the HLS player
+        // gets, just under a different extra name on this path, so the whole
+        // subtitle stack works here with no second code path.
+        tmdbId = mediaId
+        // The viewer's saved caption size, font and edge. Stored globally rather
+        // than per title, so a choice made while watching a film is already in
+        // force the first time captions appear on an episode of anime.
+        loadCaptionStyle()
         if (profileId == -1 || mediaId == 0) {
             Log.w(sCRAPE, "▶️ playback confirmed but PROFILE_ID/MEDIA_ID missing — not logging")
             return
@@ -295,7 +315,13 @@ class MiruroPlayerActivity : ComponentActivity() {
         val requestHeaders = mapOf(
             "User-Agent" to ua,
             "Referer" to referer,
-            "Origin" to "https://www.miruro.tv",
+            // FROM THE REFERER, NOT HARD-CODED -- see originFromReferer. Miruro's
+            // player moved into an iframe on strm.cx and the sun provider's CDN
+            // now serves only that Origin. The backend reports the frame that
+            // actually fetched each stream, so this sends what the website's own
+            // player sent; an old payload's miruro.tv referer still derives to
+            // the value that used to be written here.
+            "Origin" to originFromReferer(referer, "https://www.miruro.tv"),
             "Accept" to "*/*",
             "Accept-Language" to "en-US,en;q=0.9",
             "X-API-Key" to BuildConfig.API_KEY
@@ -303,7 +329,7 @@ class MiruroPlayerActivity : ComponentActivity() {
 
         // Buffering / bitrate / networking come from the shared ExoPlayerConfig so
         // every site's player behaves identically. Only requestHeaders above are
-        // Miruro-specific (its CDN pins Origin to miruro.tv).
+        // Miruro-specific.
         // See HlsPlayerActivity: the hint must exist before the engine is built.
         ExoPlayerConfig.ensureQuicHint(this, url)
         val httpFactory = ExoPlayerConfig.dataSourceFactory(ua, requestHeaders, context = this)
@@ -681,6 +707,10 @@ class MiruroPlayerActivity : ComponentActivity() {
             // episode watched. Guarded by `watchLogged` so a pause/resume can't
             // log the same episode twice.
             override fun onIsPlayingChanged(isPlaying: Boolean) {
+                // What the fix-sequence screen's play/pause button reads. Fed from
+                // here rather than polled, so the button is right the instant the
+                // transport changes rather than up to a tick later.
+                isPlayingState = isPlaying
                 // Suppress the plain idle release while frames are flowing, and arm
                 // the longer still-watching check instead. The pause hook has to
                 // hop to the main thread — ExoPlayer is single-threaded and
@@ -724,15 +754,28 @@ class MiruroPlayerActivity : ComponentActivity() {
                             .inflate(R.layout.miruro_player_view, null) as PlayerView).apply {
                             playerView = this
                             this.player = this@MiruroPlayerActivity.player
-                            // 3s fade-out + blue focused scrubber (shared).
-                            ExoPlayerConfig.applyControllerPolicy(this)
-                            // Quality button in the custom control bar opens the picker.
-                            findViewById<View?>(R.id.quality_button)?.setOnClickListener {
-                                showQualityOverlay.value = true
+                            // tintTimeBar = false: player_controls.xml declares
+                            // played_color itself, and the helper would repaint
+                            // it white the moment it attached.
+                            ExoPlayerConfig.applyControllerPolicy(this, tintTimeBar = false)
+                            // Title strip, time remaining, focus placement and the
+                            // injected Subtitles button — the same band the HLS
+                            // player wears, driven by the same code.
+                            attachBandChrome(this)
+                            // Quality is this player's alone, so the shared layout
+                            // declares it GONE and the owner reveals it.
+                            findViewById<View?>(R.id.quality_button)?.apply {
+                                visibility = View.VISIBLE
+                                setOnClickListener { showQualityOverlay.value = true }
                             }
                         }
                     }
                 )
+                // Captions and every subtitle panel. BEFORE the quality picker
+                // so that picker draws over them; the two cannot both be open,
+                // but the caption text can be on screen while it is.
+                SubtitleLayer()
+
                 if (showQualityOverlay.value) {
                     val labels = remember(showQualityOverlay.value) { buildQualityLabels() }
                     VideoQualityOverlay(
@@ -824,6 +867,15 @@ class MiruroPlayerActivity : ComponentActivity() {
                 "🎛 key down: code=${event.keyCode} (${KeyEvent.keyCodeToString(event.keyCode)})"
             )
         }
+        // A SUBTITLE PANEL OWNS THE REMOTE while it is up. Everything below
+        // this line assumes the keys are for the video — seek, play, pause — and
+        // a panel needs them for its own rows and its own search field. Same
+        // guard, same order, as the HLS player.
+        if (pickerOpen || subMenuOpen || fixSeqOpen || styleOpen) {
+            return super.dispatchKeyEvent(event)
+        }
+        // Same reason as the HLS player: the centre key never reaches Compose.
+        if (handleSyncHintKey(event)) return true
         // Quality overlay open: BACK closes it; every other key goes to the Compose
         // overlay so its focusable rows handle up / down / OK.
         if (showQualityOverlay.value) {
@@ -963,7 +1015,6 @@ class MiruroPlayerActivity : ComponentActivity() {
      * pausing during a stall would leave this false and the episode would stay
      * paused on return.
      */
-    private var wasPlayingBeforePause = false
 
     override fun onPause() {
         super.onPause()
@@ -988,6 +1039,8 @@ class MiruroPlayerActivity : ComponentActivity() {
         // false on the way out, and a source stuck in the playing set suppresses
         // the idle timer for the rest of the process lifetime.
         IdleWatcher.setPlaying(IdleWatcher.SOURCE_MIRURO, false)
+        // Before releasePlayer: the caption ticker reads the player's clock.
+        releaseSubtitleUi()
         releasePlayer()
         super.onDestroy()
     }

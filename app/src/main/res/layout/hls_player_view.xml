@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The HLS player's PlayerView.
+
+    The control bar it names is SHARED with the anime player; see
+    player_controls.xml. What stays per player is this file, because the two
+    differ in what they ask of the surface itself, not in the bar.
+
+    WHY THIS FILE HAS TO EXIST. app:controller_layout_id is read ONLY from an
+    AttributeSet, inside PlayerControlView's playbackAttrs branch, and PlayerView
+    forwards its own attrs as playbackAttrs. A PlayerView built in code, which is
+    what this replaces, passes null there, so a custom control bar can never
+    reach it: media3 silently inflates its stock bar instead, with no error and
+    nothing in logcat. Inflating from XML is the only channel, and
+    miruro_player_view.xml already proves the pattern in this app.
+
+    EVERY ATTRIBUTE IS STATED, NOT INHERITED. The code this replaces used the
+    one argument constructor and took media3's defaults; an XML file that
+    quietly differs from them would change behaviour with no code change.
+
+    auto_show stays TRUE because it is the resting value the subtitle UI
+    restores to: claimRemoteForSubtitleUi turns auto show off while a panel is
+    up and closeAllSubtitleUi turns it back on unconditionally. Setting false
+    here would be undone the first time a panel closed.
+
+    The PLAYER layout is deliberately NOT replaced. media3's own carries
+    exo_controller_placeholder, without which PlayerView.controller is null and
+    around twenty setters throw through checkNotNull, with
+    applyControllerPolicy's setControllerShowTimeoutMs the first to hit it. It
+    also carries exo_buffering, which is what setShowBuffering draws.
+-->
+<androidx.media3.ui.PlayerView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/hls_player_view"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/black"
+    app:use_controller="true"
+    app:resize_mode="fit"
+    app:surface_type="surface_view"
+    app:auto_show="true"
+    app:keep_content_on_player_reset="false"
+    app:controller_layout_id="@layout/player_controls" />

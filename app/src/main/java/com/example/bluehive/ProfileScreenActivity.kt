@@ -125,6 +125,36 @@ private val AVATAR_DRAWABLE_MAP: Map<String, Int> = mapOf(
     "avatar4"  to R.drawable.avatar4,
     "avatar5"  to R.drawable.avatar5,
     "avatar6"  to R.drawable.avatar6,
+    "avatar7"  to R.drawable.avatar7,
+    "avatar8"  to R.drawable.avatar8,
+    "avatar9"  to R.drawable.avatar9,
+    "avatar10" to R.drawable.avatar10,
+    "avatar11" to R.drawable.avatar11,
+    "avatar12" to R.drawable.avatar12,
+    "avatar13" to R.drawable.avatar13,
+    "avatar14" to R.drawable.avatar14,
+    "avatar15" to R.drawable.avatar15,
+    "avatar16" to R.drawable.avatar16,
+    "avatar17" to R.drawable.avatar17,
+    "avatar18" to R.drawable.avatar18,
+    "avatar19" to R.drawable.avatar19,
+    "avatar20" to R.drawable.avatar20,
+    "avatar21" to R.drawable.avatar21,
+    "avatar22" to R.drawable.avatar22,
+    "avatar23" to R.drawable.avatar23,
+    "avatar24" to R.drawable.avatar24,
+    "avatar25" to R.drawable.avatar25,
+    "avatar26" to R.drawable.avatar26,
+    "avatar27" to R.drawable.avatar27,
+    "avatar28" to R.drawable.avatar28,
+    "avatar29" to R.drawable.avatar29,
+    "avatar30" to R.drawable.avatar30,
+    "avatar31" to R.drawable.avatar31,
+    "avatar32" to R.drawable.avatar32,
+    "avatar33" to R.drawable.avatar33,
+    "avatar34" to R.drawable.avatar34,
+    "avatar35" to R.drawable.avatar35,
+    "avatar36" to R.drawable.avatar36,
 )
 
 private fun resolveAvatarDrawable(resName: String?): Int =
@@ -712,6 +742,20 @@ fun ProfileScreen(
         onDispose { NetworkMonitor.unregister(context, cb) }
     }
 
+    /**
+     * A profile to land on instead of slot 0 the next time focus is placed.
+     *
+     * Set when one has just been CREATED. The grid effect's default is slot 0,
+     * which is right on a cold open — OK then means "continue as me" — but wrong
+     * straight after creating, where the profile the user was just describing
+     * has appeared somewhere down the row and they have to walk to it.
+     *
+     * An id rather than an index, because the card is appended locally here and
+     * then reordered by the reload that follows; an index would point at
+     * whatever took that slot.
+     */
+    var focusProfileId by remember { mutableStateOf(-1) }
+
     val creationLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -743,6 +787,10 @@ fun ProfileScreen(
                         seat                 = accountSeat,
                     )
                 )
+
+                // Land on it when the grid effect next runs — which the size
+                // change on the line above is what triggers.
+                focusProfileId = newId
 
                 // RE-READ THE QUOTA, do not just add the card.
                 //
@@ -911,6 +959,34 @@ fun ProfileScreen(
             kotlinx.coroutines.android.awaitFrame()
             navSoundArmed = true
             return@LaunchedEffect
+        }
+
+        // ── A profile just created beats the opening focus ─────────────────
+        //
+        // Same precedence as the return-from-a-child case above and for the
+        // same reason: slot 0 is the right landing on a cold open, and the
+        // wrong one when the user has just finished describing a profile that
+        // is now sitting further along the row.
+        val wantedId = focusProfileId
+        if (wantedId != -1) {
+            focusProfileId = -1
+            val index = profiles.indexOfFirst { it.id == wantedId }
+            if (index >= 0) {
+                // The cards are built as the grid composes, so the requester
+                // for a late slot may not exist for a frame or two yet.
+                while (focusRequesters.size <= index) {
+                    kotlinx.coroutines.android.awaitFrame()
+                }
+                kotlinx.coroutines.android.awaitFrame()
+                runCatching { focusRequesters[index].requestFocus() }
+                focusParked = false      // release the parking spot
+                kotlinx.coroutines.android.awaitFrame()
+                navSoundArmed = true
+                return@LaunchedEffect
+            }
+            // Fell through: the id is not in the list after all. Nothing is
+            // returned here on purpose, so the ordinary slot-0 landing below
+            // still happens rather than the screen opening with no focus.
         }
 
         if (profiles.isEmpty()) {
@@ -1929,8 +2005,13 @@ fun ProfileCard(
                 label         = "profileCardAvatarAlpha",
             )
 
+            // Lifted twice, a tenth each time: 0.7 -> 0.67 -> 0.637, so an
+            // unfocused card shows 36.3% of its artwork where it once showed 30%.
+            // This screen dims the hardest of the three, so the same proportional
+            // step buys it the least, and it is the one to push again if a row of
+            // unfocused cards still reads as flat.
             val tintAlpha by androidx.compose.animation.core.animateFloatAsState(
-                targetValue   = if (isFocused) 0f else 0.7f,
+                targetValue   = if (isFocused) 0f else 0.637f,
                 animationSpec = tween(durationMillis = 200),
                 label         = "profileCardTint",
             )

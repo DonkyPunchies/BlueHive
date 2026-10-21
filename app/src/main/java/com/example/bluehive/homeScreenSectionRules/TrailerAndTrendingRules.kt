@@ -35,7 +35,10 @@ const val CAROUSEL_TRAILER_PHASE_OFFSET_MS        = CAROUSEL_AUTO_CYCLE_DELAY_MS
 //  Never build a trending/trailer ImageRequest by hand; use these.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const val TRENDING_BACKDROP_PX_W = 848
+// The trending picture area in px on the onn box (389 x 218.7 dp at 2x); see
+// TRENDING_VIEWPORT_W in HomeScreenTrendingCompose. Was 848 wide before the
+// panel became 16:9 on 2026-10-19.
+const val TRENDING_BACKDROP_PX_W = 778
 const val TRENDING_BACKDROP_PX_H = 438
 const val TRAILER_THUMB_PX_W     = 488
 const val TRAILER_THUMB_PX_H     = 273

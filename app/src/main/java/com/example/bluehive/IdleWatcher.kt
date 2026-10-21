@@ -119,27 +119,23 @@ object IdleWatcher {
      *
      * KEYED ON INPUT, NOT ON LIFECYCLE, and that is the point. A background-based
      * timer would miss the exact case this is for, because the app is often not
-     * backgrounded when the TV goes off. "No human has pressed anything in two
+     * backgrounded when the TV goes off. "No human has pressed anything in four
      * hours" is true regardless of what Android thinks the lifecycle is.
      *
-     * TWO HOURS, REDUCED FROM FOUR ON 2026-09-11, and the argument is the one
-     * [IDLE_RELEASE_MS] already makes: the slot is handed back at THIRTY MINUTES.
-     * Past that the process holds nothing the user or the backend cares about —
-     * it is cache, and cache is precisely what the second reason above says has
-     * OOM-killed us before. Keeping it for another three and a half hours bought
-     * only a warm start for somebody who had already been gone half an hour.
+     * FOUR HOURS, BACK UP FROM TWO ON 2026-10-18 at the owner's call. It was cut
+     * to two on 2026-09-11 on the argument [IDLE_RELEASE_MS] makes: the slot is
+     * handed back at THIRTY MINUTES, so past that the process holds only cache,
+     * and cache is what the second reason above says has OOM-killed us before.
      *
-     * WHAT THE SHORTER VALUE COSTS, measured on the onn box: a cold start runs
-     * roughly 15 seconds from launcher to profile picker, and it is paid only by
-     * someone returning after two idle hours — who is beginning a fresh session
-     * anyway. What the longer value cost was a ~170MB process sitting on a 2GB
-     * box for most of an evening while somebody watched something else on the
-     * same TV.
+     * WHAT EACH VALUE COSTS, measured on the onn box: a cold start runs roughly 15
+     * seconds from launcher to profile picker, paid by whoever comes back after
+     * the close. The longer value instead keeps a ~170MB process on a 2GB box for
+     * up to four idle hours while somebody watches something else on the same TV.
      *
      * Still comfortably clear of IDLE_RELEASE_MS, so the two never interact, and
      * still long enough never to fire on someone who stepped out for dinner.
      */
-    private const val CLOSE_AFTER_IDLE_MS = 2L * 60 * 60 * 1000
+    private const val CLOSE_AFTER_IDLE_MS = 35L * 60 * 1000 // TEMP-TEST v339
 
     // THE "STILL WATCHING?" PROMPT WAS REMOVED 2026-09-11, and what it covered is
     // worth recording because most of it is now covered elsewhere.
@@ -167,6 +163,17 @@ object IdleWatcher {
      * Tick cadence. Pure arithmetic on a plugged-in TV; no network, no wakelock.
      */
     private const val TICK_MS = 15L * 1000
+
+    /**
+     * How often a tick writes its whole state to the log, whatever it decides.
+     *
+     * ADDED 2026-10-20 because the close was invisible until it fired. A TV sat
+     * all night on a paused episode and never closed, and nothing in the log said
+     * why: the one Log.e this class had is on the close itself, so "never closed"
+     * and "never ran" looked identical. One line every few minutes names which
+     * gate held -- signed out, exited, something playing, or input resetting it.
+     */
+    private const val DIAG_EVERY_MS = 60L * 1000 // TEMP-TEST v339
 
     // ── Playback sources ──────────────────────────────────────────────────────
     //
@@ -222,6 +229,12 @@ object IdleWatcher {
      */
     @Volatile private var lastReleaseWasIdle = false
 
+    /** elapsedRealtime of the last state line; see [DIAG_EVERY_MS]. */
+    @Volatile private var lastDiagAt = 0L
+
+    /** Minutes of stillness a reset has to cut short before it is worth a log line. */
+    private const val NOTABLE_IDLE_MS = 2L * 60 * 1000
+
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var job: Job? = null
 
@@ -240,8 +253,15 @@ object IdleWatcher {
      * Cheap enough to call on every keystroke: two volatile writes and, only in
      * the rare woken-from-idle case, a stream start.
      */
-    fun noteInteraction() {
-        lastInputAt = SystemClock.elapsedRealtime()
+    fun noteInteraction(what: String = "") {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastInputAt >= NOTABLE_IDLE_MS) {
+            // Only after a real stretch of stillness, so ordinary browsing logs
+            // nothing. An input that arrives on its own after hours is exactly the
+            // thing that would keep the close from ever firing.
+            Log.e(TAG, "input ($what) after ${(now - lastInputAt) / 60000}m idle — timer reset")
+        }
+        lastInputAt = now
         // Someone is here. Re-arm the close so a failed teardown cannot leave the
         // app unable to ever ask again.
         closeRequested = false
@@ -276,10 +296,12 @@ object IdleWatcher {
             Log.w(TAG, "setPlaying for unknown source '$source' — ignored")
             return
         }
-        synchronized(playingSources) {
+        val changed = synchronized(playingSources) {
             if (isPlaying) playingSources.add(source) else playingSources.remove(source)
         }
-        Log.d(TAG, "playback $source=$isPlaying (playing=${snapshotPlaying()})")
+        // Log.e on a CHANGE: this set is the only thing that suspends the close, so
+        // its history is the first thing to read when a TV stays up all night.
+        if (changed) Log.e(TAG, "playback $source=$isPlaying (playing=${snapshotPlaying()})")
     }
 
     /**
@@ -308,7 +330,11 @@ object IdleWatcher {
             // Returning from background is interaction by definition, and without
             // this the first tick after a long background would see a stale
             // lastInputAt and release immediately.
-            lastInputAt = SystemClock.elapsedRealtime()
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastInputAt >= NOTABLE_IDLE_MS) {
+                Log.e(TAG, "foreground return after ${(now - lastInputAt) / 60000}m idle — timer reset")
+            }
+            lastInputAt = now
         }
     }
 
@@ -328,12 +354,14 @@ object IdleWatcher {
     fun start() {
         if (job?.isActive == true) return
         job = scope.launch {
-            Log.i(TAG, "idle watcher started (release=${IDLE_RELEASE_MS / 60000}m, " +
+            Log.e(TAG, "idle watcher started (release=${IDLE_RELEASE_MS / 60000}m, " +
                     "close=${CLOSE_AFTER_IDLE_MS / 60000}m)")
             while (isActive) {
                 delay(TICK_MS)
+                // Log.e: a tick that throws every time is a close that never fires,
+                // and Log.w is stripped from the builds that actually run.
                 runCatching { tick() }
-                    .onFailure { Log.w(TAG, "tick failed: ${it.message}") }
+                    .onFailure { Log.e(TAG, "tick failed: $it") }
             }
         }
     }
@@ -366,11 +394,20 @@ object IdleWatcher {
         // genuinely is foreground-only. The close is the opposite case: an app that
         // is backgrounded AND idle is exactly the process worth reclaiming, and the
         // slot has already been dealt with by InactivityWatcher's server-side grace.
-        if (!SessionManager.get().isAuthenticated) return
-        if (DeviceEventStream.isIntentionallyExited) return
-
-        val idleMs  = SystemClock.elapsedRealtime() - lastInputAt
+        val now     = SystemClock.elapsedRealtime()
+        val idleMs  = now - lastInputAt
         val playing = snapshotPlaying()
+        val authed  = SessionManager.get().isAuthenticated
+        val exited  = DeviceEventStream.isIntentionallyExited
+        if (now - lastDiagAt >= DIAG_EVERY_MS) {
+            lastDiagAt = now
+            Log.e(TAG, "state: idle=${idleMs / 60000}m playing=$playing fg=$foreground " +
+                    "authed=$authed exited=$exited released=$releasedForIdle " +
+                    "closeRequested=$closeRequested (close at ${CLOSE_AFTER_IDLE_MS / 60000}m)")
+        }
+
+        if (!authed) return
+        if (exited) return
 
         // ── Close the whole app ────────────────────────────────────────────────
         //

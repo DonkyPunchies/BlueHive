@@ -31,9 +31,12 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.res.ResourcesCompat
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import com.example.bluehive.api.ApiClient
 import com.example.bluehive.api.RelayGrantRequest
+import com.example.bluehive.api.SubtitleSyncRequest
 import com.example.bluehive.auth.SessionManager
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
@@ -50,6 +53,7 @@ import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.ui.PlayerView
+import androidx.media3.ui.CaptionStyleCompat
 import androidx.media3.ui.SubtitleView
 import com.example.bluehive.BuildConfig
 import com.example.bluehive.IdleWatcher
@@ -90,16 +94,19 @@ import com.example.bluehive.api.extractStreamAwait
  * On a fatal CDN error, re-runs extraction for a fresh token/node (MAX_EXTRACT_RETRIES).
  */
 @UnstableApi
-class HlsPlayerActivity : ComponentActivity() {
+class HlsPlayerActivity : SubtitlePlayerActivity() {
 
-    private val TAG = "scraper-vidapi"
+    override val TAG = "scraper-vidapi"
 
-    private var player: ExoPlayer? = null
-    private var playerView: PlayerView? = null
+    // player and playerView now live in SubtitlePlayerActivity.
     private var trackSelector: DefaultTrackSelector? = null
-    /** Cues on screen right now. Compose state, so the live SubtitleView renders
-     *  them — see the AndroidView in setContent. */
-    private var activeCues by mutableStateOf<List<Cue>>(emptyList())
+
+    // What the backend times a subtitle against. currentM3u8 is whichever URL is
+    // actually playing — direct or relay — so a measurement always describes the
+    // stream the viewer is hearing.
+    override val measureStreamUrl: String get() = currentM3u8
+    override val measureReferer: String get() = referer
+    override val measureUserAgent: String get() = ua
 
     // --- failover state ---
     // Per centre press: did the DOWN go to PlayerView's controller (so let the UP
@@ -110,6 +117,17 @@ class HlsPlayerActivity : ComponentActivity() {
 
     private var loggedDuration = false
     private var extractRetries = 0
+
+    /**
+     * Redraws spent on a url a PROBE already proved dead, charged separately
+     * from [extractRetries].
+     *
+     * The two are different questions. extractRetries covers "this link went
+     * stale, draw another" -- a token expiring mid-episode, where the next draw
+     * usually works. This one covers "the backend handed back a url that serves
+     * nothing", which is evidence about the SOURCE, not about the draw.
+     */
+    private var deadRedraws = 0
     /** Counts 429 back-offs. Separate from extractRetries: a rate limit is not a
      *  failed extraction and must not consume the re-extraction budget. */
     private var rateLimitRetries = 0
@@ -190,9 +208,45 @@ class HlsPlayerActivity : ComponentActivity() {
      * Lifted out of onPlayerError so the fast-fail paths below end exactly the way
      * the retry-exhausted path always has — one message, one behaviour.
      */
+    /**
+     * This source is finished; tell whoever launched us which one it was.
+     *
+     * THE ONE FUNNEL FOR "THIS SOURCE IS DEAD", called from five places and
+     * from nowhere else — a BACK press, an idle close and a successful finish
+     * all exit by other routes. That is what makes it safe to report failure
+     * here: anything arriving at this function has already exhausted the
+     * player's own recovery (re-extraction, the relay, the stall watchdog),
+     * so the caller is not being asked to retry something still fixable.
+     *
+     * The result is what lets the detail screen continue the failover chain
+     * past a source whose EXTRACTION succeeded and whose PLAYBACK did not —
+     * the case the chain could not see before, because the backend hands over
+     * a url and never learns whether it played.
+     */
     private fun abandonSourceWithNotice() {
         showToast("Couldn't reach this episode's server. Try another source.")
-        lifecycleScope.launch { delay(2_500); finish() }
+        runCatching {
+            setResult(
+                RESULT_SOURCE_FAILED,
+                Intent().putExtra(EXTRA_FAILED_SOURCE,
+                                  intent.getStringExtra("SOURCE_NAME").orEmpty())
+                        .putExtra(EXTRA_FAILED_AT_MS, positionForHandOff()),
+            )
+        }
+        lifecycleScope.launch { delay(2_500); finish() }  // EXIT: source-failed
+    }
+
+    /**
+     * Where the viewer was, for the next source to start from.
+     *
+     * The live player when there is one; otherwise what the last rebuild
+     * captured. Relay and re-extraction both tear the player down and leave the
+     * position in resumePositionMs, and those are exactly the paths that end
+     * here -- so the larger of the two is the latest place anyone saw.
+     */
+    private fun positionForHandOff(): Long {
+        val live = runCatching { player?.currentPosition }.getOrNull() ?: 0L
+        return maxOf(live, resumePositionMs, 0L)
     }
 
     /** Row id from logWatchHistory — the handle progress/stop are addressed to. */
@@ -556,6 +610,18 @@ class HlsPlayerActivity : ComponentActivity() {
      * play/pause state at none of them, which is precisely the kind of omission
      * that happens when the same three lines are written out four times.
      */
+    /** Set when the decoder was taken while we were not in front; see onPlayerError. */
+    private var codecReclaimPending = false
+    private var codecReacquireAttempts = 0
+
+    /**
+     * How many times to ask for a decoder back before accepting the answer.
+     *
+     * Two, because the case this exists for is a single reclaim during a pause,
+     * and a device refusing twice in a row is not going to yield on a third ask.
+     */
+    private val MAX_CODEC_REACQUIRES = 2
+
     private fun captureResumeState() {
         player?.let {
             if (it.currentPosition > 0) resumePositionMs = it.currentPosition
@@ -575,155 +641,23 @@ class HlsPlayerActivity : ComponentActivity() {
     private var ua: String = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-    // --- captions (dev state, self-rendered) ---
-    private var tmdbId: Int = 0
-    // Subtitle the EXTRACTOR pulled off the streaming site (SUBTITLE_URL extra).
-    // Preferred over OpenSubtitles: it's this exact release's caption track, so
-    // it's already in sync and needs no imdb lookup.
-    private var streamSubtitleUrl: String? = null
-    private var parsedCues: List<TimedCue> = emptyList()
-    private var captionsLoaded = false
-    private var captionsOn = false
-    private var lastCueKey: String = "\u0000"
-    private var toastText by mutableStateOf<String?>(null)
-    private var toastJob: Job? = null
-    private var captionTickerJob: Job? = null
-
-    // --- English-subtitle picker (CC button) ---
-    // OpenSubtitles lists several English subtitles per episode, each timed to a
-    // different rip, and only one matches what we're streaming. The picker shows
-    // them all so a drifting one can be swapped out mid-episode.
-    private var pickerOpen by mutableStateOf(false)
-    private var pickerLoading by mutableStateOf(false)
-    private var pickerOptions by mutableStateOf<List<HlsSubtitles.SubtitleChoice>>(emptyList())
-    private var pickerError by mutableStateOf<String?>(null)
-    /** EnglishOption.index currently rendering, or -1 when captions are off. */
-    private var activeSubtitleIndex by mutableStateOf(-1)
-    /** True only if WE paused to show the picker, so closing it can't resume a
-     *  video the user had deliberately paused before pressing CC. */
-    private var pausedForPicker = false
-
-    /**
-     * Was playback running when this activity last went to the background?
-     *
-     * THE SAME RULE AS pausedForPicker, applied to the lifecycle. onResume used
-     * to call play() unconditionally, so anything that backgrounded the activity
-     * and came back resumed a film the user had deliberately paused. The one
-     * trigger that is certain to do that on a television is the daydream: this
-     * box has screensaver_enabled=1 and screen_off_timeout=600000, so pausing
-     * and sitting still for ten minutes backgrounds the app, and the key press
-     * that dismisses the screensaver brings it back — playing.
-     *
-     * playWhenReady, NOT isPlaying. isPlaying is briefly false mid-buffer (see
-     * ExoPlayerConfig.togglePlayPause, which flips playWhenReady for exactly
-     * this reason), so pausing during a stall would record "was not playing" and
-     * the film would stay paused on return — trading one wrong behaviour for
-     * another. playWhenReady is the user's intent rather than the decoder's
-     * moment-to-moment state.
-     */
-    private var wasPlayingBeforePause = false
-
-    // Subtitle timing offset in ms (+ = show later, − = show earlier), persisted per title.
-    private var subtitleOffsetMs: Long = 0
-    private var subOffsetLabel: TextView? = null
-    private var ccButton: ImageButton? = null
-    private val subPrefs by lazy { getSharedPreferences("vidapi_sub_offsets", MODE_PRIVATE) }
-
-    /**
-     * Subtitle RATE correction — the one fix the offset buttons cannot perform.
-     *
-     * An offset is a constant shift, and it handles the common case: the release a
-     * subtitle was timed to had a different amount of distributor logo before the
-     * first frame. It cannot touch the other case. A subtitle authored against a
-     * 25fps PAL transfer, rendered over a 23.976fps source, is wrong by a RATIO
-     * rather than a constant — 4.27%, which is ~3m50s by the end of a feature.
-     * Sync the opening and the ending breaks; sync the ending and the opening
-     * does. No number of nudges fixes it, because the error GROWS.
-     *
-     * So cue times are now scaled as well as shifted: videoTime = cue*rate + offset.
-     * Because we render cues ourselves off the playback clock (see the class
-     * header) this costs one division per tick and applies instantly, mid-film,
-     * with no reload — the same property that made the offset buttons possible.
-     *
-     * NOBODY OPERATES THIS. There is no drift button, and the words "framerate"
-     * and "drift" appear nowhere in the UI. The rate is MEASURED from the ◀ / ▶
-     * nudges the viewer was already going to make — see [recordSyncPoint].
-     *
-     * That deletion is the whole design. The button this replaces made the
-     * viewer diagnose their own problem first ("is this off by a constant, or by
-     * a ratio?") before it could tell them which control to reach for. That is a
-     * distinction for someone who knows what telecine is, and asking for it is
-     * what made the feature unusable rather than the number of buttons.
-     *
-     * 1.0 means no correction, and must keep meaning exactly that — see
-     * renderActiveCues.
-     */
-    private var subtitleRate: Double = 1.0
-
-    /**
-     * One "this looks right HERE" observation: the playback position, and the
-     * offset the viewer settled on at it.
-     *
-     * Settled is the load-bearing word. Reaching +2.00s takes eight presses, and
-     * the seven offsets on the way there are not answers to anything — they are
-     * someone still turning the dial. Only the value they stop at is data, which
-     * is why these are recorded on a debounce rather than per press.
-     */
-    private data class SyncPoint(val positionMs: Long, val offsetMs: Long)
-
-    private var lastSyncPoint: SyncPoint? = null
-    private var syncSettleJob: Job? = null
-
-    /** How long the nudging must stop before an offset counts as settled. */
-    private val SYNC_SETTLE_MS = 3_000L
-
-    /**
-     * How far apart two observations must be before their slope means anything.
-     *
-     * FIFTEEN minutes, and the number is measured rather than picked. Each
-     * observation carries about ±250ms of error — the nudge step is 250ms and
-     * nobody's eye is better than that anyway — so the error in the SLOPE is
-     * roughly 500ms divided by the span. A short arm turns that into a large
-     * rate error applied across the whole film:
-     *
-     *     span    worst residual, simulated, on a 36s-per-2h drift
-     *      5 min   5.6s   ← worse than some of what it was fixing
-     *     10 min   3.0s
-     *     15 min   2.0s   ← the knee
-     *     30 min   1.1s
-     *
-     * Five minutes was the first guess and the simulation threw it out.
-     */
-    private val SYNC_MIN_SPAN_MS = 15 * 60_000L
-
-    /** Sanity band for a measured rate. Outside it, the pair was not drift. */
-    private val SYNC_RATE_MIN = 0.90
-    private val SYNC_RATE_MAX = 1.10
-
-    /**
-     * The two settled offsets must differ by at least this much.
-     *
-     * This is the noise floor, stated in the only units that matter. Two
-     * observations 250ms apart are indistinguishable from the same observation
-     * made twice, and dividing that by the span yields a confident-looking rate
-     * built out of rounding. Below 1.5s we are not measuring drift, so we leave
-     * the film alone — at which point the drift is under ~12s across a feature,
-     * which the ◀ / ▶ buttons already handle.
-     */
-    private val SYNC_MIN_OFFSET_DELTA_MS = 1_500L
 
     private lateinit var reextractLauncher: ActivityResultLauncher<Intent>
 
-    private data class TimedCue(val startMs: Long, val endMs: Long, val cue: Cue)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         val url = intent.getStringExtra("M3U8_URL")
         if (url.isNullOrBlank()) {
+            // Nothing to report to the chain: no url means the LAUNCH was
+            // malformed, not that the source refused. Failing over would send
+            // the same broken intent at the next source.
             Log.e(TAG, "HlsPlayerActivity launched without M3U8_URL — finishing")
-            finish(); return
+            finish(); return  // EXIT: not-the-source
         }
+
+        loadCaptionStyle()
 
         embedUrl = intent.getStringExtra("EMBED_URL")
         relayUrl = intent.getStringExtra("M3U8_FALLBACK_URL")
@@ -734,20 +668,22 @@ class HlsPlayerActivity : ComponentActivity() {
         if (!streamSubtitleUrl.isNullOrBlank())
             Log.d(TAG, "subs: stream subtitle available → ${streamSubtitleUrl!!.take(90)}")
 
-        // Restore the saved timing for this title (sync once, remembered). The
-        // rate index is clamped: a value stored by a build with a different rate
-        // table would otherwise be an out-of-bounds read on every caption tick.
-        subtitleOffsetMs = if (tmdbId > 0) subPrefs.getLong(tmdbId.toString(), 0L) else 0L
-        // Clamped on the way in: a rate outside the band would make every cue
-        // lookup wrong for the whole film, and prefs outlive the code that wrote
-        // them. The key is deliberately NOT the "_rate" one an earlier build used
-        // for a preset INDEX — getFloat on an int-typed key throws.
-        subtitleRate = if (tmdbId > 0)
-            subPrefs.getFloat("${tmdbId}_ratef", 1f).toDouble()
-                .coerceIn(SYNC_RATE_MIN, SYNC_RATE_MAX) else 1.0
-        if (subtitleOffsetMs != 0L || subtitleRate != 1.0)
-            Log.d(TAG, "subs: restored saved timing ${subtitleOffsetMs}ms " +
-                    "rate=${"%.5f".format(subtitleRate)} for tmdb=$tmdbId")
+        // EVERY PLAYBACK STARTS IN SYNC. Timing used to be remembered per title
+        // and restored here, which assumed the next playback would use the same
+        // subtitle file and the same release -- neither of which holds. A source
+        // can change between sessions, and an offset measured against one cut is
+        // simply wrong against another, so the saved value was as likely to
+        // break the subtitles as to fix them, silently, before the viewer had
+        // touched anything.
+        //
+        // Nothing is read back now. The backend's own measurement still runs per
+        // playback, and a manual nudge lasts as long as the thing it was aimed at.
+        subtitleOffsetMs = 0L
+        // The rate travelled with the offset and goes with it. Reading it back
+        // would be reading a key persistTiming now deletes -- harmless, since
+        // the default is 1.0, but a restore path that restores nothing is just
+        // somewhere for a future reader to lose time.
+        subtitleRate = 1.0
 
         reextractLauncher = registerForActivityResult(
             ActivityResultContracts.StartActivityForResult()
@@ -762,10 +698,18 @@ class HlsPlayerActivity : ComponentActivity() {
                 startPlayback(newUrl)
             } else {
                 val reason = data?.getStringExtra(HlsExtract.RESULT_REASON) ?: "unknown"
-                Log.e(TAG, "❌ re-extraction failed ($reason) — finishing")
-                finish()
+                Log.e(TAG, "❌ re-extraction failed ($reason) — giving up this source")
+                abandonSourceWithNotice()
             }
         }
+
+        // A FAILOVER CARRIES ON FROM WHERE THE LAST SOURCE DIED -- see
+        // EXTRA_START_AT_MS. Zero for every ordinary launch, so a source picked
+        // by hand still starts at the beginning exactly as before. startPlayback
+        // consumes it like any other resume: one seek, then cleared.
+        resumePositionMs = intent.getLongExtra(EXTRA_START_AT_MS, 0L).coerceAtLeast(0L)
+        if (resumePositionMs > 0)
+            Log.e(TAG, "▶ failover hand-off — starting at ${resumePositionMs}ms")
 
         startPlayback(url)
     }
@@ -846,8 +790,22 @@ class HlsPlayerActivity : ComponentActivity() {
                                 "($extractRetries/$MAX_EXTRACT_RETRIES)")
                         relaunchExtraction()
                     } else {
-                        Log.e(TAG, "🛑 wedged and out of re-extraction attempts — finishing")
-                        finish()
+                        // abandonSourceWithNotice(), NOT finish(). Both close the
+                        // player; only one tells the screen behind it that THIS
+                        // SOURCE failed, which is what lets the chain move on to
+                        // the next one.
+                        //
+                        // This was the only give-up path in the file still calling
+                        // finish() -- the five others already report -- so a stall
+                        // was the single most common failure the source failover
+                        // could not see. MEASURED 2026-10-09 on Carrie s1e1:
+                        // VidNest's cdn8.streamraiwind.stream answered 522 (origin
+                        // unreachable) and every segment 404'd, and the ladder spun
+                        // relay -> stall -> re-extract for ~78s a round before
+                        // closing in silence. VidFast was one hop away the whole
+                        // time and was never asked.
+                        Log.e(TAG, "🛑 wedged and out of re-extraction attempts — giving up this source")
+                        abandonSourceWithNotice()
                     }
                 }
                 addListener(object : Player.Listener {
@@ -931,7 +889,7 @@ class HlsPlayerActivity : ComponentActivity() {
                         if (state == Player.STATE_ENDED && player?.isCurrentMediaItemLive != true) {
                             Log.i(TAG, "🏁 playback ended — closing player")
                             IdleWatcher.setPlaying(IdleWatcher.SOURCE_HLS, false)
-                            finish()
+                            finish()  // EXIT: dismissed
                         }
                     }
 
@@ -941,6 +899,7 @@ class HlsPlayerActivity : ComponentActivity() {
                     // backing out) must not count as watched. Guarded so a pause or a
                     // mid-play re-extract can't log the same title twice.
                     override fun onIsPlayingChanged(isPlaying: Boolean) {
+                        isPlayingState = isPlaying
                         // Tell the idle timer whether anyone could plausibly be
                         // watching. While this is true the plain 30-minute release
                         // is suppressed and the longer still-watching check applies
@@ -952,6 +911,11 @@ class HlsPlayerActivity : ComponentActivity() {
                         // main thread: ExoPlayer is single-threaded and throws if
                         // touched from the watcher's IO tick.
                         IdleWatcher.setPlaying(IdleWatcher.SOURCE_HLS, isPlaying)
+
+                        // Frames are flowing, so whatever the last reclaim cost
+                        // has been paid back. A pause hours from now starts with
+                        // a full budget rather than inheriting this one's.
+                        if (isPlaying) codecReacquireAttempts = 0
 
                         if (isPlaying) {
                             // Frames are flowing, so whatever recovery was in
@@ -1093,6 +1057,12 @@ class HlsPlayerActivity : ComponentActivity() {
                         // is itself the evidence. Exactly once, because if both
                         // readings fail the stream really is unplayable and a third
                         // attempt just delays the honest answer.
+                        //
+                        // UNSUPPORTED ONLY. Its sibling 3001 (container MALFORMED)
+                        // means the right parser was already reading and a chunk
+                        // came back that is not media -- a source failure, so it
+                        // goes down the relay/re-extract ladder below. See
+                        // isSourceFailure.
                         if (error.errorCode ==
                                 PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED &&
                             !containerRetried
@@ -1111,15 +1081,87 @@ class HlsPlayerActivity : ComponentActivity() {
                             return
                         }
 
-                        val isCdnFailure =
-                            error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS ||
-                                    error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ||
-                                    error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT ||
-                                    error.errorCode == PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE
+                        // ── THE SYSTEM TOOK THE DECODER ──────────────────────
+                        //
+                        // Hardware codecs are a scarce global resource and a
+                        // paused app behind the screensaver is the first thing
+                        // Android takes one from. That reclamation is correct and
+                        // is not fought here — nothing tries to hold a codec in
+                        // the background.
+                        //
+                        // What was wrong is what happened next. This code is not
+                        // one of the four below, so it fell through to the else
+                        // and called finish(): the player vanished, silently, and
+                        // the viewer lost their place in a film because of our
+                        // branch rather than because of Android's decision.
+                        //
+                        // MEASURED 2026-10-01 03:07:15Z, device report #514,
+                        // ERROR_CODE_DECODING_RESOURCES_RECLAIMED on
+                        // MediaCodecAudioRenderer, 57 minutes after playback_start
+                        // — a pause, a screensaver, and a reclaim.
+                        //
+                        // RE-ACQUIRED ON RESUME, NEVER WHILE BACKGROUNDED. Asking
+                        // for a codec the system has just decided we should not
+                        // have only gets refused again, and racing it is exactly
+                        // the fighting this avoids. The state is captured now and
+                        // the rebuild waits for the viewer to come back.
+                        //
+                        // The rebuild goes through startPlayback, so a stream URL
+                        // that expired during the pause — 300 seconds, and this
+                        // was gone for the best part of an hour — fails as an
+                        // ordinary CDN error and the relay and re-extraction paths
+                        // below pick it up. Nothing new had to be written for that.
+                        if (error.errorCode ==
+                                PlaybackException.ERROR_CODE_DECODING_RESOURCES_RECLAIMED) {
+                            captureResumeState()
+                            if (codecReacquireAttempts >= MAX_CODEC_REACQUIRES) {
+                                // Bounded on purpose. A device that genuinely
+                                // cannot give us a decoder must end up somewhere
+                                // honest rather than looping, and the old
+                                // behaviour — say something, then close — is the
+                                // right destination once retrying is pointless.
+                                Log.e(TAG, "🎛 codec reclaimed again after " +
+                                        "$codecReacquireAttempts attempts — giving up")
+                                abandonSourceWithNotice()
+                                return
+                            }
+                            codecReacquireAttempts++
+                            if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                                Log.e(TAG, "🎛 decoder reclaimed while in front — " +
+                                        "rebuilding at ${resumePositionMs}ms " +
+                                        "(attempt $codecReacquireAttempts)")
+                                startPlayback(currentM3u8)
+                            } else {
+                                Log.e(TAG, "🎛 decoder reclaimed in the background — " +
+                                        "holding at ${resumePositionMs}ms until resume")
+                                codecReclaimPending = true
+                            }
+                            return
+                        }
+
+                        // RENAMED FROM isCdnFailure. The set now holds a
+                        // member that is not a CDN fault at all -- a manifest
+                        // that would not parse -- and the old name was already
+                        // the argument for leaving it out. See isSourceFailure.
+                        val isSourceFailure = isSourceFailure(error.errorCode)
                         // Relay first — see switchToRelay for why re-extraction
                         // cannot fix a blocked CDN.
-                        if (isCdnFailure && switchToRelay(error.errorCodeName, httpStatus)) return
-                        if (isCdnFailure && embedUrl != null && extractRetries < MAX_EXTRACT_RETRIES) {
+                        if (isSourceFailure && switchToRelay(error.errorCodeName, httpStatus)) return
+                        // JUNK OVER THE RELAY TOO means the origin serves it to
+                        // everyone, and a fresh extraction of the SAME source points
+                        // back at the same file. MEASURED 2026-10-19, In the
+                        // Beginning on VidNest: the re-extraction spent 32 s to
+                        // return the identical dead URL -- dead air before the chain
+                        // could reach a source that worked. Hand straight to it.
+                        if (error.errorCode ==
+                                PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED &&
+                            usingRelay) {
+                            Log.e(TAG, "🛑 junk chunk over the relay as well — " +
+                                    "skipping re-extraction, handing to the next source")
+                            abandonSourceWithNotice()
+                            return
+                        }
+                        if (isSourceFailure && embedUrl != null && extractRetries < MAX_EXTRACT_RETRIES) {
                             extractRetries++
                             Log.w(TAG, "↻ CDN failure — re-extracting for a fresh server (retry $extractRetries/$MAX_EXTRACT_RETRIES)")
                             relaunchExtraction()
@@ -1129,10 +1171,14 @@ class HlsPlayerActivity : ComponentActivity() {
                             // retries with a backoff is ~10s of black screen, and
                             // closing silently reads as a crash rather than "this
                             // episode's CDN is unreachable from here".
-                            if (isCdnFailure) {
+                            if (isSourceFailure) {
                                 abandonSourceWithNotice()
                             } else {
-                                finish()
+                                // A decoder fault, or a container neither
+                                // reading could open, is not the source's
+                                // doing, so the next source in the chain would
+                                // fail in exactly the same way.
+                                finish()  // EXIT: not-the-source
                             }
                         }
                     }
@@ -1166,92 +1212,30 @@ class HlsPlayerActivity : ComponentActivity() {
                     AndroidView(
                         modifier = Modifier.fillMaxSize(),
                         factory = { ctx ->
-                            PlayerView(ctx).apply {
+                            // INFLATED, NOT CONSTRUCTED. app:controller_layout_id
+                            // is read only from an AttributeSet, and a PlayerView
+                            // built in code passes none -- so a custom control bar
+                            // can never reach it and media3 silently uses its
+                            // stock one. The apply body below is unchanged.
+                            (LayoutInflater.from(ctx)
+                                .inflate(R.layout.hls_player_view, null) as PlayerView).apply {
                                 playerView = this
                                 this.player = this@HlsPlayerActivity.player
                                 useController = true
                                 // 3s fade-out + blue scrubber while it holds D-pad
                                 // focus. Shared so every site's player matches.
-                                ExoPlayerConfig.applyControllerPolicy(this)
+                                // tintTimeBar = false: hls_player_controls.xml
+                                // declares played_color itself, and the helper
+                                // would repaint it white the moment it attached.
+                                ExoPlayerConfig.applyControllerPolicy(this, tintTimeBar = false)
                                 // Inject our subtitle CC + timing buttons into the
                                 // control bar each time it appears (guarded to once).
-                                setControllerVisibilityListener(
-                                    PlayerView.ControllerVisibilityListener { vis ->
-                                        if (vis == View.VISIBLE) {
-                                            injectSubtitleControls(this)
-                                            // Hide media3's own CC button — we use our own.
-                                            findViewById<View>(androidx.media3.ui.R.id.exo_subtitle)
-                                                ?.visibility = View.GONE
-                                        }
-                                    }
-                                )
+                                attachBandChrome(this)
                             }
                         }
                     )
 
-                    // Self-rendered captions overlay (fed by the position ticker).
-                    //
-                    // Cues are pushed through Compose state rather than through a
-                    // cached SubtitleView reference. The ticker used to hold the
-                    // View the factory happened to build and call setCues on it
-                    // directly, which silently stopped working the moment Compose
-                    // handed us a different instance — the on-screen text froze,
-                    // and "turn captions off" couldn't clear it because it was
-                    // clearing a view nobody was looking at. update runs against
-                    // whatever view is live now, so that can't happen.
-                    AndroidView(
-                        modifier = Modifier.fillMaxSize(),
-                        factory = { ctx ->
-                            SubtitleView(ctx).apply {
-                                setUserDefaultStyle()
-                                setUserDefaultTextSize()
-                                setBottomPaddingFraction(0.10f)   // sit above the control bar
-                            }
-                        },
-                        update = { it.setCues(activeCues) }
-                    )
-
-                    // English-subtitle picker (CC). Drawn above the player and the
-                    // caption layer so it owns D-pad focus while it's up.
-                    if (pickerOpen) {
-                        SubtitlePickerOverlay(
-                            loading     = pickerLoading,
-                            options     = pickerOptions,
-                            activeIndex = activeSubtitleIndex,
-                            durationMs  = player?.duration?.takeIf { it > 0 } ?: 0L,
-                            error       = pickerError,
-                            onPick      = { applyChoice(it) },
-                            onTurnOff   = { turnCaptionsOff() },
-                            onDismiss   = { closeSubtitlePicker() },
-                        )
-                    }
-
-                    // Transient toast, lower-right corner (non-interactive overlay).
-                    toastText?.let { msg ->
-                        Text(
-                            text = msg,
-                            color = Color.White,
-                            fontSize = 15.sp,
-                            textAlign = TextAlign.End,
-                            modifier = Modifier
-                                .align(Alignment.BottomEnd)
-                                // Clears the control bar. At bottom = 28.dp a toast
-                                // raised BY a control-bar button lands on top of the
-                                // buttons that raised it — the timing read-out sits
-                                // exactly there, which is the one thing you want to
-                                // read afterwards. The width cap stops a long
-                                // message spanning the screen instead of wrapping.
-                                .padding(end = 28.dp, bottom = 96.dp)
-                                .widthIn(max = 560.dp)
-                                .background(Color(0xE6000000), RoundedCornerShape(10.dp))
-                                .padding(horizontal = 18.dp, vertical = 12.dp)
-                        )
-                    }
-
-                    // "Still watching?" — LAST, so it draws above the captions, the
-                    // toast and the subtitle picker. It takes no focus and consumes
-                    // no input (any key dismisses it through the window hook), so
-                    // sitting on top costs the picker nothing if both are somehow up.
+                    SubtitleLayer()
                 }
             }
         }
@@ -1274,7 +1258,7 @@ class HlsPlayerActivity : ComponentActivity() {
             backendHost != null && backendHost.equals(streamHost, ignoreCase = true)
         } catch (_: Exception) { false }
 
-        // Referer only when the backend supplies one; Origin never. See
+        // Referer only when the backend supplies one. See
         // ExoPlayerConfig.streamHeaders for the measured per-level table and for
         // why a blanket removal (build 114) was wrong.
         val requestHeaders = mutableMapOf(
@@ -1284,6 +1268,27 @@ class HlsPlayerActivity : ComponentActivity() {
         )
         if (streamReferer.isNotBlank()) requestHeaders["Referer"] = streamReferer
         if (isBackendRelay) requestHeaders["X-API-Key"] = BuildConfig.API_KEY
+
+        // ── ORIGIN, FOR CLOUDFLARE WORKERS ONLY ──────────────────────────────
+        //
+        // Derived from the Referer, exactly as the backend's gate derives it: a
+        // Referer may carry a path and an Origin never may. See
+        // requiresOriginHeader for why this is scoped to one host suffix and for
+        // the measurement that found it.
+        //
+        // This factory is shared by playback AND probeStreamReachable, so the
+        // header lands on both -- which matters, because the probe was failing
+        // for the same missing header and reporting the stream dead.
+        if (streamReferer.isNotBlank() &&
+            requiresOriginHeader(android.net.Uri.parse(url).host)
+        ) {
+            runCatching {
+                val u = android.net.Uri.parse(streamReferer)
+                if (u.scheme != null && u.host != null) {
+                    requestHeaders["Origin"] = "${u.scheme}://${u.host}"
+                }
+            }
+        }
 
         // BEFORE the factory, because addQuicHint is build-time state. A filtered
         // CDN never advertises alt-svc (its TCP handshake dies first), so QUIC has
@@ -1350,405 +1355,6 @@ class HlsPlayerActivity : ComponentActivity() {
                else ExoPlayerConfig.progressiveMediaSource(url, factory)
     }
 
-    // ── Captions: CC button + self-rendering ─────────────────────────────────
-    /** Sentinel for "nothing rendered yet" — no real cue key can be a NUL. */
-    private val noCueKey = 0.toChar().toString()
-
-    /**
-     * CC now opens the picker rather than silently loading the first English
-     * subtitle it finds. There are usually several, only one is timed to the
-     * release we're streaming, and until now the other four were fetched past,
-     * discarded and never offered — leaving a drifting subtitle with no recourse
-     * but the offset buttons, which cannot fix a framerate mismatch.
-     */
-    private fun onCcClicked() {
-        if (pickerOpen) closeSubtitlePicker() else openSubtitlePicker()
-    }
-
-    /** Cache key shared by every subtitle for this exact episode. */
-    private fun subtitleCacheKey(): String {
-        val season  = intent.getIntExtra("SEASON_NUMBER", 0)
-        val episode = intent.getIntExtra("EPISODE_NUMBER", 0)
-        return if (season > 0) "${tmdbId}_s${season}e${episode}" else "$tmdbId"
-    }
-
-    private fun openSubtitlePicker() {
-        if (tmdbId <= 0 && streamSubtitleUrl.isNullOrBlank()) {
-            Log.e(TAG, "subs: no tmdbId passed — cannot fetch captions")
-            showToast("Sorry, no subtitle for this media is available.")
-            return
-        }
-        pickerOpen = true
-        pickerError = null
-        playerView?.hideController()
-
-        // Pause while they choose — comparing candidates takes a few seconds and
-        // the episode shouldn't run on underneath. Only resume what WE paused, so
-        // closing the panel can't restart a video they had deliberately paused.
-        player?.let { p ->
-            if (p.playWhenReady) { p.playWhenReady = false; pausedForPicker = true }
-        }
-
-        // Already loaded once this session — reopen instantly, no re-download.
-        if (pickerOptions.isNotEmpty()) return
-
-        pickerLoading = true
-        Log.d(TAG, "subs: ▶️ CC pressed → listing English subtitles for tmdb=$tmdbId")
-        lifecycleScope.launch {
-            val choices = withContext(Dispatchers.IO) {
-                try {
-                    withTimeoutOrNull(25_000) {
-                        val key = subtitleCacheKey()
-                        val fromStream = streamSubtitleUrl
-
-                        // NOTHING IS DOWNLOADED HERE ANY MORE except the stream's
-                        // own caption. This used to fan out and fetch every
-                        // candidate at once — the comment claimed "~40 KB each",
-                        // and measured on the onn box it peaked at 806MB and got
-                        // the app killed by the low-memory killer mid-film.
-                        //
-                        // The backend lists them with their cue counts and timings
-                        // already computed, so the picker renders from a few
-                        // hundred bytes of JSON. The chosen file is fetched in
-                        // applyChoice, one download instead of eight.
-                        val listed = if (tmdbId > 0) HlsSubtitles.listChoices(
-                            tmdbId    = tmdbId,
-                            mediaType = intent.getStringExtra("MEDIA_TYPE") ?: "movie",
-                            season    = intent.getIntExtra("SEASON_NUMBER", 0),
-                            episode   = intent.getIntExtra("EPISODE_NUMBER", 0),
-                        ) else emptyList()
-
-                        // The stream caption still has to be fetched to be offered
-                        // at all — it is the only way to know whether it has cues.
-                        // One file, and it is the option most likely to be picked.
-                        // The SOURCE is part of the cache key. Every site serves
-                        // its own encode with its own caption, so one name per
-                        // title handed the second site the first site's file.
-                        val stream = if (!fromStream.isNullOrBlank())
-                            HlsSubtitles.streamChoice(
-                                context   = this@HlsPlayerActivity,
-                                url       = fromStream,
-                                key       = key,
-                                sourceTag = intent.getStringExtra("EXTRACT_SOURCE") ?: "vidfast",
-                            )
-                        else null
-
-                        listOfNotNull(stream) + listed
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "subs: listing threw — ${e.message}", e); null
-                }
-            }
-            pickerLoading = false
-            pickerOptions = choices.orEmpty()
-            if (pickerOptions.isEmpty()) {
-                pickerError = "Couldn't reach the subtitle service. Try again in a moment."
-                Log.e(TAG, "subs: FAILED for tmdb=$tmdbId — nothing usable (see prior subs: logs)")
-            } else {
-                Log.d(TAG, "subs: picker ready — ${pickerOptions.size} option(s)")
-                // Deliberately does NOT auto-apply the first option. Loading one
-                // on open makes the panel a confirmation of a choice already made
-                // rather than a choice — and the first entry is exactly the one
-                // that might be drifting, which is why the picker exists.
-            }
-        }
-    }
-
-    private fun closeSubtitlePicker() {
-        pickerOpen = false
-        if (pausedForPicker) { player?.playWhenReady = true; pausedForPicker = false }
-    }
-
-    /** Render [choice] from now on. Only ever called from the picker. */
-    private fun applyChoice(choice: HlsSubtitles.SubtitleChoice) {
-        lifecycleScope.launch {
-            val cues = withContext(Dispatchers.IO) {
-                try {
-                    // THE DOWNLOAD HAPPENS HERE NOW, for this one option only.
-                    // Listing an option costs a row; fetching it costs a request,
-                    // and only the option actually chosen ever pays that. The
-                    // stream caption returns its existing path immediately.
-                    val path = HlsSubtitles.ensureVtt(
-                        context   = this@HlsPlayerActivity,
-                        choice    = choice,
-                        tmdbId    = tmdbId,
-                        mediaType = intent.getStringExtra("MEDIA_TYPE") ?: "movie",
-                        season    = intent.getIntExtra("SEASON_NUMBER", 0),
-                        episode   = intent.getIntExtra("EPISODE_NUMBER", 0),
-                        key       = subtitleCacheKey(),
-                    )
-                    if (path != null && File(path).exists()) parseVtt(path) else null
-                } catch (e: Exception) {
-                    Log.e(TAG, "subs: parse threw — ${e.message}", e); null
-                }
-            }
-            if (cues.isNullOrEmpty()) {
-                showToast("That subtitle couldn't be read — try another.")
-                return@launch
-            }
-            parsedCues = cues
-            captionsLoaded = true
-            captionsOn = true
-            activeSubtitleIndex = choice.option.index
-            // A different file has different timing, so an anchor taken against
-            // the old one would pair with a point from the new one and measure
-            // a drift that belongs to neither.
-            lastSyncPoint = null
-            syncSettleJob?.cancel()
-            lastCueKey = noCueKey
-            updateCcButtonState()
-            startCaptionTicker()
-            Log.d(TAG, "subs: captions loaded — ${choice.label} (${cues.size} cues), offset=${subtitleOffsetMs}ms")
-            closeSubtitlePicker()
-            showToast(
-                if (subtitleOffsetMs != 0L || subtitleRate != 1.0)
-                    "${choice.label} on (timing saved from last time)."
-                else
-                    "${choice.label} on. Out of sync? Nudge it with ◀ / ▶."
-            )
-        }
-    }
-
-    private fun turnCaptionsOff() {
-        captionsOn = false
-        captionsLoaded = false
-        activeSubtitleIndex = -1
-        // Stop the ticker FIRST, then clear — otherwise the next tick (up to
-        // 80ms away) can win the race and put the last cue straight back.
-        captionTickerJob?.cancel()
-        captionTickerJob = null
-        parsedCues = emptyList()
-        activeCues = emptyList()
-        lastCueKey = noCueKey
-        updateCcButtonState()
-        closeSubtitlePicker()
-        Log.d(TAG, "captions OFF")
-    }
-
-    /** Recompute the active cue(s) from the playback clock (+ offset) ~12×/sec. */
-    private fun startCaptionTicker() {
-        captionTickerJob?.cancel()
-        captionTickerJob = lifecycleScope.launch {
-            while (true) {
-                renderActiveCues()
-                delay(80)
-            }
-        }
-    }
-
-    private fun renderActiveCues() {
-        val p = player
-        val active: List<Cue> =
-            if (!captionsOn || p == null || parsedCues.isEmpty()) emptyList()
-            else {
-                // Map the playback clock into CUE space: videoTime = cue*rate +
-                // offset, inverted. +offset ⇒ cue shows later; rate > 1 stretches
-                // the subtitle to fit a longer video, fixing one that runs ahead.
-                //
-                // At rate 1.0 this is exactly the old expression: a Long position
-                // converts to Double losslessly below 2^53 ms, and dividing by 1.0
-                // is the identity, so the uncorrected path did not change.
-                val t = ((p.currentPosition - subtitleOffsetMs) / subtitleRate).toLong()
-                parsedCues.filter { t >= it.startMs && t <= it.endMs }.map { it.cue }
-            }
-        val key = active.joinToString("") { it.text ?: "" }
-        if (key != lastCueKey) { activeCues = active; lastCueKey = key }
-    }
-
-    // ── Subtitle timing controls (buttons in the bottom control bar) ──────────
-    private fun injectSubtitleControls(pv: PlayerView) {
-        if (subOffsetLabel != null) return                 // inject once
-        val bar = pv.findViewById<LinearLayout>(androidx.media3.ui.R.id.exo_basic_controls) ?: return
-        val inflater = LayoutInflater.from(pv.context)
-
-        fun syncButton(iconRes: Int, desc: String, onClick: () -> Unit): ImageButton =
-            (inflater.inflate(R.layout.vidapi_sub_sync_button, bar, false) as ImageButton).apply {
-                setImageResource(iconRes)
-                contentDescription = desc
-                setOnClickListener { onClick() }
-            }
-
-        val cc = syncButton(R.drawable.ic_sub_cc, "Toggle captions") { onCcClicked() }
-        val earlier = syncButton(R.drawable.ic_sub_earlier, "Subtitles earlier") { nudgeOffset(-250) }
-        val label = (inflater.inflate(R.layout.vidapi_sub_offset_label, bar, false) as TextView).apply {
-            text = fmtTiming()
-        }
-        val later = syncButton(R.drawable.ic_sub_later, "Subtitles later") { nudgeOffset(+250) }
-        val reset = syncButton(R.drawable.ic_sub_reset, "Reset subtitle timing") { resetOffset() }
-
-        ccButton = cc
-        subOffsetLabel = label
-        updateCcButtonState()
-
-        // Four controls, and every one of them does something the viewer can
-        // state without jargon: show captions, earlier, later, start over. Rate
-        // correction is deliberately absent — it is measured, not operated.
-        listOf(cc, earlier, label, later, reset)
-            .forEachIndexed { i, v -> bar.addView(v, i) }
-        Log.d(TAG, "subs: injected caption + timing controls into control bar")
-    }
-
-    private fun nudgeOffset(deltaMs: Int) {
-        subtitleOffsetMs = (subtitleOffsetMs + deltaMs).coerceIn(-60_000L, 60_000L)
-        subOffsetLabel?.text = fmtTiming()
-        persistTiming()
-        // Nudging the timing implies wanting captions visible — but only while
-        // one is still selected. After an explicit turn-off there is nothing to
-        // re-enable, and resurrecting it there would undo the user's choice.
-        if (captionsLoaded && !captionsOn && activeSubtitleIndex >= 0) {
-            captionsOn = true; updateCcButtonState()
-        }
-        renderActiveCues()                                 // instant, no reload
-        armSyncSettle()                                    // learn from this nudge
-        Log.d(TAG, "subs: timing offset → ${subtitleOffsetMs}ms")
-    }
-
-    /**
-     * Wait for the nudging to stop, then record where they stopped.
-     *
-     * Restarted on every press, so a run of presses collapses into the single
-     * value they landed on. Cancelled outright when captions are off, because an
-     * offset nobody can see is not an observation of anything.
-     */
-    private fun armSyncSettle() {
-        syncSettleJob?.cancel()
-        if (!captionsOn || !captionsLoaded) return
-        syncSettleJob = lifecycleScope.launch {
-            delay(SYNC_SETTLE_MS)
-            player?.currentPosition?.let { recordSyncPoint(it, subtitleOffsetMs) }
-        }
-    }
-
-    /**
-     * The whole drift feature, with no UI attached.
-     *
-     * A viewer fixing a subtitle tells us, without meaning to, exactly what is
-     * wrong with it. Each time they settle on an offset they are asserting "at
-     * THIS moment, the right shift is THIS much". One such assertion is a
-     * constant offset and we already honour it. Two of them, far enough apart,
-     * are a LINE — and the slope of that line is the timing error we could not
-     * otherwise see.
-     *
-     *     needed offset at p   o(p) = p·(1 − 1/rate) + delta/rate
-     *     slope                m    = (o₂ − o₁) / (p₂ − p₁) = 1 − 1/rate
-     *     so                   rate = 1 / (1 − m)
-     *     and                  delta = rate·(o₁ − p₁·m)
-     *
-     * Both fall out exactly; nothing is guessed and no preset is involved. Note
-     * it does NOT need them to have fully corrected the drift either time — only
-     * to have stopped somewhere they were happy with, twice.
-     */
-    private fun recordSyncPoint(positionMs: Long, offsetMs: Long) {
-        val point = SyncPoint(positionMs, offsetMs)
-        val prev = lastSyncPoint
-        val span = positionMs - (prev?.positionMs ?: 0L)
-
-        // Too close together, or they seeked backwards: this is the new anchor
-        // rather than the far end of a measurement.
-        if (prev == null || span < SYNC_MIN_SPAN_MS) {
-            lastSyncPoint = point
-            Log.d(TAG, "subs: sync anchor at ${positionMs}ms offset=${offsetMs}ms")
-            return
-        }
-
-        // Under the noise floor: they settled on effectively the same answer
-        // twice, which means the subtitle is NOT drifting. Leave it alone.
-        if (abs(offsetMs - prev.offsetMs) < SYNC_MIN_OFFSET_DELTA_MS) {
-            lastSyncPoint = point
-            return
-        }
-
-        val m = (offsetMs - prev.offsetMs).toDouble() / span.toDouble()
-        val rate = 1.0 / (1.0 - m)
-        if (rate.isNaN() || rate !in SYNC_RATE_MIN..SYNC_RATE_MAX) {
-            // Not a rate error — more likely they simply wanted it shifted twice.
-            // Keep the newer point; the next one may still form a sane pair.
-            lastSyncPoint = point
-            Log.d(TAG, "subs: sync pair implied rate ${"%.4f".format(rate)} — out of band, ignored")
-            return
-        }
-
-        subtitleRate = rate
-        subtitleOffsetMs = (rate * (prev.offsetMs - prev.positionMs * m))
-            .toLong().coerceIn(-60_000L, 60_000L)
-        lastSyncPoint = null                               // measured; start over
-        subOffsetLabel?.text = fmtTiming()
-        persistTiming()
-        renderActiveCues()
-
-        // The one sentence the viewer ever sees about any of this. It names no
-        // mechanism — but it DOES name the way out, because something that
-        // changes your subtitles on its own has to be undoable by someone who
-        // never asked for it and does not know what it did.
-        showToast("This subtitle drifts — corrected for the rest of the film. " +
-                "Reset undoes it.")
-        Log.d(TAG, "subs: measured drift from 2 sync points — " +
-                "rate=${"%.5f".format(rate)} offset=${subtitleOffsetMs}ms " +
-                "(p1=${prev.positionMs} o1=${prev.offsetMs}, p2=$positionMs o2=$offsetMs)")
-    }
-
-    /** Start over — including anything measured, and the measurement in progress. */
-    private fun resetOffset() {
-        subtitleOffsetMs = 0
-        subtitleRate = 1.0
-        lastSyncPoint = null
-        syncSettleJob?.cancel()
-        subOffsetLabel?.text = fmtTiming()
-        persistTiming()
-        renderActiveCues()
-        Log.d(TAG, "subs: timing reset — offset 0, rate 1.0, sync points cleared")
-    }
-
-    /** Offset and rate travel together: a title is synced once, both parts of it. */
-    private fun persistTiming() {
-        if (tmdbId <= 0) return
-        subPrefs.edit()
-            .putLong(tmdbId.toString(), subtitleOffsetMs)   // key unchanged: saved offsets survive
-            .putFloat("${tmdbId}_ratef", subtitleRate.toFloat())
-            .remove("${tmdbId}_rate")                      // the old preset index, now meaningless
-            .apply()
-    }
-
-    private fun updateCcButtonState() { ccButton?.alpha = if (captionsOn) 1f else 0.45f }
-
-    private fun fmtOffset(ms: Long): String = String.format(Locale.US, "%+.2fs", ms / 1000.0)
-
-    /**
-     * The control-bar read-out. Just the offset — the rate is deliberately NOT
-     * shown. "×1.043" is a number nobody can act on, and putting it here would
-     * re-introduce the mechanism this design exists to hide.
-     */
-    private fun fmtTiming(): String = fmtOffset(subtitleOffsetMs)
-
-    /** Parse our WEBVTT (always HH:MM:SS.mmm from HlsSubtitles) into timed cues. */
-    private fun parseVtt(path: String): List<TimedCue> {
-        val text = File(path).readText(Charsets.UTF_8).replace("\r\n", "\n").replace("\r", "\n")
-        val tsRe = Regex("(\\d{2}):(\\d{2}):(\\d{2})\\.(\\d{3})\\s*-->\\s*(\\d{2}):(\\d{2}):(\\d{2})\\.(\\d{3})")
-        val out = ArrayList<TimedCue>()
-        for (block in text.split("\n\n")) {
-            val lines = block.trim().split("\n")
-            if (lines.isEmpty()) continue
-            var idx = -1
-            var m: MatchResult? = null
-            for ((i, l) in lines.withIndex()) {
-                val mm = tsRe.find(l)
-                if (mm != null) { idx = i; m = mm; break }
-            }
-            val g = m?.groupValues ?: continue
-            val start = ((g[1].toLong() * 60 + g[2].toLong()) * 60 + g[3].toLong()) * 1000 + g[4].toLong()
-            val end   = ((g[5].toLong() * 60 + g[6].toLong()) * 60 + g[7].toLong()) * 1000 + g[8].toLong()
-            val cueText = lines.drop(idx + 1).joinToString("\n").trim()
-            if (cueText.isEmpty()) continue
-            out.add(TimedCue(start, end, Cue.Builder().setText(cueText).build()))
-        }
-        return out
-    }
-
-    private fun showToast(msg: String) {
-        toastText = msg
-        toastJob?.cancel()
-        toastJob = lifecycleScope.launch { delay(5_000); toastText = null }
-    }
 
     /**
      * Fall back to the backend relay, once.
@@ -1788,6 +1394,18 @@ class HlsPlayerActivity : ComponentActivity() {
             if (directStartedAtMs > 0L)
                 (android.os.SystemClock.elapsedRealtime() - directStartedAtMs).toInt()
             else -1
+
+        // The relay is for a blocked transport, not a dead origin -- the whole
+        // reasoning, and why this is not `>= 400`, lives in relayCanHelp.
+        //
+        // Returning false is not giving up: both callers fall through to
+        // re-extraction, and from there to the source failover.
+        val answered = httpStatus ?: transport?.httpStatus ?: -1
+        if (!relayCanHelp(answered)) {
+            Log.e(TAG, "🔀 relay skipped for $why: origin answered $answered " +
+                    "— a relay asks the same origin. Re-extracting instead.")
+            return false
+        }
 
         usingRelay = true
         // Remember the position BEFORE the teardown so recovery resumes.
@@ -1851,7 +1469,9 @@ class HlsPlayerActivity : ComponentActivity() {
 
     /** Fire the headless extractor again for the same embed URL. Result handled above. */
     private fun relaunchExtraction() {
-        val embed = embedUrl ?: run { finish(); return }
+        // Same reasoning as the tmdb guard in reextractViaBackend: no embed url
+        // means this source cannot be retried, which the chain should hear about.
+        val embed = embedUrl ?: run { abandonSourceWithNotice(); return }
         // Remember where we were BEFORE tearing the player down, so a recovery
         // resumes the episode instead of restarting it.
         captureResumeState()
@@ -1888,8 +1508,10 @@ class HlsPlayerActivity : ComponentActivity() {
     private fun reextractViaBackend() {
         val tmdb = intent.getIntExtra("TMDB_ID", 0)
         if (tmdb <= 0) {
-            Log.e(TAG, "no TMDB_ID — cannot re-extract via backend; finishing")
-            finish(); return
+            // Unable to ASK is still this source failing for the viewer. Reporting
+            // costs nothing and gives the chain a turn.
+            Log.e(TAG, "no TMDB_ID — cannot re-extract via backend; giving up this source")
+            abandonSourceWithNotice(); return
         }
         val type    = intent.getStringExtra("MEDIA_TYPE") ?: "movie"
         val season  = intent.getIntExtra("SEASON_NUMBER", 0).takeIf { it > 0 }
@@ -1919,8 +1541,14 @@ class HlsPlayerActivity : ComponentActivity() {
             }.getOrNull()?.takeIf { it.isSuccessful }?.body()
 
             if (body == null || body.m3u8.isBlank()) {
-                Log.e(TAG, "❌ backend re-extraction failed — finishing")
-                finish(); return@launch
+                // THE SOURCE IS OUT OF ANSWERS, so say so and let the chain move
+                // on. MEASURED 2026-10-10, South Park s15e4 on VidNest: a segment
+                // answered 502, the relay was correctly skipped (502 is the origin
+                // broken, not the transport blocked), the re-extraction came back
+                // empty -- and the player closed in silence. No notice, no
+                // failover, and MoviesAPI had the episode the whole time.
+                Log.e(TAG, "❌ backend re-extraction failed — giving up this source")
+                abandonSourceWithNotice(); return@launch
             }
 
             // SAME URL BACK = the source has no working link, not a bad draw.
@@ -1944,13 +1572,31 @@ class HlsPlayerActivity : ComponentActivity() {
             ) {
                 failedStreamUrls += body.m3u8
                 recoveryLog("re-extracted URL does not answer — not handing it to the player")
-                if (extractRetries < MAX_EXTRACT_RETRIES) {
-                    // Still a pool to draw from: go straight to the next attempt
-                    // rather than waiting for ExoPlayer to time out on a known-dead
-                    // link. This is what keeps the pool-redraw behaviour intact.
+                // ── ONE REDRAW, NOT FOUR ─────────────────────────────────────
+                //
+                // Each attempt here is refresh=1, which is a real headless
+                // browser run on the server, so this loop is the most expensive
+                // thing the player can do -- and it is paid again for every
+                // source in the failover chain.
+                //
+                // MEASURED 2026-10-09, Carrie s1e1: the origin behind VidNest was
+                // down (Cloudflare 522) and every draw produced a DIFFERENT proxy
+                // host -- red-brook, divine-block, nameless-king, wispy-bread --
+                // all of them 404, because a new front door onto a dead building
+                // is still a dead building. Four draws, 13-27s each, ~55s to
+                // conclude what the first redraw had already shown, times four
+                // sources: about four minutes of spinner.
+                //
+                // ONE redraw still separates a bad draw from a dead source, which
+                // is the only thing this loop can actually establish. Past that,
+                // the useful move is the NEXT SOURCE, and abandonSourceWithNotice
+                // is what asks for it.
+                if (deadRedraws < MAX_DEAD_REDRAWS && extractRetries < MAX_EXTRACT_RETRIES) {
+                    deadRedraws++
                     extractRetries++
                     reextractViaBackend()
                 } else {
+                    recoveryLog("a redraw also served nothing — this source is down, moving on")
                     abandonSourceWithNotice()
                 }
                 return@launch
@@ -1989,11 +1635,22 @@ class HlsPlayerActivity : ComponentActivity() {
     // on every site's player.
     @SuppressLint("RestrictedApi")
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        // The subtitle picker is a modal: while it's up every key belongs to it.
-        // Without this the activity would keep stealing centre (play/pause) and
-        // the channel keys (seek) before Compose ever saw them, so rows could be
+        // THE SUBTITLE UI IS MODAL: while any of it is up, every key belongs to
+        // it. Without this the activity keeps stealing centre (play/pause) and
+        // the channel keys (seek) before Compose ever sees them, so rows could be
         // moved between but never actually selected.
-        if (pickerOpen) return super.dispatchKeyEvent(event)
+        //
+        // The timing screen is why this now lists three flags instead of one.
+        // Left and right are its only controls, and the line further down this
+        // method hands every direction key to raiseControllerOnDirectionKey,
+        // which consumes it to raise the control bar. The nudges never arrived.
+        if (pickerOpen || subMenuOpen || fixSeqOpen || styleOpen) {
+            return super.dispatchKeyEvent(event)
+        }
+        // BEFORE the centre handling below, which toggles play/pause and never
+        // lets the key reach Compose -- so the hint has to be answered here or
+        // it could not be pressed at all.
+        if (handleSyncHintKey(event)) return true
 
         val p = player
         if (p != null) {
@@ -2058,6 +1715,18 @@ class HlsPlayerActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+
+        // The decoder was taken while we were away — ask for one now that being
+        // in front makes that a reasonable request. Gated on a flag only the
+        // reclaim path sets, so an ordinary resume still takes exactly the one
+        // line below and nothing else.
+        if (codecReclaimPending) {
+            codecReclaimPending = false
+            Log.e(TAG, "🎛 back in front after a reclaim — rebuilding at ${resumePositionMs}ms")
+            startPlayback(currentM3u8)
+            return
+        }
+
         // Only resume what WE paused. A film the user stopped stays stopped.
         if (wasPlayingBeforePause) player?.play()
     }
@@ -2081,8 +1750,7 @@ class HlsPlayerActivity : ComponentActivity() {
         recoveryWatchdogJob?.cancel()
         progressiveRefreshJob?.cancel()
         stallWatchdogJob?.cancel()
-        toastJob?.cancel()
-        captionTickerJob?.cancel()
+        releaseSubtitleUi()
         playerView?.player = null
         playerView = null
         player?.run { playWhenReady = false; stop(); clearMediaItems(); release() }
@@ -2091,6 +1759,25 @@ class HlsPlayerActivity : ComponentActivity() {
     }
 
     companion object {
+        /**
+         * "The source failed, try another." RESULT_FIRST_USER so it cannot be
+         * confused with RESULT_OK or the RESULT_CANCELED that an ordinary BACK
+         * press produces — backing out of a working stream must never look
+         * like a dead source.
+         */
+        const val RESULT_SOURCE_FAILED = android.app.Activity.RESULT_FIRST_USER
+        const val EXTRA_FAILED_SOURCE = "FAILED_SOURCE"
+
+        /**
+         * Where the dead source was, in ms, sent back with RESULT_SOURCE_FAILED,
+         * and the same position handed to the next source's player as
+         * [EXTRA_START_AT_MS]. A failover carries on; it does not start over.
+         * MEASURED 2026-10-19, In the Beginning: VidNest died at 1:30, the chain
+         * reached MoviesAPI, and MoviesAPI began the film again at 0:00.
+         */
+        const val EXTRA_FAILED_AT_MS = "FAILED_AT_MS"
+        const val EXTRA_START_AT_MS = "START_AT_MS"
+
         /**
          * How many times to re-draw a segment CDN before giving up.
          *
@@ -2106,6 +1793,16 @@ class HlsPlayerActivity : ComponentActivity() {
          * cost of an extra attempt is one ~2s extraction (deduplicated server-side).
          */
         private const val MAX_EXTRACT_RETRIES = 4
+
+        /**
+         * How many redraws to spend once a probe has proved the url serves
+         * nothing. See the call site for the measurement behind the number.
+         *
+         * Deliberately not MAX_EXTRACT_RETRIES: that budget exists for stale
+         * tokens, where another draw genuinely tends to work. A probe failure is
+         * a different signal and a far more expensive one to re-ask.
+         */
+        private const val MAX_DEAD_REDRAWS = 1
         /** How many times a 429 is waited out before the source is abandoned. */
         private const val MAX_RATE_LIMIT_RETRIES = 3
         /** First back-off; doubles each attempt (4s, 8s, 16s = 28s total).

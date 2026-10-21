@@ -27,6 +27,7 @@ import androidx.compose.animation.core.FastOutLinearInEasing
 import androidx.compose.animation.core.Easing
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
@@ -47,6 +48,7 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.draw.drawBehind
@@ -148,37 +150,6 @@ data class ProfileButtonAnimationConfig(
 //  1.  ProfilePictureButton
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * A focusable, pressable profile-avatar button.
- *
- * [avatarRes] is fully modular — pass any of your 30 bundled avatar drawables.
- *
- * @param avatarRes      Drawable resource ID for the avatar image.
- * @param focusRequester FocusRequester managed by the caller for D-pad routing.
- * @param onClick        Invoked on centre/enter key press or tap.
- * @param modifier       Positional modifier from the screen (offset, etc.).
- * @param dimensions     Size, plinth, and colour config.
- * @param animConfig     Press animation config.
- */
-@Composable
-fun ProfilePictureButton(
-    avatarRes: Int,
-    focusRequester: FocusRequester,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-    dimensions: ProfileButtonDimensions = ProfileButtonDimensions(),
-    animConfig: ProfileButtonAnimationConfig = ProfileButtonAnimationConfig(),
-) {
-    ProfileButtonBase(
-        topImageRes    = avatarRes,
-        focusRequester = focusRequester,
-        onClick        = onClick,
-        modifier       = modifier,
-        dimensions     = dimensions,
-        animConfig     = animConfig,
-        glowConfig     = null,
-    )
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  2.  CreateProfileButton
@@ -473,22 +444,48 @@ data class AvatarGlowConfig(
     val cornerRadius: Dp = 0.dp,
 )
 
+/** Focus scale on an avatar, matching PROFILE_FOCUS_SCALE on the profile picker. */
+private const val AVATAR_FOCUS_SCALE = 1.06f
+
+// ProfileCard uses 0.7f. These tiles are half a profile card's size, so
+// the same veil reads much heavier on them -- at 0.7f the artwork went muddy and
+// the colours stopped telling the avatars apart. Lightened until the unfocused
+// row is still clearly subordinate to the focused one but still legible.
+// Lifted twice, a tenth each time: 0.5 -> 0.45 -> 0.395, so 60.5% of the artwork
+// comes through where 50% did. Past about 0.35 the unfocused row stops reading as
+// subordinate to the focused avatar at all, which is the point of the tint.
+private const val AVATAR_UNFOCUSED_TINT = 0.395f
+
 /**
- * A focusable avatar image for the profile creation picker.
+ * A focusable avatar image for the profile creation and profile management
+ * pickers.
  *
- * Selection states:
- *   isSelected=true, isAnySelected=true  → 80% opacity + checkmark overlay
- *   isSelected=false, isAnySelected=true → 40% opacity, no checkmark
- *   isAnySelected=false                  → full opacity (nothing selected yet)
+ * The focus treatment is a port of ProfileCard on the profile picker screen, so
+ * the two controls read as the same thing:
+ *
+ *   focused   -> avatar at full brightness, no border, glow visible, scaled 1.06
+ *   unfocused -> black tint at 50%, thin border, no glow, unscaled
+ *
+ * The avatar image itself is NEVER made translucent. A translucent avatar lets
+ * the glow behind it show through the picture, and that bleed-through is what
+ * made the focused avatar look hazy. The dimming is a tint layer drawn ON TOP
+ * of the image, where the glow cannot reach it.
+ *
+ * Selection is independent of focus and is shown by the checkmark alone -- the
+ * selected avatar is not held at its own brightness, because brightness is what
+ * tells you where the focus is.
  *
  * @param avatarRes      Drawable resource ID for the avatar image.
  * @param focusRequester FocusRequester managed by the caller for D-pad routing.
  * @param onClick        Invoked on centre/enter key press or tap.
  * @param modifier       Positional modifier from the screen (offset, etc.).
- * @param imageConfig    Avatar image size, position, corner radius, and stroke.
- * @param glowConfig     Glow image size and position — shown only when focused.
+ * @param imageConfig    Avatar image size, position, corner radius, and border.
+ * @param glowConfig     Glow image size and position -- shown only when focused.
  * @param isSelected     True when this avatar is the currently selected one.
- * @param isAnySelected  True when any avatar in the row has been selected.
+ * @param onFocusGained  Fired only on a focus GAIN -- never on a loss, and never
+ *                       on a recomposition reporting the state it already had.
+ *                       The caller uses it for the profile-swap sound, exactly
+ *                       as ProfileCard does on the picker.
  */
 @Composable
 fun AvatarPickerButton(
@@ -499,57 +496,77 @@ fun AvatarPickerButton(
     imageConfig: AvatarImageConfig = AvatarImageConfig(),
     glowConfig: AvatarGlowConfig   = AvatarGlowConfig(),
     isSelected: Boolean            = false,
-    isAnySelected: Boolean         = false,
+    onFocusGained: () -> Unit      = {},
 ) {
     var isFocused by remember { mutableStateOf(false) }
     val interactionSource = remember { MutableInteractionSource() }
     val currentOnClick by rememberUpdatedState(onClick)
+    val currentOnFocusGained by rememberUpdatedState(onFocusGained)
 
-    // Opacity rules:
-    //   selected            → 0.80f
-    //   not selected + any  → 0.40f
-    //   nothing selected    → 1.00f
-    val imageAlpha = when {
-        isSelected              -> 0.80f
-        isAnySelected           -> 0.40f
-        else                    -> 1.00f
-    }
+    // Every timing and magnitude below is ProfileCard's, not a new one.
+    val glowAlpha by animateFloatAsState(
+        targetValue   = if (isFocused) 1f else 0f,
+        animationSpec = tween(durationMillis = if (isFocused) 150 else 100),
+        label         = "avatarPickerGlow",
+    )
 
-    // Outer Box: unconstrained so the glow can overflow freely without
-    // pushing the image around — same pattern as CreateProfileButton.
-    Box(modifier = modifier) {
+    val scale by animateFloatAsState(
+        targetValue   = if (isFocused) AVATAR_FOCUS_SCALE else 1f,
+        animationSpec = tween(durationMillis = 200),
+        label         = "avatarPickerScale",
+    )
 
-        // ── Layer 1: Glow — behind everything, only while focused ─────────────
-        if (isFocused) {
-            Box(
-                modifier = Modifier
-                    .offset(x = glowConfig.offsetX, y = glowConfig.offsetY)
-                    .wrapContentSize(align = Alignment.TopStart, unbounded = true),
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(width = glowConfig.width, height = glowConfig.height)
-                        .clip(RoundedCornerShape(glowConfig.cornerRadius)),
-                ) {
-                    Image(
-                        painter            = painterResource(id = R.drawable.avatar_button_glow),
-                        contentDescription = null,
-                        contentScale       = ContentScale.FillBounds,
-                        modifier           = Modifier.matchParentSize(),
-                    )
-                }
-            }
-        }
+    val tintAlpha by animateFloatAsState(
+        targetValue   = if (isFocused) 0f else AVATAR_UNFOCUSED_TINT,
+        animationSpec = tween(durationMillis = 200),
+        label         = "avatarPickerTint",
+    )
 
-        // ── Layer 2: Outer interaction Box (handles focus, clicks, stroke) ──────
-        // graphicsLayer alpha is NOT applied here — we apply opacity individually
-        // to the image and stroke so the checkmark stays at full opacity.
+    // Sized to the avatar so the grid spacing stays put, but unbounded so the
+    // larger glow can overflow without pushing anything around.
+    Box(
+        modifier = modifier
+            .size(width = imageConfig.width, height = imageConfig.height)
+            .wrapContentSize(align = Alignment.TopStart, unbounded = true),
+    ) {
+        // -- Layer 1: Glow -- behind the avatar, fades with focus -------------
+        Image(
+            painter            = painterResource(id = R.drawable.avatar_button_glow),
+            contentDescription = null,
+            contentScale       = ContentScale.FillBounds,
+            modifier           = Modifier
+                .size(width = glowConfig.width, height = glowConfig.height)
+                .offset(x = glowConfig.offsetX, y = glowConfig.offsetY)
+                .alpha(glowAlpha),
+        )
+
+        // -- Layer 2: Avatar -- focus target, border, tint, checkmark ---------
         Box(
             modifier = Modifier
                 .size(width = imageConfig.width, height = imageConfig.height)
                 .offset(x = imageConfig.offsetX, y = imageConfig.offsetY)
+                .graphicsLayer {
+                    scaleX = scale
+                    scaleY = scale
+                }
+                .then(
+                    if (!isFocused) Modifier.border(
+                        width = imageConfig.strokeWidth,
+                        color = imageConfig.strokeColor,
+                        shape = RoundedCornerShape(imageConfig.cornerRadius),
+                    ) else Modifier
+                )
+                .clip(RoundedCornerShape(imageConfig.cornerRadius))
                 .focusRequester(focusRequester)
-                .onFocusChanged { isFocused = it.isFocused }
+                .onFocusChanged {
+                    // Compare BEFORE assigning: onFocusChanged also fires on
+                    // recompositions carrying the state it already had, and a
+                    // bare "if (it.isFocused) play()" would re-fire the sound
+                    // while the avatar simply sat there.
+                    val gained = it.isFocused && !isFocused
+                    isFocused = it.isFocused
+                    if (gained) currentOnFocusGained()
+                }
                 .focusable(interactionSource = interactionSource)
                 .onKeyEvent { event ->
                     if (event.type == KeyEventType.KeyDown &&
@@ -570,36 +587,22 @@ fun AvatarPickerButton(
                     currentOnClick()
                 },
         ) {
-            // ── Avatar image — clipped + dimmed based on selection state ─────
+            Image(
+                painter            = painterResource(id = avatarRes),
+                contentDescription = null,
+                contentScale       = ContentScale.Crop,
+                modifier           = Modifier.matchParentSize(),
+            )
+
+            // Tint sits ON TOP of the picture, so the glow behind cannot bleed
+            // through it. This is the whole reason the avatar is never alpha'd.
             Box(
                 modifier = Modifier
                     .matchParentSize()
-                    .clip(RoundedCornerShape(imageConfig.cornerRadius))
-                    .graphicsLayer { alpha = imageAlpha },
-            ) {
-                Image(
-                    painter            = painterResource(id = avatarRes),
-                    contentDescription = null,
-                    contentScale       = ContentScale.Crop,
-                    modifier           = Modifier.matchParentSize(),
-                )
-            }
+                    .background(Color(0xFF000000).copy(alpha = tintAlpha)),
+            )
 
-            // ── Stroke border — same opacity as the image, hidden while focused
-            if (!isFocused) {
-                Box(
-                    modifier = Modifier
-                        .matchParentSize()
-                        .graphicsLayer { alpha = imageAlpha }
-                        .border(
-                            width = imageConfig.strokeWidth,
-                            color = imageConfig.strokeColor,
-                            shape = RoundedCornerShape(imageConfig.cornerRadius),
-                        ),
-                )
-            }
-
-            // ── Checkmark — full opacity, centred over the selected avatar ────
+            // -- Checkmark -- full opacity, above the tint --------------------
             if (isSelected) {
                 Image(
                     painter            = painterResource(id = R.drawable.check_mark),
