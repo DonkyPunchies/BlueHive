@@ -135,7 +135,7 @@ object IdleWatcher {
      * Still comfortably clear of IDLE_RELEASE_MS, so the two never interact, and
      * still long enough never to fire on someone who stepped out for dinner.
      */
-    private const val CLOSE_AFTER_IDLE_MS = 35L * 60 * 1000 // TEMP-TEST v339
+    private const val CLOSE_AFTER_IDLE_MS = 4L * 60 * 60 * 1000
 
     // THE "STILL WATCHING?" PROMPT WAS REMOVED 2026-09-11, and what it covered is
     // worth recording because most of it is now covered elsewhere.
@@ -173,7 +173,7 @@ object IdleWatcher {
      * and "never ran" looked identical. One line every few minutes names which
      * gate held -- signed out, exited, something playing, or input resetting it.
      */
-    private const val DIAG_EVERY_MS = 60L * 1000 // TEMP-TEST v339
+    private const val DIAG_EVERY_MS = 5L * 60 * 1000
 
     // ── Playback sources ──────────────────────────────────────────────────────
     //
