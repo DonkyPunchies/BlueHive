@@ -45,6 +45,7 @@ import com.example.bluehive.homeScreenSectionRules.CAROUSEL_NAVIGATION_RATE_MS
 import com.example.bluehive.homeScreenSectionRules.CAROUSEL_PRELOAD_RADIUS
 import com.example.bluehive.homeScreenSectionRules.LocalCarouselCycleTick
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.key
 
 
 @Composable
@@ -54,6 +55,8 @@ fun HomeScreenTrailerNavigationCompose(
     isTrailerPlaying: Boolean,
     modifier: Modifier = Modifier,
     isPaused: Boolean = false,
+    // The panel is entered (even while its trailer plays): titles sit top-right.
+    raisedCaption: Boolean = false,
     onTrailerClick: (LatestTrailer) -> Unit = {}
 ) {
     val context = LocalContext.current
@@ -139,6 +142,19 @@ fun HomeScreenTrailerNavigationCompose(
 
     LaunchedEffect(trailers, currentIndex) {
         if (trailers.isEmpty()) return@LaunchedEffect
+
+        // FINISH AN INTERRUPTED SLIDE FIRST. A press (or tick) that lands while a
+        // slide is still running restarts this effect, cancelling it inside
+        // animateTo -- so the two lines that commit it at the bottom never ran.
+        // The next run then found currentIndex == shownIndex (RIGHT then LEFT,
+        // 150-250 ms apart), returned, and left the panel frozen half-way with
+        // two titles side by side and the halves swapped. Snapping the old slide
+        // home before deciding what to do next makes every press start clean.
+        incomingIndex?.let { interrupted ->
+            shownIndex = interrupted
+            incomingIndex = null
+            slideProgress.snapTo(1f)
+        }
 
         // First-time sync
         if (shownIndex == currentIndex && incomingIndex == null) return@LaunchedEffect
@@ -254,30 +270,37 @@ fun HomeScreenTrailerNavigationCompose(
         val cardWidthPx = with(density) { 325.19415283203125.dp.toPx() }
 
         val inc = incomingIndex
-        val p = slideProgress.value
+        val shown = shownIndex
+        val dir = slideDir
 
+        // ONE CALL SITE, KEYED BY INDEX, for the resting card and both sliding
+        // cards. Separate call sites made every slide start and end dispose one
+        // card and build a fresh one; the fresh card's caption measured its
+        // badges as 0 dp for a frame (long titles flashed full-width, over the
+        // badges when raised) and lost any glide still in flight. Keyed, the
+        // card that finishes a slide is the same instance that will rest.
+        //
+        // The slide offset is read inside graphicsLayer, at draw time, so the
+        // running animation moves the cards without recomposing them.
         if (trailers.isNotEmpty()) {
-            if (inc == null) {
-                // Idle: show current
-                HomeScreenTrailerAdapterCompose(
-                    trailer = trailers[shownIndex],
-                    index = shownIndex,
-                    total = trailers.size
-                )
-            } else {
-
-                Box(modifier = Modifier.graphicsLayer { translationX = (-slideDir * (p * cardWidthPx)) }) {
-                    HomeScreenTrailerAdapterCompose(trailer = trailers[shownIndex],
-                        index = shownIndex,
-                        total = trailers.size
-                    )
-                }
-
-                Box(modifier = Modifier.graphicsLayer { translationX = (slideDir * ((1f - p) * cardWidthPx)) }) {
-                    HomeScreenTrailerAdapterCompose(trailer = trailers[inc],
-                        index = inc,
-                        total = trailers.size
-                    )
+            val slots = if (inc == null) listOf(shown) else listOf(shown, inc)
+            for (i in slots) {
+                if (i in trailers.indices) key(i) {
+                    Box(modifier = Modifier.graphicsLayer {
+                        val p = slideProgress.value
+                        translationX = when {
+                            inc == null -> 0f
+                            i == shown  -> -dir * (p * cardWidthPx)
+                            else        ->  dir * ((1f - p) * cardWidthPx)
+                        }
+                    }) {
+                        HomeScreenTrailerAdapterCompose(
+                            trailer = trailers[i],
+                            index = i,
+                            total = trailers.size,
+                            raised = raisedCaption
+                        )
+                    }
                 }
             }
         }

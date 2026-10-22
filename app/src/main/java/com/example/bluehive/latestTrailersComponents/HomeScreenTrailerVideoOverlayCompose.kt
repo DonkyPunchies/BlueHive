@@ -14,6 +14,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -27,7 +28,11 @@ import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
@@ -55,6 +60,15 @@ fun HomeScreenTrailerVideoOverlayCompose(
     youtubeUrl: String,
     visible: Boolean,
     modifier: Modifier = Modifier,
+    // Told after every Click, with whether the trailer is now playing, so the
+    // panel can re-show its "Click to pause / to play" hint with the right word.
+    onPlayPauseToggled: (Boolean) -> Unit = {},
+    // Told when the first picture is on screen, or that none is coming. The
+    // panel holds its hint while "Loading trailer..." shows and only starts the
+    // fade from here -- timed from the click, it was gone before the trailer
+    // ever appeared (measured on the onn box, 2026-10-22).
+    onStarted: () -> Unit = {},
+    onFailed: () -> Unit = {},
     onClose: () -> Unit
 ) {
     if (!visible) return
@@ -99,6 +113,44 @@ fun HomeScreenTrailerVideoOverlayCompose(
         }
     }
 
+    val startedCallback = rememberUpdatedState(onStarted)
+    val failedCallback  = rememberUpdatedState(onFailed)
+    val toggledCallback = rememberUpdatedState(onPlayPauseToggled)
+    DisposableEffect(player) {
+        val listener = object : Player.Listener {
+            override fun onRenderedFirstFrame() { startedCallback.value() }
+
+            // ERRORS AFTER prepare() ARRIVE HERE, NOT IN THE try/catch BELOW,
+            // which only sees what throws synchronously. A stream that resolves
+            // and is then refused (a 403 from the video host, a decoder that
+            // gives up) used to leave a black picture with no message, and the
+            // panel's hint held "Click to pause" over it forever.
+            override fun onPlayerError(error: PlaybackException) {
+                Log.e(TAG, "Playback error after start: ${error.errorCodeName}", error)
+                uiState = PlaybackUiState.Error("Trailer failed to play")
+                failedCallback.value()
+            }
+        }
+        player.addListener(listener)
+        onDispose { player.removeListener(listener) }
+    }
+
+    // PAUSE WHEN THE APP GOES TO THE BACKGROUND. Nothing did, and ExoPlayer here
+    // takes no audio focus, so pressing Home mid-trailer left its sound playing
+    // behind the launcher. Paused rather than closed, so coming back finds the
+    // trailer where it was, with the panel's "Click to play" hint up.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, player) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP && player.playWhenReady) {
+                player.pause()
+                toggledCallback.value(false)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     BackHandler(enabled = true) { onClose() }
 
     Box(
@@ -113,7 +165,28 @@ fun HomeScreenTrailerVideoOverlayCompose(
                         true
                     }
                     Key.Enter, Key.NumPadEnter, Key.DirectionCenter -> {
-                        if (player.isPlaying) player.pause() else player.play()
+                        // KEY REPEATS ARE IGNORED. Holding Click -- including
+                        // the press that started this trailer, whose repeats
+                        // land here once focus arrives -- flipped play/pause
+                        // every ~50 ms and restarted the panel's hint each time.
+                        if (event.nativeKeyEvent.repeatCount > 0) return@onKeyEvent true
+                        // Nothing to pause in a trailer that failed to load.
+                        if (uiState is PlaybackUiState.Error) return@onKeyEvent true
+                        // A trailer that has run to its end plays again from the
+                        // start; play() alone does nothing once it has ended.
+                        if (player.playbackState == Player.STATE_ENDED) {
+                            player.seekTo(0)
+                            player.play()
+                            onPlayPauseToggled(true)
+                            return@onKeyEvent true
+                        }
+                        // playWhenReady, NOT isPlaying: isPlaying is false while
+                        // the stream resolves or buffers, so a Click then called
+                        // play() -- a no-op -- and the trailer could not be paused
+                        // until its first frame was on screen.
+                        val nowPlaying = !player.playWhenReady
+                        if (nowPlaying) player.play() else player.pause()
+                        onPlayPauseToggled(nowPlaying)
                         true
                     }
                     Key.DirectionLeft,
@@ -164,18 +237,23 @@ fun HomeScreenTrailerVideoOverlayCompose(
         if (streamUrl.isNullOrBlank()) {
             uiState = PlaybackUiState.Error("Trailer failed to load")
             Log.e(TAG, "No playable stream URL resolved for: $youtubeUrl")
+            failedCallback.value()
             return@LaunchedEffect
         }
 
         try {
             player.setMediaItem(MediaItem.fromUri(streamUrl))
+            // NO play() AFTER prepare(). playWhenReady is already true from the
+            // builder, so the trailer starts by itself once ready -- and a Click
+            // that paused it while the link was still resolving stays paused. An
+            // explicit play() here overrode that pause.
             player.prepare()
-            player.play()
             uiState = PlaybackUiState.Playing
             Log.d(TAG, "Playing stream URL: $streamUrl")
         } catch (e: Exception) {
             uiState = PlaybackUiState.Error("Playback error")
             Log.e(TAG, "Playback error: ${e.message}", e)
+            failedCallback.value()
         }
     }
 }

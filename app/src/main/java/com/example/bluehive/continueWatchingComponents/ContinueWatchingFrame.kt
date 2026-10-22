@@ -47,6 +47,11 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.ColorFilter
+import com.example.bluehive.homeScreenSectionRules.PANEL_HINT_GOLD
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -520,6 +525,18 @@ fun HomeScreenContinueWatchingCompose(
     val listWidth   = 183.75.dp
     val listHeight  = 169.dp
 
+    // Gold while inside the list, matching the Latest Trailers and Highest
+    // Trending panels (PanelHints.kt), so all three home panels say "you are
+    // inside me" the same way. The frame art is near-white, so a Modulate tint
+    // IS the colour, and white leaves it untouched. Follows frameState through
+    // the pause/resume demote-and-restore below, so a viewer back from a show
+    // lands in the list with the frame already gold.
+    val frameTint by animateColorAsState(
+        targetValue   = if (frameState is ContinueWatchingFrameState.Selected) PANEL_HINT_GOLD else Color.White,
+        animationSpec = tween(250),
+        label         = "continueWatchingFrameTint"
+    )
+
     Box(
         modifier = Modifier
             // Focus-within the whole component (frame + rows) → drives the state machine.
@@ -548,7 +565,8 @@ fun HomeScreenContinueWatchingCompose(
                 // Visible when Focused OR Selected (per this block's intent) — so the frame
                 // stays highlighted while you're navigating rows inside the list.
                 .graphicsLayer(alpha = if (frameState is ContinueWatchingFrameState.Focused || frameState is ContinueWatchingFrameState.Selected) 1f else 0f),
-            contentScale = ContentScale.FillBounds
+            contentScale = ContentScale.FillBounds,
+            colorFilter = ColorFilter.tint(frameTint, BlendMode.Modulate)
         )
 
         // ✅ SHADOW: visible ONLY when Selected.

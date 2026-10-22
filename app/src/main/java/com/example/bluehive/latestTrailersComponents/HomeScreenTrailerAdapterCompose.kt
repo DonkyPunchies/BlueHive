@@ -6,11 +6,9 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -34,6 +32,13 @@ import com.example.bluehive.homeScreenSectionRules.trailerThumbUrl
 import com.example.bluehive.models.LatestTrailer
 import com.example.bluehive.utilities.AppTypography
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import com.example.bluehive.homeScreenSectionRules.PanelCaption
 
 // Add at file level — zero per-recompose allocation
 private val TRAILER_SCRIM = Brush.verticalGradient(
@@ -61,10 +66,15 @@ fun HomeScreenTrailerAdapterCompose(
     index: Int,
     total: Int,
     modifier: Modifier = Modifier,
+    // The panel is entered: the title moves to the top-right (PanelCaption).
+    raised: Boolean = false,
     titleFont: FontFamily = AppTypography.pattayaRegular,
     metaFont: FontFamily = AppTypography.passionRegular
 ) {
     val context = LocalContext.current
+    val density = LocalDensity.current
+    // How much of the top row the badges take, so the raised title stays clear.
+    var badgesWidth by remember { mutableStateOf(0.dp) }
 
     Box(
         modifier = modifier.fillMaxSize()
@@ -92,38 +102,24 @@ fun HomeScreenTrailerAdapterCompose(
                 .background(TRAILER_SCRIM)
         )
 
-        // Bottom-left text
-        Column(
-            modifier = Modifier
-                .align(Alignment.BottomStart)
-                .padding(start = 8.dp, bottom = 8.dp, end = 8.dp)
-                .widthIn(max = 170.dp)
-        ) {
-            Text(
-                text = trailer.title,
-                color = Color.White,
-                fontFamily = titleFont,
-                fontSize = 13.sp,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-                lineHeight = 13.sp
-            )
-            Text(
-                text = trailer.dataTitle,
-                color = Color(0xFFD0D0D0),
-                fontFamily = metaFont,
-                fontSize = 8.sp,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-                lineHeight = 9.sp
-            )
-        }
+        // Title + subtitle: bottom-left, or top-right while the panel is entered.
+        // Was a bottom-left Column capped at 170 dp that wrapped to two lines;
+        // PanelCaption keeps each to one line and shrinks it to fit instead.
+        PanelCaption(
+            title         = trailer.title,
+            subtitle      = trailer.dataTitle,
+            raised        = raised,
+            reservedStart = badgesWidth,
+            titleFont     = titleFont,
+            metaFont      = metaFont
+        )
 
         // Badges (top-left)
         Row(
             modifier = Modifier
                 .align(Alignment.TopStart)
-                .padding(start = 8.dp, top = 8.dp),
+                .padding(start = 8.dp, top = 8.dp)
+                .onSizeChanged { badgesWidth = with(density) { it.width.toDp() } },
             verticalAlignment = Alignment.CenterVertically
         ) {
             trailer.mediaType?.let { type ->

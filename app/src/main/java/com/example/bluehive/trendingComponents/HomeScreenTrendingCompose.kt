@@ -14,14 +14,12 @@ import androidx.compose.foundation.focusable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -66,6 +64,8 @@ import com.example.bluehive.api.ApiClient
 import com.example.bluehive.api.TrendingItem
 import com.example.bluehive.models.MediaItem
 import com.example.bluehive.utilities.AppTypography
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.rememberCoroutineScope
@@ -79,6 +79,14 @@ import com.example.bluehive.homeScreenSectionRules.CAROUSEL_NAVIGATION_RATE_MS
 import com.example.bluehive.homeScreenSectionRules.CAROUSEL_PRELOAD_RADIUS
 import com.example.bluehive.homeScreenSectionRules.LocalCarouselCycleTick
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.key
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.layout.onSizeChanged
+import com.example.bluehive.homeScreenSectionRules.PANEL_HINT_GOLD
+import com.example.bluehive.homeScreenSectionRules.PanelCaption
+import com.example.bluehive.homeScreenSectionRules.PanelHintLayer
 
 // ─────────────────────────────────────────────────────────────────────────────
 // State
@@ -132,11 +140,16 @@ private fun TrendingItemAdapterCompose(
     // it, which has always read "3/36".
     position: Int = 0,
     total: Int = 0,
+    // The panel is entered: the title moves to the top-right (PanelCaption).
+    raised: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     val context     = LocalContext.current
     val titleFont   = AppTypography.pattayaRegular
     val metaFont    = AppTypography.passionRegular
+    val density     = androidx.compose.ui.platform.LocalDensity.current
+    // How much of the top row the badges take, so the raised title stays clear.
+    var badgesWidth by remember { mutableStateOf(0.dp) }
 
     Box(modifier = modifier.fillMaxSize()) {
 
@@ -164,41 +177,25 @@ private fun TrendingItemAdapterCompose(
                 .background(BACKDROP_SCRIM)
         )
 
-        // Bottom-left: title + release year
-        Column(
-            modifier = Modifier
-                .align(Alignment.BottomStart)
-                .padding(start = 8.dp, bottom = 8.dp, end = 8.dp)
-                .widthIn(max = 200.dp)
-        ) {
-            Text(
-                text = item.title,
-                color = Color.White,
-                fontFamily = titleFont,
-                fontSize = 13.sp,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-                lineHeight = 13.sp
-            )
-
-            val year = item.releaseDate?.take(4)
-            if (!year.isNullOrBlank()) {
-                Text(
-                    text = year,
-                    color = Color(0xFFD0D0D0),
-                    fontFamily = metaFont,
-                    fontSize = 8.sp,
-                    maxLines = 1
-                )
-            }
-        }
+        // Title + release year: bottom-left, or top-right while the panel is
+        // entered. Was a bottom-left Column capped at 200 dp that wrapped to two
+        // lines; PanelCaption keeps each to one line and shrinks it to fit.
+        PanelCaption(
+            title         = item.title,
+            subtitle      = item.releaseDate?.take(4),
+            raised        = raised,
+            reservedStart = badgesWidth,
+            titleFont     = titleFont,
+            metaFont      = metaFont
+        )
 
         // Top-left badges: media type + content rating + rank
         Row(
             modifier = Modifier
                 .align(Alignment.TopStart)
                 // 8dp so the larger badges are not crowded against the frame.
-                .padding(start = 8.dp, top = 8.dp),
+                .padding(start = 8.dp, top = 8.dp)
+                .onSizeChanged { badgesWidth = with(density) { it.width.toDp() } },
             verticalAlignment = Alignment.CenterVertically
         ) {
             TrendingPillBadge(
@@ -228,11 +225,11 @@ private fun TrendingItemAdapterCompose(
             }
         }
 
-        // TOP-RIGHT IS DELIBERATELY EMPTY. The score badge that sat here was
-        // removed on request; the corner is being kept clear for something
-        // else. item.voteAverage is still carried on the model and still
-        // populated from the detail fetch below, so putting a number back here
-        // needs no plumbing -- only a composable.
+        // TOP-RIGHT HAS NO BADGE. The score badge that sat here was removed on
+        // request, and the corner now belongs to the remote hints: "Click to
+        // browse" while the panel is focused, and the raised title while it is
+        // entered (PanelHints.kt). item.voteAverage is still carried on the
+        // model and still populated from the detail fetch below.
     }
 }
 
@@ -379,6 +376,15 @@ private fun TrendingNavigationCompose(
     // Slide animation
     LaunchedEffect(items, currentIndex) {
         if (items.isEmpty()) return@LaunchedEffect
+        // FINISH AN INTERRUPTED SLIDE FIRST -- see the trailer carousel
+        // (HomeScreenTrailerNavigationCompose) for the freeze this prevents: a
+        // press mid-slide cancelled the commit at the bottom of this effect, and
+        // RIGHT-then-LEFT left the panel stuck half-way between two titles.
+        incomingIndex?.let { interrupted ->
+            shownIndex    = interrupted
+            incomingIndex = null
+            slideProgress.snapTo(1f)
+        }
         if (shownIndex == currentIndex && incomingIndex == null) return@LaunchedEffect
         if (incomingIndex == null && shownIndex !in items.indices) {
             shownIndex = currentIndex; return@LaunchedEffect
@@ -459,34 +465,36 @@ private fun TrendingNavigationCompose(
         val density = androidx.compose.ui.platform.LocalDensity.current
         val cardWidthPx = with(density) { TRENDING_VIEWPORT_W.toPx() }
         val inc         = incomingIndex
-        val p           = slideProgress.value
+        val shown       = shownIndex
+        val dir         = slideDir
 
+        // ONE CALL SITE, KEYED BY INDEX, for the resting card and both sliding
+        // cards, as in the trailer carousel: the card that finishes a slide is
+        // the same instance that will rest, so its caption keeps its measured
+        // badge width and any glide in flight instead of starting over.
+        //
+        // graphicsLayer moves the already-drawn bitmap on the RenderThread, and
+        // the slide offset is read INSIDE it, so the running animation costs no
+        // layout pass and no recomposition per frame.
         if (items.isNotEmpty()) {
-            if (inc == null) {
-                TrendingItemAdapterCompose(
-                    item     = items[shownIndex],
-                    position = shownIndex + 1,
-                    total    = items.size,
-                )
-            } else {
-                val outTranslation = -slideDir * (p * cardWidthPx)
-                val inTranslation  =  slideDir * ((1f - p) * cardWidthPx)
-
-                // graphicsLayer moves the already-drawn bitmap on the RenderThread —
-                // no layout pass, no recomposition, no UI-thread involvement per frame.
-                Box(modifier = Modifier.graphicsLayer { translationX = outTranslation }) {
-                    TrendingItemAdapterCompose(
-                        item     = items[shownIndex],
-                        position = shownIndex + 1,
-                        total    = items.size,
-                    )
-                }
-                Box(modifier = Modifier.graphicsLayer { translationX = inTranslation }) {
-                    TrendingItemAdapterCompose(
-                        item     = items[inc],
-                        position = inc + 1,
-                        total    = items.size,
-                    )
+            val slots = if (inc == null) listOf(shown) else listOf(shown, inc)
+            for (i in slots) {
+                if (i in items.indices) key(i) {
+                    Box(modifier = Modifier.graphicsLayer {
+                        val p = slideProgress.value
+                        translationX = when {
+                            inc == null -> 0f
+                            i == shown  -> -dir * (p * cardWidthPx)
+                            else        ->  dir * ((1f - p) * cardWidthPx)
+                        }
+                    }) {
+                        TrendingItemAdapterCompose(
+                            item     = items[i],
+                            position = i + 1,
+                            total    = items.size,
+                            raised   = isInteractive,
+                        )
+                    }
                 }
             }
         }
@@ -562,11 +570,27 @@ fun HomeScreenTrendingCompose(
 
     // Leaving Selected is a back-out, matching the trailer panel: it undoes the
     // press that entered, and the shadow clears with it.
+    // The detail fetch a Click started, until it has opened the title. ONE at a
+    // time: a second Click during the ~1 s fetch used to start a second one and
+    // open the details screen twice. Back cancels it -- leaving the panel used to
+    // be followed, a moment later, by the details screen opening anyway.
+    val detailsJob = remember { mutableStateOf<Job?>(null) }
+
     BackHandler(enabled = trendingState is TrendingFrameState.Selected) {
+        detailsJob.value?.cancel()
         BlueHiveApplication.playBackOutSound()
         trendingState = TrendingFrameState.Focused
         hitboxFocusRequester.requestFocus()
     }
+
+    // ── Remote hints (PanelHints.kt) ─────────────────────────────────────────
+    // Gold while entered, exactly as the trailer panel: near-white frame art,
+    // so a Modulate tint IS the colour and white leaves it untouched.
+    val frameTint by animateColorAsState(
+        targetValue   = if (trendingState is TrendingFrameState.Selected) PANEL_HINT_GOLD else Color.White,
+        animationSpec = tween(250),
+        label         = "trendingFrameTint"
+    )
 
     // ── Layout dimensions — mirror HRC frame pattern, adjust to taste ────────
     //
@@ -598,7 +622,8 @@ fun HomeScreenTrendingCompose(
                 .height(focusedH)
                 .zIndex(0f)
                 .graphicsLayer(alpha = if (trendingState is TrendingFrameState.UnFocused) 0f else 1f),
-            contentScale = ContentScale.FillBounds
+            contentScale = ContentScale.FillBounds,
+            colorFilter = ColorFilter.tint(frameTint, BlendMode.Modulate)
         )
 
         // Shadow — visible ONLY when Selected.
@@ -641,7 +666,8 @@ fun HomeScreenTrendingCompose(
             isPaused      = isPaused,
             // trendingItem is TrendingItem here — fetch full details before navigating
             onItemClick   = { trendingItem ->
-                scope.launch {
+                if (detailsJob.value?.isActive == true) return@TrendingNavigationCompose
+                detailsJob.value = scope.launch {
                     try {
                         val detail = api.getMediaDetails(
                             tmdbId    = trendingItem.tmdbId,
@@ -690,6 +716,10 @@ fun HomeScreenTrendingCompose(
                                 whereToWatch     = null
                             )
                         )
+                    } catch (e: CancellationException) {
+                        // Back cancelled the fetch. Rethrown, never treated as a
+                        // failure: the fallback below would open the title anyway.
+                        throw e
                     } catch (e: Exception) {
                         android.util.Log.e("TrendingCompose", "Detail fetch failed for ${trendingItem.tmdbId}, falling back", e)
                         // Fallback: navigate with partial data from TrendingItem
@@ -789,6 +819,23 @@ fun HomeScreenTrendingCompose(
                     }
                 }
                 .focusable(interactionSource = hitboxInteraction)
+        )
+
+        // Remote hints over the picture, above the carousel (zIndex 5). Not
+        // focusable and handles no keys, so the focus model above is untouched.
+        val selected = trendingState is TrendingFrameState.Selected
+        PanelHintLayer(
+            compact      = if (trendingState is TrendingFrameState.Focused) "to browse" else null,
+            legend       = selected,
+            legendBrowse = true,
+            legendClick  = "to open",
+            legendExit   = "Exit",
+            arrows       = selected,
+            modifier     = Modifier
+                .offset(x = viewportX, y = viewportY)
+                .width(viewportW)
+                .height(viewportH)
+                .zIndex(6f)
         )
     }
 }
