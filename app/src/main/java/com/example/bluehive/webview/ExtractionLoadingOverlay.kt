@@ -126,8 +126,19 @@ fun ExtractionFocusTrap(content: @Composable () -> Unit) {
     }
 }
 
+/**
+ * @param chain (attempt, planned) while the backend works down the source chain
+ *              -- shown as the headline "Finding a stream: trying 2 of 4", with
+ *              [status] beneath it as the detail. null for waits that are not a
+ *              chain (anime, server check).
+ */
 @Composable
-fun ExtractionLoadingOverlay(status: String, stage: Int, note: String? = null) {
+fun ExtractionLoadingOverlay(
+    status: String,
+    stage: Int,
+    note: String? = null,
+    chain: Pair<Int, Int>? = null,
+) {
     val inf = rememberInfiniteTransition(label = "loader")
 
     // These are read ONLY inside graphicsLayer{}/draw lambdas below — i.e. in the
@@ -338,6 +349,33 @@ fun ExtractionLoadingOverlay(status: String, stage: Int, note: String? = null) {
 
             Spacer(Modifier.height(38.dp))
 
+            // WHICH SOURCE, OF HOW MANY. A failover used to restart the same
+            // stage words with nothing to say a source had died and another had
+            // taken over, so a long chain read as one stuck load. "of N" is the
+            // attempts this chain can actually make (SourceCatalog.plannedAttempts),
+            // and a chain of one says only "Finding a stream".
+            if (chain != null) {
+                val (attempt, planned) = chain
+                val of = maxOf(planned, attempt)
+                val headline = if (of > 1) "Finding a stream: trying $attempt of $of" else "Finding a stream"
+                AnimatedContent(
+                    targetState = headline,
+                    transitionSpec = { fadeIn(tween(300)) togetherWith fadeOut(tween(200)) },
+                    label = "chain"
+                ) { h ->
+                    Text(
+                        h,
+                        color         = Color.White.copy(0.95f),
+                        fontSize      = 19.sp,
+                        fontWeight    = FontWeight.Normal,
+                        textAlign     = TextAlign.Center,
+                        letterSpacing = 0.3.sp,
+                        modifier      = Modifier.widthIn(max = 420.dp)
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+            }
+
             AnimatedContent(
                 targetState = status,
                 transitionSpec = { fadeIn(tween(300)) togetherWith fadeOut(tween(200)) },
@@ -345,8 +383,10 @@ fun ExtractionLoadingOverlay(status: String, stage: Int, note: String? = null) {
             ) { s ->
                 Text(
                     s,
-                    color         = Color.White.copy(0.88f),
-                    fontSize      = 17.sp,
+                    // Under a headline the stage words are the detail, so they
+                    // step back; alone they are the message, as before.
+                    color         = Color.White.copy(if (chain != null) 0.6f else 0.88f),
+                    fontSize      = if (chain != null) 14.sp else 17.sp,
                     fontWeight    = FontWeight.Light,
                     textAlign     = TextAlign.Center,
                     letterSpacing = 0.3.sp,

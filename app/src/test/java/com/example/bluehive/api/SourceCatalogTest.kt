@@ -164,4 +164,50 @@ class SourceCatalogTest {
     fun `returns null when nothing below is eligible`() {
         assertNull(SourceCatalog.nextInChainFrom(chain, "VidNest") { false })
     }
+
+    // ── plannedAttemptsFrom ─────────────────────────────────────────────────
+
+    @Test
+    fun `planned counts the pressed source and every eligible one below`() {
+        assertEquals(4, SourceCatalog.plannedAttemptsFrom(chain, "VidNest", true, 6) { true })
+        assertEquals(3, SourceCatalog.plannedAttemptsFrom(chain, "VidFast", true, 6) { true })
+    }
+
+    @Test
+    fun `planned is capped by the backend's max attempts`() {
+        assertEquals(3, SourceCatalog.plannedAttemptsFrom(chain, "VidNest", true, 3) { true })
+    }
+
+    @Test
+    fun `planned is one when failover is off`() {
+        assertEquals(1, SourceCatalog.plannedAttemptsFrom(chain, "VidNest", false, 6) { true })
+    }
+
+    @Test
+    fun `planned skips what the chain walk would skip`() {
+        val c = listOf(src("A"), src("B", failover = false), src("C"), src("D"))
+        assertEquals(3, SourceCatalog.plannedAttemptsFrom(c, "A", true, 6) { true })
+        assertEquals(2, SourceCatalog.plannedAttemptsFrom(chain, "VidNest", true, 6) { it == "MoviesAPI" })
+    }
+
+    @Test
+    fun `planned matches the walk - the count is how many sources it visits`() {
+        // Walk the chain exactly as the screens do and count the visits; the
+        // total must be what plannedAttemptsFrom promised, or "trying k of N"
+        // would stop short of N or run past it.
+        val canExtract: (String) -> Boolean = { it != "VidLove" }
+        var visited = 1
+        var at: String? = "VidNest"
+        while (visited < 6) {
+            at = SourceCatalog.nextInChainFrom(chain, at!!, canExtract)?.name ?: break
+            visited++
+        }
+        assertEquals(visited, SourceCatalog.plannedAttemptsFrom(chain, "VidNest", true, 6, canExtract))
+    }
+
+    @Test
+    fun `planned is one for the last source or a retired one`() {
+        assertEquals(1, SourceCatalog.plannedAttemptsFrom(chain, "MoviesAPI", true, 6) { true })
+        assertEquals(1, SourceCatalog.plannedAttemptsFrom(chain, "RetiredSource", true, 6) { true })
+    }
 }

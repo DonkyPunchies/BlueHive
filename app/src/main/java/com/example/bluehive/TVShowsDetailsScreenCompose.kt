@@ -1441,6 +1441,18 @@ fun TVShowsDetailsScreenContent(
     // REAL status text from the extractor process (empty = use the anime flow's
     // stage labels). This is what makes the overlay honest — see the receiver below.
     var vidFastStatus    by remember { mutableStateOf("") }
+    // Which chain step is extracting now, stamped by extractAndPlay on EVERY
+    // entry. Keys the stage-dot effect, so each new source restarts its dots
+    // (a failover keeps isExtracting up, which alone never restarted them), and
+    // is the "2" in the loading screen's "trying 2 of 4".
+    var extractAttempt   by remember { mutableIntStateOf(0) }
+    // The "4": how many sources this chain can try, fixed on the viewer's press.
+    var chainTotal       by remember { mutableIntStateOf(1) }
+    // Amber line once a source has failed -- "VidNest didn't work, trying
+    // VidFast" -- kept for the rest of the chain. vidFastStatus carried this
+    // once, but the next attempt overwrote it in the same frame, so a failover
+    // was never seen.
+    var extractNote      by remember { mutableStateOf<String?>(null) }
 
     /** Non-null shows ExtractionErrorOverlay — a failure the user can act on. */
     var extractionError by remember { mutableStateOf<String?>(null) }
@@ -1561,7 +1573,17 @@ fun TVShowsDetailsScreenContent(
         isVidFastExtract = true
         extractPending   = true
         extractStage     = 1
+        extractAttempt   = attempt
         vidFastStatus    = "Finding your stream…"
+        // A fresh press starts a fresh chain: count what it can try, and drop
+        // any note left from the last one.
+        if (attempt == 1) {
+            chainTotal  = SourceCatalog.plannedAttempts(
+                BlueHiveApplication.appContext, "tv", tmdbId,
+                pendingSeason, pendingEpisode, src.name,
+            ) { usesBackendExtraction(it) }
+            extractNote = null
+        }
 
         // Display name IS the backend key once lowercased — see
         // usesBackendExtraction. Keeps one source of truth instead of a mapping
@@ -1636,6 +1658,7 @@ fun TVShowsDetailsScreenContent(
                 extractPending   = true
                 extractStage     = 1
                 vidFastStatus    = "${src.coverName} didn\u2019t work \u2014 trying ${next.label}\u2026"
+                extractNote      = "${src.coverName} didn\u2019t work \u2014 trying ${next.label}"
                 extractAndPlay(
                     TVShowsDetailsScreenCompose.StreamingSource(next.label, next.name, next.url),
                     attempt + 1,
@@ -1740,6 +1763,12 @@ fun TVShowsDetailsScreenContent(
               "failover ${chainAttempt}/${SourceCatalog.maxAttempts} (playback): " +
               "$failed died in the player at ${atMs}ms -> trying ${next.name}")
         val step = chainAttempt + 1
+        // The player only reports the source's routing name; the viewer knows it
+        // by its button label.
+        val failedLabel = SourceCatalog.sources(
+            BlueHiveApplication.appContext, "tv", tmdbId, pendingSeason, pendingEpisode,
+        ).firstOrNull { it.name.equals(failed, ignoreCase = true) }?.label ?: failed
+        extractNote = "$failedLabel stopped playing — trying ${next.label}"
         extractJob = coroutineScope.launch {
             extractAndPlay(
                 TVShowsDetailsScreenCompose.StreamingSource(next.label, next.name, next.url),
@@ -2173,7 +2202,13 @@ fun TVShowsDetailsScreenContent(
         lastExtractServer = server
         if (!isExtracting && !extractPending && !isCheckingServers) {
             extractPending = true
-            coroutineScope.launch {
+            // HELD IN extractJob, like the source chain, so BACK cancels it. It
+            // was launched untracked: Back hid the loading screen, the backend
+            // answered a moment later, and the episode started anyway. Cancelled,
+            // the backend await ends it, and ensureActive()/launchIfActive()
+            // below stop the player and the on-device fallback from starting
+            // after the fact.
+            extractJob = coroutineScope.launch {
                 delay(200)
                 isExtracting = true
                 try { BlueHiveApplication.coilImageLoader.memoryCache?.clear() } catch (_: Exception) {}
@@ -2324,19 +2359,22 @@ fun TVShowsDetailsScreenContent(
         launchExtract(req.first, req.second, req.third)
     }
 
-    LaunchedEffect(isExtracting) {
+    // PACED FOR EVERY EXTRACTION NOW, and restarted per chain step, exactly as
+    // the movie screen does. Backend extraction used to be exempt because VidFast
+    // reported its real state over a broadcast -- but that receiver went with the
+    // on-device extractor, so the exemption left the dots on stage 1 and the
+    // words on "Finding your stream…" for the whole 20-90 s wait, which reads as
+    // a hang. The stage words are only the detail line now; "trying 2 of 4"
+    // above them is the real progress.
+    //
+    // KEYED ON extractAttempt as well: a failover keeps isExtracting up, so
+    // without the second key the next source would inherit the last one's dots.
+    LaunchedEffect(isExtracting, extractAttempt) {
         if (isExtracting) {
             extractStage = 1
-            // VidFast reports its REAL state over a broadcast, so don't drive the
-            // dots on a timer — that would advance while nothing had happened, and
-            // could show "almost there" during a run that's about to fail. The
-            // anime (Miruro) extractor has no such reporting, so it keeps the
-            // estimated pacing below.
-            if (!isVidFastExtract) {
-                delay(900);  extractStage = 2
-                delay(2500); extractStage = 3
-                delay(3500); extractStage = 4
-            }
+            delay(900);  extractStage = 2
+            delay(2500); extractStage = 3
+            delay(3500); extractStage = 4
         } else {
             extractStage = 0
         }
@@ -3624,20 +3662,20 @@ fun TVShowsDetailsScreenContent(
             // close the episode overlay, once to jump to the season column —
             // before a third press reaches the BackHandler that cancels.
             ExtractionFocusTrap {
+                val stageWords = when (extractStage) {
+                    0, 1 -> "Locating stream source…"
+                    2    -> "Loading stream source…"
+                    3    -> "Preparing video player…"
+                    else -> "Almost there…"
+                }
                 ExtractionLoadingOverlay(
-                    // VidFast: the extractor's OWN words, broadcast as it works.
-                    // Anime: estimated labels, since Miruro's extractor doesn't report.
-                    status = vidFastStatus.ifBlank {
-                        when (extractStage) {
-                            0, 1 -> "Locating stream source…"
-                            2    -> "Loading stream source…"
-                            3    -> "Preparing video player…"
-                            else -> "Almost there…"
-                        }
-                    },
-                    stage = extractStage,
-                    // Amber line: "Failure on first extraction — attempting retry 2/2".
-                    note  = null
+                    // Source chain: the headline says which source of how many,
+                    // and the stage words are the detail under it. Anything else
+                    // keeps vidFastStatus if set, as before.
+                    status = if (isVidFastExtract) stageWords else vidFastStatus.ifBlank { stageWords },
+                    stage  = extractStage,
+                    note   = if (isVidFastExtract) extractNote else null,
+                    chain  = if (isVidFastExtract) extractAttempt to chainTotal else null,
                 )
             }
         }

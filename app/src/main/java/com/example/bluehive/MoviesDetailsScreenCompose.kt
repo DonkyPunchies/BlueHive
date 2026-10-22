@@ -596,6 +596,14 @@ fun MoviesDetailsScreenContent(
     // only the way to change it moved.
     var isBackendExtract by remember { mutableStateOf(false) }
     var backendStatus    by remember { mutableStateOf("") }
+    // The loading screen's "trying 2 of 4": how many sources this chain can
+    // try in all, fixed when the viewer presses a source (attempt 1).
+    var chainTotal       by remember { mutableIntStateOf(1) }
+    // Amber line under it once a source has failed -- "VidNest didn't work,
+    // trying VidFast" -- kept up for the rest of the chain. backendStatus was
+    // meant to carry this, but the overlay never read it, so a failover was
+    // invisible: the same stage words simply started over.
+    var extractNote      by remember { mutableStateOf<String?>(null) }
     /** Non-null shows ExtractionErrorOverlay — a failure the user can act on. */
     var extractionError  by remember { mutableStateOf<String?>(null) }
     var pendingUrl        by remember { mutableStateOf<String?>(null) }
@@ -945,6 +953,14 @@ fun MoviesDetailsScreenContent(
         // this field exists to prevent.
         extractAttempt   = attempt
         backendStatus    = "Finding your stream…"
+        // A fresh press starts a fresh chain: count what it can try, and drop
+        // any note left from the last one.
+        if (attempt == 1) {
+            chainTotal  = SourceCatalog.plannedAttempts(
+                BlueHiveApplication.appContext, "movie", mediaId, 0, 0, src.name,
+            ) { usesBackendExtraction(it) }
+            extractNote = null
+        }
 
         // Display name IS the backend key once lowercased — see usesBackendExtraction.
         val sourceKey = src.name.lowercase()
@@ -1001,6 +1017,7 @@ fun MoviesDetailsScreenContent(
                 extractPending   = true
                 extractStage     = 1
                 backendStatus    = "${src.coverName} didn\u2019t work \u2014 trying ${next.label}\u2026"
+                extractNote      = "${src.coverName} didn\u2019t work \u2014 trying ${next.label}"
                 extractAndPlayMovie(
                     MoviesDetailsScreenCompose.StreamingSource(next.label, next.name, next.url),
                     attempt + 1,
@@ -1105,6 +1122,11 @@ fun MoviesDetailsScreenContent(
               "failover ${chainAttempt}/${SourceCatalog.maxAttempts} (playback): " +
               "$failed died in the player at ${atMs}ms -> trying ${next.name}")
         val step = chainAttempt + 1
+        // The player only reports the source's routing name; the viewer knows it
+        // by its button label.
+        val failedLabel = SourceCatalog.sources(BlueHiveApplication.appContext, "movie", mediaId, 0, 0)
+            .firstOrNull { it.name.equals(failed, ignoreCase = true) }?.label ?: failed
+        extractNote = "$failedLabel stopped playing — trying ${next.label}"
         extractJob = coroutineScope.launch {
             extractAndPlayMovie(
                 MoviesDetailsScreenCompose.StreamingSource(next.label, next.name, next.url),
@@ -1128,6 +1150,11 @@ fun MoviesDetailsScreenContent(
         extractJob            = null
         extractPending        = false
         isExtracting          = false
+        // Reset here because a cancel never reaches the line in
+        // extractAndPlayMovie that clears it -- and the loading screen reads it
+        // to decide whether to show "trying 2 of 4", so a stale true would put a
+        // source count and an old failover note over the next ANIME load.
+        isBackendExtract      = false
         extractStage          = 0
         coroutineScope.launch {
             awaitFrame()
@@ -1265,7 +1292,13 @@ fun MoviesDetailsScreenContent(
         lastExtractServer = server
         if (!isExtracting && !extractPending && !isCheckingServers) {
             extractPending = true
-            coroutineScope.launch {
+            // HELD IN extractJob, like the source chain, so BACK cancels it. It
+            // was launched untracked: Back hid the loading screen, the backend
+            // answered a moment later, and the film started anyway. Cancelled,
+            // the backend await ends it, and ensureActive()/launchIfActive()
+            // below stop the player and the on-device fallback from starting
+            // after the fact.
+            extractJob = coroutineScope.launch {
                 delay(200)
                 isExtracting = true
                 try { BlueHiveApplication.coilImageLoader.memoryCache?.clear() } catch (_: Exception) {}
@@ -2220,6 +2253,9 @@ fun MoviesDetailsScreenContent(
                         else -> "Almost there…"
                     },
                     stage = extractStage,
+                    // Source chain only: anime extraction is not a chain.
+                    note  = if (isBackendExtract) extractNote else null,
+                    chain = if (isBackendExtract) extractAttempt to chainTotal else null,
                 )
             }
         }

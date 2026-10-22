@@ -329,6 +329,44 @@ object SourceCatalog {
         return chain.drop(i + 1).firstOrNull { it.failover && canExtract(it.name) }
     }
 
+    /**
+     * How many sources a chain that starts at [firstName] can try in all -- the
+     * "of 4" in the loading screen's "Finding a stream: trying 2 of 4".
+     *
+     * EXACTLY THE ATTEMPTS THE CHAIN CAN MAKE, not the length of the list: the
+     * pressed source, plus every entry below it that [nextInChainFrom] would
+     * accept, capped at [maxAttempts]. Counting the whole list would promise
+     * attempts that can never happen -- "trying 1 of 4" for a viewer who picked
+     * the last source -- and the count would stop short of its own total.
+     */
+    fun plannedAttempts(
+        context: Context?,
+        mediaType: String,
+        tmdbId: Int,
+        season: Int,
+        episode: Int,
+        firstName: String,
+        canExtract: (String) -> Boolean,
+    ): Int = plannedAttemptsFrom(
+        sources(context, mediaType, tmdbId, season, episode),
+        firstName, failoverEnabled, maxAttempts, canExtract,
+    )
+
+    /** The count itself, with no Context and no IO, so it can be tested. */
+    internal fun plannedAttemptsFrom(
+        chain: List<Source>,
+        firstName: String,
+        enabled: Boolean,
+        max: Int,
+        canExtract: (String) -> Boolean,
+    ): Int {
+        if (!enabled) return 1
+        val i = chain.indexOfFirst { it.name.equals(firstName, true) }
+        if (i < 0) return 1
+        val below = chain.drop(i + 1).count { it.failover && canExtract(it.name) }
+        return (1 + below).coerceIn(1, max.coerceAtLeast(1))
+    }
+
     // ── Disk, so the device keeps a real list across restarts and offline ────
     private fun prefs(c: Context) = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
