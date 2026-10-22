@@ -213,6 +213,13 @@ class SelfUpdateActivity : ComponentActivity() {
     /** True when the stopped screen is reporting a failure, which draws it in red. */
     private val isError = MutableStateFlow(false)
 
+    /**
+     * True on a "not enough storage" failure only. Adds a first, focused Clear
+     * space button that opens the device's installed-apps page, where the user
+     * can uninstall apps or clear their caches (see openAppsSettings).
+     */
+    private val canClearSpace = MutableStateFlow(false)
+
     /** The verified APK, kept so a retry does not re-download 163MB. */
     @Volatile private var downloadedApk: java.io.File? = null
 
@@ -309,6 +316,7 @@ class SelfUpdateActivity : ComponentActivity() {
                                     "then come back here."
                             failureCode.value = null
                             isError.value = false
+                            canClearSpace.value = false
                             retryLabel.value = "Open settings"
                             canRetry.value = true
                             awaitingPermission = true
@@ -326,6 +334,7 @@ class SelfUpdateActivity : ComponentActivity() {
                             failureDetail.value = null
                             failureCode.value = null
                             isError.value = false
+                            canClearSpace.value = false
                             startDownload(pendingManifest)
                         }
 
@@ -407,6 +416,7 @@ class SelfUpdateActivity : ComponentActivity() {
                 val detail by failureDetail.collectAsState()
                 val code by failureCode.collectAsState()
                 val error by isError.collectAsState()
+                val clearSpace by canClearSpace.collectAsState()
                 UpdateScreen(
                     fromVersion = BuildConfig.VERSION_NAME,
                     toVersion = manifest.latestVersionName,
@@ -420,6 +430,8 @@ class SelfUpdateActivity : ComponentActivity() {
                     errorCode = code,
                     isError = error,
                     onClose = { closeApplication() },
+                    showClearSpace = clearSpace,
+                    onClearSpace = { openAppsSettings() },
                 )
             }
         }
@@ -576,6 +588,41 @@ class SelfUpdateActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * The Clear space button: open the device's installed-apps page, where the
+     * user uninstalls apps or clears their caches by hand. BlueHive cannot free
+     * another app's space itself -- only the system or the user can.
+     *
+     * TRIED IN ORDER, FIRST THAT OPENS WINS. MANAGE_APPLICATIONS_SETTINGS is the
+     * installed-apps list: on Fire OS 7 it resolves to Settings > Applications
+     * (com.amazon.tv.settings.v2, checked on the Fire TV Stick 2026-10-22), and
+     * Android TV / Google TV Settings handles the same action for Settings >
+     * Apps. Fire OS has no storage page an app can open -- the storage action
+     * resolves to nothing there -- which is why the apps list is the target on
+     * both. Plain Settings is the last resort.
+     *
+     * TRIED WITH startActivity, NOT resolveActivity. From Android 11, package
+     * visibility hides other apps' activities from resolveActivity unless the
+     * manifest declares them, while startActivity is not filtered, so actually
+     * trying is the honest test.
+     *
+     * The user returns with Back to this same screen and presses Try again.
+     */
+    private fun openAppsSettings() {
+        val actions = listOf(
+            Settings.ACTION_MANAGE_APPLICATIONS_SETTINGS,
+            Settings.ACTION_APPLICATION_SETTINGS,
+            Settings.ACTION_SETTINGS,
+        )
+        for (action in actions) {
+            if (runCatching { startActivity(Intent(action)) }.isSuccess) {
+                Log.e(TAG, "clear space: opened $action")
+                return
+            }
+        }
+        Log.e(TAG, "clear space: no settings screen could be opened")
+    }
+
     override fun onPause() {
         super.onPause()
         if (awaitingPermission) pausedSinceAsking = true
@@ -614,6 +661,7 @@ class SelfUpdateActivity : ComponentActivity() {
                     "then come back here."
             failureCode.value = null
             isError.value = false
+            canClearSpace.value = false
             retryLabel.value = "Open settings"
             canRetry.value = true
         } else {
@@ -656,6 +704,7 @@ class SelfUpdateActivity : ComponentActivity() {
                     failureDetail.value = outcome.reason
                     failureCode.value = null
                     isError.value = true
+                    canClearSpace.value = false
                     // beginInstall() restarts the download when no APK is held,
                     // so the existing dispatcher already does the right thing.
                     retryLabel.value = "Try again"
@@ -707,6 +756,7 @@ class SelfUpdateActivity : ComponentActivity() {
             failureDetail.value = null
             failureCode.value = null
             isError.value = false
+            canClearSpace.value = false
             startDownload(pendingManifest)
             return
         }
@@ -716,6 +766,7 @@ class SelfUpdateActivity : ComponentActivity() {
         failureDetail.value = null
         failureCode.value = null
         isError.value = false
+        canClearSpace.value = false
         isInstalling.value = true
         status.value = "Installing update…"
         UpdateManager.install(applicationContext, apk)
@@ -775,6 +826,7 @@ class SelfUpdateActivity : ComponentActivity() {
         failureDetail.value = explain(code)
         failureCode.value = if (msg.isNullOrBlank()) "code $code" else "code $code: $msg"
         isError.value = true
+        canClearSpace.value = code == PackageInstaller.STATUS_FAILURE_STORAGE
         retryLabel.value = "Try again"
     }
 
@@ -794,7 +846,8 @@ class SelfUpdateActivity : ComponentActivity() {
     private fun explain(status: Int): String = when (status) {
         PackageInstaller.STATUS_FAILURE_STORAGE ->
             "There isn't enough free space on this device for the update. " +
-                "Uninstall an app you don't use to make room, then press Try again."
+                "Press Clear space to open your apps, uninstall one you don't use " +
+                "or clear its cache, then come back here and press Try again."
         PackageInstaller.STATUS_FAILURE_CONFLICT ->
             "This update does not match the copy of BlueHive already installed."
         PackageInstaller.STATUS_FAILURE_INCOMPATIBLE ->
@@ -895,6 +948,9 @@ private fun UpdateScreen(
     isError: Boolean = false,
     /** The second button on a stopped screen; Back reaches it too. */
     onClose: () -> Unit = {},
+    /** Adds a first, focused Clear space button. Storage failures only. */
+    showClearSpace: Boolean = false,
+    onClearSpace: () -> Unit = {},
 ) {
     val bg = Color(0xFF0E0E10)
     val accent = Color(0xFF378ADD)
@@ -964,7 +1020,7 @@ private fun UpdateScreen(
         contentAlignment = Alignment.Center,
     ) {
         Column(
-            modifier = Modifier.width(620.dp).padding(horizontal = 24.dp),
+            modifier = Modifier.width(680.dp).padding(horizontal = 24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
 
@@ -1167,15 +1223,27 @@ private fun UpdateScreen(
             // Close Application. Side by side so the pair costs one row of a
             // 540dp-tall TV layout; D-pad left and right move between them, and
             // Back is the second way to close (see onCreate).
+            //
+            // A STORAGE FAILURE GETS A THIRD, FIRST AND FOCUSED (2026-10-22):
+            // Clear space opens the installed-apps page, because freeing room is
+            // the only thing that changes the answer and Try again cannot.
             if (showRetry) {
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(16.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    if (showClearSpace) {
+                        UpdateScreenButton(
+                            label = "Clear space",
+                            primary = true,
+                            takeFocus = true,
+                            onClick = onClearSpace,
+                        )
+                    }
                     UpdateScreenButton(
                         label = retryLabel,
                         primary = true,
-                        takeFocus = true,
+                        takeFocus = !showClearSpace,
                         onClick = onRetry,
                     )
                     UpdateScreenButton(
