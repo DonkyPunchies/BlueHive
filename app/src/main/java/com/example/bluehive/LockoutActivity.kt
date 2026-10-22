@@ -43,7 +43,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
@@ -533,8 +532,12 @@ private fun LockoutButton(
         isToggleable   = false,
         fontFamily     = fontFamily,
         focusRequester = focusRequester,
+        // ALWAYS FOCUSABLE, so the focus glow never leaves it. This used to be
+        // `canFocus = !isDisabled`: a press turned it into "Checking…", focus
+        // dropped off, and nothing put it back, so after one Refresh the screen
+        // had no glow at all (2026-10-22). Presses while disabled are ignored in
+        // onClick below instead.
         modifier       = Modifier
-            .focusProperties { canFocus = !isDisabled }
             .onKeyEvent { event ->
                 if (event.type == KeyEventType.KeyDown) BlueHiveApplication.playHoverSound()
                 false
