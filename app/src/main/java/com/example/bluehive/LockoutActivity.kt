@@ -274,7 +274,9 @@ fun LockoutScreen(
         }
     }
 
-    val codeFont = FontFamily.Monospace
+    // Sans-serif, as in the approved design C mockup. This screen used to be
+    // monospace, and v360 kept that: it did not look like the design.
+    val uiFont = FontFamily.Default
 
     // Did we land here because THIS TV released its own slot after sitting idle?
     //
@@ -364,10 +366,11 @@ fun LockoutScreen(
     }
 
     // ──────────────────────────────────────────────────────────────────────────
+    // Sizes are design C's mockup px x 1.3; see the note above SlotBanner.
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xFF0C0C0C))
+            .background(ScreenBg)
     ) {
         Column(
             modifier            = Modifier.fillMaxSize(),
@@ -376,48 +379,46 @@ fun LockoutScreen(
         ) {
 
             Text(
-                text          = headline,
-                color         = Color.White,
-                fontSize      = 22.sp,
-                fontWeight    = FontWeight.Bold,
-                fontFamily    = codeFont,
-                letterSpacing = 1.sp,
-                textAlign     = TextAlign.Center,
-                modifier      = Modifier.padding(horizontal = 40.dp)
+                text       = headline,
+                color      = HeadlineText,
+                fontSize   = 25.sp,
+                fontWeight = FontWeight.Medium,
+                fontFamily = uiFont,
+                textAlign  = TextAlign.Center,
+                modifier   = Modifier.padding(horizontal = 40.dp)
             )
 
-            Spacer(Modifier.height(20.dp))
+            Spacer(Modifier.height(8.dp))
 
             Text(
                 text       = body,
-                color      = Color.White.copy(alpha = 0.70f),
-                fontSize   = 14.sp,
-                fontFamily = codeFont,
-                fontWeight = FontWeight.Light,
+                color      = BodyText,
+                fontSize   = 16.sp,
+                lineHeight = 24.sp,
+                fontFamily = uiFont,
                 textAlign  = TextAlign.Center,
                 // A width, not hand-placed line breaks: the slot-full copy flows
                 // around a number that may be 1, 4 or absent.
-                modifier   = Modifier.padding(horizontal = 60.dp).widthIn(max = 640.dp)
+                modifier   = Modifier.widthIn(max = BODY_WIDTH)
             )
 
             // ── Who holds the slots (workspace_full, when the server listed them)
             val list = holders?.takeIf { isWorkspaceFull && it.holders.isNotEmpty() }
             if (list != null) {
                 val elapsedMs = nowMs - list.receivedAtMs
-                Spacer(Modifier.height(16.dp))
-                SlotBanner(SlotHolderText.banner(list, elapsedMs), codeFont)
-                Spacer(Modifier.height(8.dp))
-                SlotHolderList(list, elapsedMs, codeFont)
+                Spacer(Modifier.height(14.dp))
+                SlotBanner(SlotHolderText.banner(list, elapsedMs), uiFont)
                 Spacer(Modifier.height(10.dp))
+                SlotHolderList(list, elapsedMs, uiFont)
+                Spacer(Modifier.height(12.dp))
                 Text(
                     text       = "You'll be let in automatically when a slot frees.",
                     color      = MutedText,
-                    fontSize   = 12.sp,
-                    fontFamily = codeFont,
-                    fontWeight = FontWeight.Light,
+                    fontSize   = 16.sp,
+                    fontFamily = uiFont,
                     textAlign  = TextAlign.Center,
                 )
-                Spacer(Modifier.height(16.dp))
+                Spacer(Modifier.height(12.dp))
             } else {
                 Spacer(Modifier.height(24.dp))
             }
@@ -433,10 +434,8 @@ fun LockoutScreen(
                     },
                     color         = if (cooldownLeft <= 30) Color(0xFFBB1414)
                     else Color.White.copy(alpha = 0.65f),
-                    fontSize      = 13.sp,
-                    fontFamily    = codeFont,
-                    fontWeight    = FontWeight.Light,
-                    letterSpacing = 0.5.sp,
+                    fontSize      = 16.sp,
+                    fontFamily    = uiFont,
                     textAlign     = TextAlign.Center,
                 )
                 Spacer(Modifier.height(16.dp))
@@ -447,10 +446,8 @@ fun LockoutScreen(
                 Text(
                     text          = "Countdown complete. You may now attempt to re-enter.",
                     color         = Color.White.copy(alpha = 0.85f),
-                    fontSize      = 13.sp,
-                    fontFamily    = codeFont,
-                    fontWeight    = FontWeight.Light,
-                    letterSpacing = 0.5.sp,
+                    fontSize      = 16.sp,
+                    fontFamily    = uiFont,
                     textAlign     = TextAlign.Center,
                     modifier      = Modifier.padding(horizontal = 60.dp)
                 )
@@ -462,10 +459,8 @@ fun LockoutScreen(
                 Text(
                     text          = "✓ A slot just opened — tap Refresh to re-enter",
                     color         = StatusBlue,   // was green; the screen is blue now
-                    fontSize      = 13.sp,
-                    fontFamily    = codeFont,
-                    fontWeight    = FontWeight.Light,
-                    letterSpacing = 0.5.sp,
+                    fontSize      = 16.sp,
+                    fontFamily    = uiFont,
                     textAlign     = TextAlign.Center,
                 )
                 Spacer(Modifier.height(16.dp))
@@ -475,7 +470,7 @@ fun LockoutScreen(
 
             // ── Action button ─────────────────────────────────────────────────
             LockoutButton(
-                fontFamily     = codeFont,
+                fontFamily     = uiFont,
                 focusRequester = buttonFocusRequester,
                 state          = state,
                 isRevoked      = isRevoked,
@@ -492,7 +487,7 @@ fun LockoutScreen(
             }
 
             if (feedback != null) {
-                Spacer(Modifier.height(20.dp))
+                Spacer(Modifier.height(14.dp))
                 Text(
                     text          = feedback,
                     color         = when (state) {
@@ -500,10 +495,8 @@ fun LockoutScreen(
                         is RefreshState.Failed   -> Color(0xFFBB1414)
                         else                     -> Color.White.copy(alpha = 0.65f)
                     },
-                    fontSize      = 13.sp,
-                    fontFamily    = codeFont,
-                    fontWeight    = FontWeight.Light,
-                    letterSpacing = 0.5.sp
+                    fontSize      = 16.sp,
+                    fontFamily    = uiFont,
                 )
             }
         }
@@ -533,8 +526,10 @@ private fun LockoutButton(
         else         -> "Refresh"
     }
 
+    // The same button as before, at design C's size: every dimension x 1.3,
+    // like the rest of the screen (it was 150 x 23 dp, small next to the list).
     ModularButton(
-        textConfig     = ModularButtonTextConfig(text = label),
+        textConfig     = ModularButtonTextConfig(text = label, fontSize = 15f),
         isToggleable   = false,
         fontFamily     = fontFamily,
         focusRequester = focusRequester,
@@ -545,17 +540,17 @@ private fun LockoutButton(
                 false
             },
         dimensions = ModularButtonDimensions(
-            mainWidth          = 150.dp,
-            mainHeight         = 23.dp,
-            mainYOffset        = 0.5.dp,
-            secondWidth        = 150.dp,
-            secondHeight       = 20.dp,
-            secondYOffset      = 7.dp,
-            shadowHeight       = 6.dp,
-            glowWidth          = 170.2.dp,
-            glowHeight         = 40.5.dp,
-            mainCornerRadius   = 7f,
-            secondCornerRadius = 6f,
+            mainWidth          = 195.dp,
+            mainHeight         = 30.dp,
+            mainYOffset        = 0.65.dp,
+            secondWidth        = 195.dp,
+            secondHeight       = 26.dp,
+            secondYOffset      = 9.dp,
+            shadowHeight       = 8.dp,
+            glowWidth          = 221.dp,
+            glowHeight         = 52.5.dp,
+            mainCornerRadius   = 9f,
+            secondCornerRadius = 8f,
         ),
         colors = ModularButtonColors(
             mainDefault   = Color(0xFF6C6C6C),
@@ -570,13 +565,13 @@ private fun LockoutButton(
             enabled    = true,
             defaultRes = R.drawable.button_focus_wide_glow,
             toggledRes = R.drawable.button_focus_wide_nonglow,
-            offsetX    = (-10).dp,
-            offsetY    = (-4).dp
+            offsetX    = (-13).dp,
+            offsetY    = (-5.2).dp
         ),
         animationConfig = ModularButtonAnimationConfig(
-            pressOffset           = 2.5.dp,
-            textOffsetDefault     = 1.dp,
-            textOffsetPressed     = 2.4.dp,
+            pressOffset           = 3.25.dp,
+            textOffsetDefault     = 1.3.dp,
+            textOffsetPressed     = 3.1.dp,
             durationMillis        = 110,
             bounceBackDelayMillis = 80
         ),
@@ -591,61 +586,70 @@ private fun LockoutButton(
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Who holds the slots (design C, 2026-10-22). Wording and order: SlotHolderText.
+//
+// DRAWN FROM THE APPROVED MOCKUP, at 1.3 dp per mockup px. The mockup is a
+// 16:9 frame about 640 px wide and the TV is 960 dp, so 1.5 would be exact;
+// 1.3 keeps four rows plus the Refresh feedback line inside 540 dp. Colours
+// are the mockup's. v360 used the old screen's monospace at about two thirds
+// of these sizes, and it did not look like the design.
 // ──────────────────────────────────────────────────────────────────────────────
 
-private val BannerBlue = Color(0xFF122EB9)
-private val BannerEdge = Color(0xFF5C78F2)
-private val BannerText = Color(0xFFF2F5FF)
-private val BannerSoft = Color(0xFFC9D4FF)
-private val BarTrack   = Color(0xFF0A1C78)
-private val StatusBlue = Color(0xFF9DB0FF)
-private val RowText    = Color(0xFFECECEF)
-private val DimText    = Color(0xFF8B8B94)
-private val MutedText  = Color(0xFFB4B2A9)
-private val RowDivider = Color(0xFF22252C)
-private val EmptySeat  = Color(0xFF5F5E5A)
+private val ScreenBg     = Color(0xFF0B0C10)
+private val HeadlineText = Color(0xFFECECEF)
+private val BodyText     = Color(0xFFA4A4AD)
+private val BannerBlue   = Color(0xFF122EB9)
+private val BannerEdge   = Color(0xFF5C78F2)
+private val BannerText   = Color(0xFFF2F5FF)
+private val BannerSoft   = Color(0xFFC9D4FF)
+private val BarTrack     = Color(0xFF0A1C78)
+private val StatusBlue   = Color(0xFF9DB0FF)
+private val RowText      = Color(0xFFECECEF)
+private val DimText      = Color(0xFF8B8B94)
+private val MutedText    = Color(0xFFB4B2A9)
+private val RowDivider   = Color(0xFF22252C)
+private val EmptySeat    = Color(0xFF5F5E5A)
 
-private val LIST_WIDTH = 560.dp
+private val LIST_WIDTH = 624.dp   // the mockup's 480 px banner and list
+private val BODY_WIDTH = 612.dp   // its 470 px paragraph
 
 /** More TVs than this collapse into "+ N more", so the screen never overflows. */
-private const val MAX_ROWS = 5
+private const val MAX_ROWS = 4
 
 @Composable
 private fun SlotBanner(banner: SlotHolderText.Banner, fontFamily: FontFamily) {
-    val shape = RoundedCornerShape(10.dp)
+    val shape = RoundedCornerShape(13.dp)
     Column(
         modifier = Modifier
             .width(LIST_WIDTH)
             .background(BannerBlue, shape)
-            .border(1.dp, BannerEdge, shape)
-            .padding(horizontal = 14.dp, vertical = 9.dp)
+            .border(1.5.dp, BannerEdge, shape)
+            .padding(horizontal = 18.dp, vertical = 12.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            ClockGlyph(color = BannerSoft, size = 14.dp)
-            Spacer(Modifier.width(8.dp))
+            ClockGlyph(color = BannerSoft, size = 20.dp)
+            Spacer(Modifier.width(10.dp))
             Text(
                 text       = banner.title,
                 color      = BannerText,
-                fontSize   = 14.sp,
+                fontSize   = 18.sp,
                 fontFamily = fontFamily,
                 fontWeight = FontWeight.Medium,
             )
         }
-        Spacer(Modifier.height(3.dp))
+        Spacer(Modifier.height(4.dp))
         Text(
             text       = banner.detail,
             color      = BannerSoft,
-            fontSize   = 11.sp,
+            fontSize   = 14.sp,
             fontFamily = fontFamily,
-            fontWeight = FontWeight.Light,
         )
         banner.progress?.let { done ->
-            Spacer(Modifier.height(7.dp))
+            Spacer(Modifier.height(9.dp))
             Box(
                 Modifier
                     .fillMaxWidth()
-                    .height(5.dp)
-                    .clip(RoundedCornerShape(3.dp))
+                    .height(6.dp)
+                    .clip(RoundedCornerShape(4.dp))
                     .background(BarTrack)
             ) {
                 Box(Modifier.fillMaxWidth(done).fillMaxHeight().background(StatusBlue))
@@ -662,11 +666,11 @@ private fun SlotHolderList(list: SlotHolders, elapsedMs: Long, fontFamily: FontF
         shown.forEachIndexed { i, h ->
             if (i > 0) Box(Modifier.fillMaxWidth().height(1.dp).background(RowDivider))
             Row(
-                modifier          = Modifier.fillMaxWidth().padding(horizontal = 2.dp, vertical = 4.dp),
+                modifier          = Modifier.fillMaxWidth().padding(horizontal = 3.dp, vertical = 5.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 HolderAvatar(h)
-                Spacer(Modifier.width(10.dp))
+                Spacer(Modifier.width(13.dp))
                 Text(
                     text = buildAnnotatedString {
                         append(SlotHolderText.who(h))
@@ -675,20 +679,20 @@ private fun SlotHolderList(list: SlotHolders, elapsedMs: Long, fontFamily: FontF
                         }
                     },
                     color      = if (h.state == SlotHolder.State.CHOOSING) MutedText else RowText,
-                    fontSize   = 12.sp,
+                    fontSize   = 16.sp,
                     fontFamily = fontFamily,
                     maxLines   = 1,
                     overflow   = TextOverflow.Ellipsis,
                     modifier   = Modifier.weight(1f),
                 )
-                Spacer(Modifier.width(10.dp))
+                Spacer(Modifier.width(13.dp))
                 Text(
                     text       = SlotHolderText.status(h, elapsedMs),
                     color      = when (h.state) {
                         SlotHolder.State.LEAVING, SlotHolder.State.WATCHING -> StatusBlue
                         else                                                -> MutedText
                     },
-                    fontSize   = 11.sp,
+                    fontSize   = 14.sp,
                     fontFamily = fontFamily,
                     maxLines   = 1,
                 )
@@ -699,9 +703,9 @@ private fun SlotHolderList(list: SlotHolders, elapsedMs: Long, fontFamily: FontF
             Text(
                 text       = "+ ${rows.size - shown.size} more",
                 color      = MutedText,
-                fontSize   = 11.sp,
+                fontSize   = 14.sp,
                 fontFamily = fontFamily,
-                modifier   = Modifier.padding(start = 32.dp, top = 4.dp),
+                modifier   = Modifier.padding(start = 42.dp, top = 5.dp),
             )
         }
     }
@@ -710,16 +714,16 @@ private fun SlotHolderList(list: SlotHolders, elapsedMs: Long, fontFamily: FontF
 /** The profile's own avatar, or an empty dashed seat for the picker or an unknown profile. */
 @Composable
 private fun HolderAvatar(h: SlotHolder) {
-    val box = Modifier.size(20.dp)
+    val box = Modifier.size(26.dp)
     if (h.state == SlotHolder.State.CHOOSING || (h.avatar == null && h.profileName == null)) {
         Canvas(box) {
-            val stroke = 1.dp.toPx()
+            val stroke = 1.3.dp.toPx()
             drawCircle(
                 color  = EmptySeat,
                 radius = size.minDimension / 2 - stroke / 2,
                 style  = Stroke(
                     width      = stroke,
-                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(3.dp.toPx(), 2.dp.toPx())),
+                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(4.dp.toPx(), 2.5.dp.toPx())),
                 ),
             )
         }
@@ -737,7 +741,7 @@ private fun HolderAvatar(h: SlotHolder) {
 @Composable
 private fun ClockGlyph(color: Color, size: Dp) {
     Canvas(Modifier.size(size)) {
-        val stroke = 1.5.dp.toPx()
+        val stroke = 2.dp.toPx()
         val r = this.size.minDimension / 2 - stroke / 2
         drawCircle(color = color, radius = r, style = Stroke(width = stroke))
         drawLine(color, center, Offset(center.x, center.y - r * 0.55f), stroke, StrokeCap.Round)
