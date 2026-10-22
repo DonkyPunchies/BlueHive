@@ -287,8 +287,9 @@ object ApiClient {
             if (response.code == 429) {
                 val reason = try {
                     val peeked = response.peekBody(1024).string()
-                    JSONObject(peeked).optJSONObject("detail")
-                        ?.optString("reason")?.takeIf { it.isNotBlank() }
+                    val detail = JSONObject(peeked).optJSONObject("detail")
+                    LockoutBus.rememberSlotLimit(detail)   // the server's slot count
+                    detail?.optString("reason")?.takeIf { it.isNotBlank() }
                 } catch (e: Exception) {
                     Log.w(TAG, "Could not parse 429 detail reason: ${e.message}")
                     null
@@ -380,6 +381,7 @@ object ApiClient {
                 val reason = try {
                     val peeked = response.peekBody(1024).string()
                     val detail = JSONObject(peeked).optJSONObject("detail")
+                    LockoutBus.rememberSlotLimit(detail)   // the server's slot count
                     detail?.optString("reason")?.takeIf { it.isNotBlank() }
                 } catch (e: Exception) {
                     // Malformed/non-JSON body — fall through with null reason.

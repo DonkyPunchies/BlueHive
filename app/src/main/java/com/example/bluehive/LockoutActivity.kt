@@ -72,7 +72,9 @@ import kotlinx.coroutines.launch
 //      403 → device was hard-revoked — clear session → LoginScreenActivity to re-pair
 //
 //  REASON_WORKSPACE_FULL
-//    All 6 concurrent streaming slots are occupied. No countdown — the user
+//    Every active-device slot on the subscription is occupied. The count is the
+//    server's (BH_ACTIVE_DEVICE_LIMIT, sent as detail.limit, held in
+//    LockoutBus.slotLimit) -- never a number baked into the app. No countdown — the user
 //    just needs to wait for someone else to free a slot. The SSE stream keeps
 //    running in the background; when a slot frees up the server pushes
 //    slot_freed and a green hint appears. The Refresh button checks whether
@@ -89,7 +91,9 @@ class LockoutActivity : ComponentActivity() {
     companion object {
         const val EXTRA_REASON             = "lockout_reason"
         const val LOCKOUT_COOLDOWN_SECONDS = 3 * 60
-        const val WORKSPACE_ACTIVE_LIMIT   = 6
+        // WORKSPACE_ACTIVE_LIMIT = 6 lived here until 2026-10-22 while the server
+        // enforced 4. The slot count now comes only from the server: see
+        // LockoutBus.slotLimit.
 
         @Volatile var isOnTop: Boolean = false
             private set
@@ -280,19 +284,25 @@ fun LockoutScreen(
                     "You will be taken back in or asked to re-pair\n" +
                     "depending on the type of revocation."
         }
-        LockoutBus.REASON_WORKSPACE_FULL -> if (afterIdleRelease) {
-            headline = "Your session timed out."
-            body     = "This TV was left idle, so its streaming slot\n" +
-                    "was released for others on your account.\n\n" +
-                    "All ${LockoutActivity.WORKSPACE_ACTIVE_LIMIT} slots have since been taken. Please wait\n" +
-                    "for one to free up, then tap Refresh to try again."
-        } else {
-            headline = "All streaming slots are currently in use."
-            body     = "You cannot enter the app right now because all\n" +
-                    "${LockoutActivity.WORKSPACE_ACTIVE_LIMIT} streaming slots on this account are occupied.\n\n" +
-                    "Slots are active instances of another person\n" +
-                    "using the app at this moment. Please wait for\n" +
-                    "a slot to free up, then tap Refresh to try again."
+        // THE SERVER'S COUNT, OR NONE. "All 4 slots" when the server has said 4;
+        // plain "All slots" before it has (an older backend, or a lockout reached
+        // without a 429 body) -- never a number that might be wrong.
+        LockoutBus.REASON_WORKSPACE_FULL -> {
+            val count = LockoutBus.slotLimit?.let { "$it " } ?: ""
+            if (afterIdleRelease) {
+                headline = "Your session timed out."
+                body     = "This TV was left idle, so its streaming slot\n" +
+                        "was released for others on your account.\n\n" +
+                        "All ${count}slots have since been taken. Please wait\n" +
+                        "for one to free up, then tap Refresh to try again."
+            } else {
+                headline = "All streaming slots are currently in use."
+                body     = "You cannot enter the app right now because all\n" +
+                        "${count}streaming slots on this account are occupied.\n\n" +
+                        "Slots are active instances of another person\n" +
+                        "using the app at this moment. Please wait for\n" +
+                        "a slot to free up, then tap Refresh to try again."
+            }
         }
         else -> {
             headline = "Session unavailable."

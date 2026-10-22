@@ -405,6 +405,12 @@ fun start() {
                     return@withContext ConnectResult.REVOKED
                 }
                 429 -> {
+                    // The body carries the server's slot count (detail.limit) for
+                    // the lockout screen. Read it here because this path never goes
+                    // through ApiClient's 429 interceptor.
+                    runCatching { JSONObject(resp.body.string()).optJSONObject("detail") }
+                        .getOrNull()
+                        ?.let { LockoutBus.rememberSlotLimit(it) }
                     Log.w(TAG, "SSE connect 429 — workspace full")
                     LockoutBus.post(LockoutBus.REASON_WORKSPACE_FULL)
                     return@withContext ConnectResult.WORKSPACE_FULL

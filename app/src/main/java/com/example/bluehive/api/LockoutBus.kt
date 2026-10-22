@@ -6,7 +6,8 @@ import android.util.Log
  * LockoutBus
  *
  * Lightweight event bus for "this TV has been locked out of the workspace
- * because all 6 active device slots are in use."
+ * because every active-device slot on the subscription is in use." How many
+ * slots there are is the server's number -- see [slotLimit].
  *
  * Posted from:
  *   - The 429 interceptor in ApiClient (any platform API call that gets 429)
@@ -28,6 +29,27 @@ object LockoutBus {
     const val REASON_WORKSPACE_FULL   = "workspace_full"
     const val REASON_REVOKED_BY_ADMIN = "revoked_by_admin"   // hard — device unpaired
     const val REASON_SESSION_REVOKED  = "session_revoked"    // soft — device still paired
+
+    /**
+     * How many TVs may be active at once on this subscription, as the server
+     * last said in a workspace_full 429 -- null until one has arrived.
+     *
+     * ONE SOURCE OF TRUTH. The limit lives in one place only:
+     * BH_ACTIVE_DEVICE_LIMIT in the backend's .env (read by device_sessions.py),
+     * which the server returns as `detail.limit` with every workspace_full 429.
+     * The lockout screen used to print its own hardcoded 6 while the server
+     * enforced 4 (found 2026-10-22). Change the .env value and restart the API,
+     * and the screen follows -- no app release.
+     */
+    @Volatile
+    var slotLimit: Int? = null
+        private set
+
+    /** Record `detail.limit` from a 429's JSON detail, when the server sent one. */
+    fun rememberSlotLimit(detail: org.json.JSONObject?) {
+        val n = detail?.optInt("limit", 0) ?: 0
+        if (n > 0) slotLimit = n
+    }
 
     private val listeners = mutableListOf<(String?) -> Unit>()
 
