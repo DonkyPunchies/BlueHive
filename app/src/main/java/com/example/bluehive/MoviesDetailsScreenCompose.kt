@@ -35,6 +35,10 @@ import androidx.media3.exoplayer.ExoPlayer
 import com.example.bluehive.models.MediaItem
 import com.example.bluehive.repository.RecommendationsRepository
 import kotlinx.coroutines.launch
+import com.example.bluehive.utilities.launchIfActive
+import com.example.bluehive.utilities.runCatchingCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import com.example.bluehive.utilities.DetailsTrailerPlayer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -946,7 +950,9 @@ fun MoviesDetailsScreenContent(
         val sourceKey = src.name.lowercase()
 
         val startedAt = System.currentTimeMillis()
-        val result = runCatching {
+        // Cancellable: leaving the page mid-extract must stop here, not read as
+        // a miss and walk on to the next source (see PageCoroutines.kt).
+        val result = runCatchingCancellable {
             ApiClient.bluehiveApi.extractStreamAwait(
                 type   = "movie",
                 tmdbId = tmdbId,
@@ -1017,7 +1023,7 @@ fun MoviesDetailsScreenContent(
         // gets back here to continue the chain. This was startActivity until
         // 2026-10-19, so a movie that died in the player never failed over.
         chainAttempt = attempt
-        playerLauncher.launch(
+        playerLauncher.launchIfActive(
             Intent(context, HlsPlayerActivity::class.java)
                 .putExtra("M3U8_URL", body.m3u8)
                 // DIRECT FIRST, relay only after a confirmed failure. Re-extracting
@@ -1142,7 +1148,7 @@ fun MoviesDetailsScreenContent(
      */
     suspend fun ensureServerList(url: String, dub: Boolean) {
         if (serverListCache[serverCacheKey(url, dub)] != null) return
-        val list = runCatching {
+        val list = runCatchingCancellable {
             ApiClient.bluehiveApi.extractServers(
                 type   = "movie",
                 tmdbId = tmdbId,
@@ -1173,7 +1179,9 @@ fun MoviesDetailsScreenContent(
     suspend fun extractAnimeMovieViaBackend(dub: Boolean = false,
                                             server: String? = null,
                                             acceptAnyTrack: Boolean = false): ExtractOutcome {
-        val body = runCatching {
+        // Cancellable, like its caller: a page closed mid-request must stop the
+        // work, not return MISS and send the caller on to its fallback.
+        val body = runCatchingCancellable {
             ApiClient.bluehiveApi.extractStreamAwait(
                 type    = "movie",
                 tmdbId  = tmdbId,
@@ -1204,6 +1212,9 @@ fun MoviesDetailsScreenContent(
 
         Log.d("scraper", "M Extract (backend movie audio=${if (dub) "dub" else "sub"}" +
                 "${server?.let { " server=$it" } ?: ""}) → ${body.m3u8.take(60)} cached=${body.cached}")
+        // Not a launcher, so a closed page cannot crash here -- but it would still
+        // open the player after the viewer has left. Stop quietly instead.
+        currentCoroutineContext().ensureActive()
         context.startActivity(
             Intent(context, MiruroPlayerActivity::class.java)
                 .putExtra("M3U8_URL", body.m3u8)
@@ -1275,7 +1286,10 @@ fun MoviesDetailsScreenContent(
                 // dub failover below would return the same server forever.
                 server?.let { triedServers.add(it) }
 
-                var outcome = runCatching {
+                // Cancellable: leaving the page while the backend works must end
+                // this coroutine, not count as a miss and launch the on-device
+                // fallback through the closed page's launcher (PageCoroutines.kt).
+                var outcome = runCatchingCancellable {
                     extractAnimeMovieViaBackend(dub = dub, server = server)
                 }.getOrDefault(ExtractOutcome.MISS)
 
@@ -1295,7 +1309,7 @@ fun MoviesDetailsScreenContent(
                         return@launch
                     }
                     Log.e("scraper", "🔁 dub unavailable on every server — playing sub as last resort")
-                    outcome = runCatching {
+                    outcome = runCatchingCancellable {
                         extractAnimeMovieViaBackend(dub = dub, server = server, acceptAnyTrack = true)
                     }.getOrDefault(ExtractOutcome.MISS)
                 }
@@ -1323,7 +1337,7 @@ fun MoviesDetailsScreenContent(
                     // in this same pass so "Choose a server" is instant afterward.
                     intent.putExtra(MiruroExtractorActivity.EXTRA_CAPTURE_SERVERS, true)
                 }
-                extractorLauncher.launch(intent)
+                extractorLauncher.launchIfActive(intent)
             }
         }
     }
@@ -1344,7 +1358,7 @@ fun MoviesDetailsScreenContent(
                 // screen — and that resume is what RestoreFocusOnPlayerReturn
                 // races, the cause of the picker losing focus. An in-process call
                 // never leaves the screen, so the race cannot arise here.
-                val list = runCatching {
+                val list = runCatchingCancellable {
                     ApiClient.bluehiveApi.extractServers(
                         type   = "movie",
                         tmdbId = tmdbId,
@@ -1367,7 +1381,7 @@ fun MoviesDetailsScreenContent(
 
                 Log.w("scraper", "M Enumerate: backend miss — on-device fallback")
                 try { BlueHiveApplication.coilImageLoader.memoryCache?.clear() } catch (_: Exception) {}
-                enumerateLauncher.launch(
+                enumerateLauncher.launchIfActive(
                     Intent(context, MiruroExtractorActivity::class.java)
                         .putExtra(MiruroExtractorActivity.EXTRA_URL, url)
                         .putExtra(MiruroExtractorActivity.EXTRA_DUB, dub)
