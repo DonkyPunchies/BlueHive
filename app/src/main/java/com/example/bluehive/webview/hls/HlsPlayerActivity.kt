@@ -376,10 +376,15 @@ class HlsPlayerActivity : SubtitlePlayerActivity() {
                 val positionSec = runCatching {
                     if (player?.isPlaying == true) player?.currentPosition else null
                 }.getOrNull()?.takeIf { it > 0 }?.let { (it / 1000).toInt() } ?: continue
+                // The length too, so a TV locked out by this one can show when the
+                // film ends. TIME_UNSET is negative, and live streams have no end.
+                val durationSec = runCatching {
+                    player?.takeIf { !it.isCurrentMediaItemLive }?.duration
+                }.getOrNull()?.takeIf { it > 0 }?.let { (it / 1000).toInt() }
                 runCatching {
                     withContext(Dispatchers.IO) {
                         com.example.bluehive.api.ApiClient.bluehiveApi.updateWatchProgress(
-                            id, com.example.bluehive.api.WatchProgressRequest(positionSec)
+                            id, com.example.bluehive.api.WatchProgressRequest(positionSec, durationSec)
                         )
                     }
                 }

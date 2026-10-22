@@ -1,6 +1,10 @@
 package com.example.bluehive.api
 
+import android.os.SystemClock
 import android.util.Log
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import org.json.JSONObject
 
 /**
  * LockoutBus
@@ -50,6 +54,45 @@ object LockoutBus {
         val n = detail?.optInt("limit", 0) ?: 0
         if (n > 0) slotLimit = n
     }
+
+    private val _holders = MutableStateFlow<SlotHolders?>(null)
+
+    /**
+     * Who holds the slots, from the last workspace_full 429 -- null when that
+     * 429 carried no list (a server older than 2026-10-22). A StateFlow because
+     * every SSE retry brings a fresh one while the lockout screen is up.
+     */
+    val holders: StateFlow<SlotHolders?> = _holders
+
+    /** Record `detail.holders` from a workspace_full 429's JSON detail. */
+    fun rememberHolders(detail: org.json.JSONObject?) {
+        if (detail?.optString("reason") != REASON_WORKSPACE_FULL) return
+        val list = detail.optJSONArray("holders")
+        _holders.value = list?.let { arr ->
+            SlotHolders(
+                holders = (0 until arr.length()).mapNotNull { i ->
+                    val o = arr.optJSONObject(i) ?: return@mapNotNull null
+                    SlotHolder(
+                        device         = o.str("device") ?: "TV",
+                        state          = SlotHolder.State.of(o.str("state")) ?: return@mapNotNull null,
+                        profileName    = o.str("name"),
+                        avatar         = o.str("avatar"),
+                        freesInSeconds = o.int("frees_in"),
+                        media          = o.str("media"),
+                        endsInSeconds  = o.int("ends_in"),
+                    )
+                },
+                graceSeconds = detail.optInt("grace_s", 15 * 60),
+                receivedAtMs = SystemClock.elapsedRealtime(),
+            )
+        }
+    }
+
+    private fun JSONObject.str(key: String): String? =
+        if (has(key) && !isNull(key)) optString(key).takeIf { it.isNotBlank() } else null
+
+    private fun JSONObject.int(key: String): Int? =
+        if (has(key) && !isNull(key)) optInt(key) else null
 
     private val listeners = mutableListOf<(String?) -> Unit>()
 

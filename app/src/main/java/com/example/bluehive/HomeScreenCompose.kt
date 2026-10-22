@@ -45,6 +45,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.currentStateAsState
 import com.example.bluehive.api.SessionExpiredBus
+import com.example.bluehive.auth.ActiveProfile
 import com.example.bluehive.auth.HostEntitlementRelay
 import com.example.bluehive.update.UpdateGate
 import com.example.bluehive.auth.SessionManager
@@ -202,6 +203,9 @@ class HomeScreenCompose : ComponentActivity() {
         val profileId       = intent.getIntExtra("PROFILE_ID", -1)
         val profileName     = intent.getStringExtra("PROFILE_NAME") ?: ""
         val profileAvatarId = intent.getIntExtra("PROFILE_AVATAR_ID", R.drawable.avatar1)
+        // Also set by the picker; this covers Android rebuilding the home screen
+        // after killing the process, when the picker never ran.
+        if (profileId > 0) ActiveProfile.id = profileId
 
         setContent {
             HomeScreenComposeContent(

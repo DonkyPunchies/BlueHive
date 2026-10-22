@@ -166,6 +166,9 @@ data class AndroidRefreshRequest(
  */
 data class WatchProgressRequest(
     val position_seconds: Int,
+    // Length of what is playing, so a TV locked out by this one can say when it
+    // ends. Null (left out of the JSON) when the player does not know it.
+    val duration_seconds: Int? = null,
 )
 
 data class DeviceRenameRequest(

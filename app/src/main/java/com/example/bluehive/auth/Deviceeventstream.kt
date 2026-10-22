@@ -11,6 +11,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -99,6 +102,13 @@ object DeviceEventStream {
     // the inactivity countdown — if the user already intentionally
     // exited via back button, the countdown is irrelevant.
     val isIntentionallyExited: Boolean get() = intentionallyExited
+
+    // How many times the stream has opened in this process. A connect only
+    // succeeds once the server has given this TV a slot (the cap is checked on
+    // connect), so a rise here while the lockout screen is up means the
+    // background retry just got in. LockoutActivity watches it to walk in.
+    private val _opens = MutableStateFlow(0)
+    val opens: StateFlow<Int> = _opens
 
     // Dedicated HTTP client for the SSE stream:
     //   - No authenticator: we handle reconnection + 401 ourselves via ensureFreshToken().
@@ -353,6 +363,8 @@ fun start() {
             .url("$BLUEHIVE_BASE/api/android/events")
             .header("Authorization",        "Bearer $accessToken")
             .header("X-Device-Fingerprint", fingerprint)
+            // Who is on this TV, for other TVs' lockout lists. See ActiveProfile.
+            .header("X-Profile-Id",         ActiveProfile.headerValue())
             .header("Accept",               "text/event-stream")
             .header("Cache-Control",        "no-cache")
             // Deliberately NO X-Refresh-Token — the SSE endpoint uses JWT-only auth.
@@ -410,7 +422,12 @@ fun start() {
                     // through ApiClient's 429 interceptor.
                     runCatching { JSONObject(resp.body.string()).optJSONObject("detail") }
                         .getOrNull()
-                        ?.let { LockoutBus.rememberSlotLimit(it) }
+                        ?.let {
+                            LockoutBus.rememberSlotLimit(it)
+                            // Who holds the slots. Each retry brings a fresh list,
+                            // which is what keeps the lockout screen's list current.
+                            LockoutBus.rememberHolders(it)
+                        }
                     Log.w(TAG, "SSE connect 429 — workspace full")
                     LockoutBus.post(LockoutBus.REASON_WORKSPACE_FULL)
                     return@withContext ConnectResult.WORKSPACE_FULL
@@ -450,6 +467,7 @@ fun start() {
             }
 
             Log.d(TAG, "SSE stream open (fp=…${fingerprint.takeLast(8)})")
+            _opens.update { it + 1 }
 
             // ── Read the stream line-by-line ───────────────────────────────────
             val source = resp.body.source()

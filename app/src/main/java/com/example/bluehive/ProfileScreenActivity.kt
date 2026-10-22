@@ -81,6 +81,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import com.example.bluehive.api.ApiClient
 import com.example.bluehive.api.ProfileQuotaResponse
 import com.example.bluehive.api.ProfileResponse
+import com.example.bluehive.auth.ActiveProfile
 import com.example.bluehive.auth.HostEntitlementRelay
 import com.example.bluehive.auth.SessionManager
 import kotlinx.coroutines.CoroutineScope
@@ -157,7 +158,8 @@ private val AVATAR_DRAWABLE_MAP: Map<String, Int> = mapOf(
     "avatar36" to R.drawable.avatar36,
 )
 
-private fun resolveAvatarDrawable(resName: String?): Int =
+// internal, not private: the lockout screen's slot list draws the same avatars.
+internal fun resolveAvatarDrawable(resName: String?): Int =
     AVATAR_DRAWABLE_MAP[resName ?: ""] ?: R.drawable.avatar1
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -572,8 +574,17 @@ class ProfileScreenActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        // The picker is on screen, so nobody is on a profile. The next heartbeat
+        // tells the server, for other TVs' lockout lists.
+        ActiveProfile.id = null
+    }
+
     private fun goHome(profileId: Int, displayName: String, avatarResId: Int) {
         Log.d(TAG, "Profile selected → id=$profileId name=$displayName")
+        // Before the select call, so no request built after it still says "none".
+        ActiveProfile.id = profileId
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 ApiClient.bluehiveApi.selectProfile(profileId)

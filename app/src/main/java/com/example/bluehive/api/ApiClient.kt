@@ -1,5 +1,6 @@
 package com.example.bluehive.api
 
+import com.example.bluehive.auth.ActiveProfile
 import com.example.bluehive.auth.HostEntitlementRelay
 import android.util.Log
 import com.example.bluehive.BuildConfig
@@ -273,6 +274,9 @@ object ApiClient {
             // change with zero client update. Sent ONLY here — never on platform or
             // TMDB clients. versionCode is the integer the update manifest compares.
             req.header("X-BlueHive-Version", BuildConfig.VERSION_CODE.toString())
+            // The profile this TV is on ("none" on the picker), so the server can
+            // tell a locked-out TV who holds each slot. See ActiveProfile.
+            req.header("X-Profile-Id", ActiveProfile.headerValue())
             // Session-lifecycle endpoints (check-slot / end-session / background /
             // foreground) are keyed by device fingerprint server-side. Send it on
             // every bluehive-api call so they match the SSE connect's fingerprint.
@@ -286,9 +290,12 @@ object ApiClient {
             val response = chain.proceed(chain.request())
             if (response.code == 429) {
                 val reason = try {
-                    val peeked = response.peekBody(1024).string()
+                    // 16 KB, not 1 KB: the workspace_full detail now lists the slot
+                    // holders, and a cut-off body parses as nothing at all.
+                    val peeked = response.peekBody(16 * 1024L).string()
                     val detail = JSONObject(peeked).optJSONObject("detail")
                     LockoutBus.rememberSlotLimit(detail)   // the server's slot count
+                    LockoutBus.rememberHolders(detail)     // ...and who holds them
                     detail?.optString("reason")?.takeIf { it.isNotBlank() }
                 } catch (e: Exception) {
                     Log.w(TAG, "Could not parse 429 detail reason: ${e.message}")
@@ -379,9 +386,12 @@ object ApiClient {
                 // without consuming the stream the route handler will read.
                 // The server returns: { "detail": { "reason": "...", "message": "..." } }
                 val reason = try {
-                    val peeked = response.peekBody(1024).string()
+                    // 16 KB, not 1 KB: the workspace_full detail now lists the slot
+                    // holders, and a cut-off body parses as nothing at all.
+                    val peeked = response.peekBody(16 * 1024L).string()
                     val detail = JSONObject(peeked).optJSONObject("detail")
                     LockoutBus.rememberSlotLimit(detail)   // the server's slot count
+                    LockoutBus.rememberHolders(detail)     // ...and who holds them
                     detail?.optString("reason")?.takeIf { it.isNotBlank() }
                 } catch (e: Exception) {
                     // Malformed/non-JSON body — fall through with null reason.
