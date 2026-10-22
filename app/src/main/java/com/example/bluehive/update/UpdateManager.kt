@@ -509,21 +509,30 @@ object UpdateManager {
      *
      * Returns -1 when the figure cannot be obtained, which callers treat as
      * "proceed and let PackageInstaller decide" rather than as a shortage.
+     *
+     * ANDROID 7.1 ALWAYS GETS -1, because all three calls are Android 8 (API 26)
+     * and minSdk is 25. Called there, the missing method throws
+     * NoSuchMethodError -- an Error, which the catch below never sees -- and it
+     * took the updater down as the download began. Lint's NewApi check found it
+     * on 2026-10-21, beside the API 29 call that crashed Accept on Android 8-9.
      */
-    private fun allocatableBytesFor(context: Context, wanted: Long): Long = try {
-        val sm = context.getSystemService(android.os.storage.StorageManager::class.java)
-        val uuid = sm.getUuidForPath(context.cacheDir)
-        val allocatable = sm.getAllocatableBytes(uuid)
-        if (allocatable >= wanted) {
-            // Ask the platform to actually free it. Without this the cache is
-            // merely evictable in principle and the session can still hit ENOSPC.
-            runCatching { sm.allocateBytes(uuid, wanted) }
-                .onFailure { Log.e(TAG, "allocateBytes declined: ${it.message}") }
+    private fun allocatableBytesFor(context: Context, wanted: Long): Long {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return -1L
+        return try {
+            val sm = context.getSystemService(android.os.storage.StorageManager::class.java)
+            val uuid = sm.getUuidForPath(context.cacheDir)
+            val allocatable = sm.getAllocatableBytes(uuid)
+            if (allocatable >= wanted) {
+                // Ask the platform to actually free it. Without this the cache is
+                // merely evictable in principle and the session can still hit ENOSPC.
+                runCatching { sm.allocateBytes(uuid, wanted) }
+                    .onFailure { Log.e(TAG, "allocateBytes declined: ${it.message}") }
+            }
+            allocatable
+        } catch (e: Exception) {
+            Log.e(TAG, "could not measure allocatable bytes: ${e.message}")
+            -1L
         }
-        allocatable
-    } catch (e: Exception) {
-        Log.e(TAG, "could not measure allocatable bytes: ${e.message}")
-        -1L
     }
 
     /**
