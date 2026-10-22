@@ -12,7 +12,9 @@ import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -195,18 +197,21 @@ class SelfUpdateActivity : ComponentActivity() {
      */
     private val canRetry = MutableStateFlow(false)
 
-    /**
-     * Whether the failure screen also offers a way past it.
-     *
-     * ONLY EVER TRUE ON AN OPTIONAL UPDATE. A download that fails used to call
-     * proceedToApp() straight away — no reason shown, mandatory or not — so the
-     * screen flashed and the user landed in the app with no idea an update had
-     * been attempted, let alone why it did not happen. Showing the reason means
-     * the screen now stays, and a screen that stays needs a documented exit for
-     * the case where staying is not required. Without this flag that fix would
-     * simply have moved the brick from the install path to the download path.
-     */
-    private val canSkip = MutableStateFlow(false)
+    // NO WAY PAST A FAILED UPDATE, at the owner's call (2026-10-21). A canSkip
+    // flag used to put a quiet "Continue without updating" under the retry button
+    // on optional updates. The failure screen now offers exactly two things, Try
+    // again and Close Application, and Back is the second way to close.
+    //
+    // WHAT THAT COSTS, stated so nobody rediscovers it: the consent screen offers
+    // only Accept or Close, so a device that cannot install -- a full disk above
+    // all -- cannot open BlueHive until the cause is fixed. That is why the
+    // failure screen has to name the cause in its title and in red.
+
+    /** The status in support form ("code 6: INSTALL_FAILED_..."), shown small under the reason. */
+    private val failureCode = MutableStateFlow<String?>(null)
+
+    /** True when the stopped screen is reporting a failure, which draws it in red. */
+    private val isError = MutableStateFlow(false)
 
     /** The verified APK, kept so a retry does not re-download 163MB. */
     @Volatile private var downloadedApk: java.io.File? = null
@@ -265,10 +270,17 @@ class SelfUpdateActivity : ComponentActivity() {
         isMandatoryUpdate = mandatory
         if (mandatory) Log.i(TAG, "mandatory update — build ${manifest.minSupported} is the floor")
 
-        // Ignore Back during the update so the user can't strand themselves.
+        // BACK CLOSES THE APP ON A STOPPED SCREEN and does nothing while a download
+        // or install is running. Swallowing it mid-flight keeps a stray press from
+        // abandoning an update half-written; once the screen has stopped -- a
+        // failure, or waiting on the install permission -- Back is the second way
+        // to the same Close Application the button offers. The consent screen has
+        // its own BackHandler, which takes precedence while it is composed.
         onBackPressedDispatcher.addCallback(this, object :
             androidx.activity.OnBackPressedCallback(true) {
-            override fun handleOnBackPressed() { /* no-op */ }
+            override fun handleOnBackPressed() {
+                if (canRetry.value) closeApplication()
+            }
         })
 
         // If install is cancelled or fails, let the user into the app anyway —
@@ -295,6 +307,8 @@ class SelfUpdateActivity : ComponentActivity() {
                             failureDetail.value =
                                 "Turn on \u201CAllow from this source\u201D on the next screen, " +
                                     "then come back here."
+                            failureCode.value = null
+                            isError.value = false
                             retryLabel.value = "Open settings"
                             canRetry.value = true
                             awaitingPermission = true
@@ -309,8 +323,9 @@ class SelfUpdateActivity : ComponentActivity() {
                             downloadedApk?.delete()
                             downloadedApk = null
                             canRetry.value = false
-                            canSkip.value = false
                             failureDetail.value = null
+                            failureCode.value = null
+                            isError.value = false
                             startDownload(pendingManifest)
                         }
 
@@ -322,16 +337,12 @@ class SelfUpdateActivity : ComponentActivity() {
                             // instead — the reason is the only useful thing left, and
                             // for a full disk it is something the user can act on.
                             Log.e(TAG, "terminal install failure — not retrying")
-                            status.value = "Update could not be installed"
-                            failureDetail.value = explain(code, result.message)
-                            retryLabel.value = "Try again"
+                            showFailure(code, result.message)
                             canRetry.value = true   // manual only; a person is not a loop
                         }
 
                         else -> {
-                            status.value = "Update was not completed. Press Try again to continue."
-                            failureDetail.value = explain(code, result.message)
-                            retryLabel.value = "Try again"
+                            showFailure(code, result.message)
                             canRetry.value = true
                             // AND retry on its own, up to a limit. The commonest
                             // cause is nobody seeing the system dialog — it appears
@@ -366,14 +377,11 @@ class SelfUpdateActivity : ComponentActivity() {
                     // above all, which is reported here from the download path
                     // too — used to vanish silently and leave them in the app with
                     // no idea an update had been attempted. The screen now says
-                    // what happened and offers both ways on, because on an
-                    // optional update carrying on really is allowed.
-                    Log.e(TAG, "Install not completed (status=$code) — explaining and offering both ways on")
-                    status.value = "Update could not be installed"
-                    failureDetail.value = explain(code, result.message)
-                    retryLabel.value = "Try again"
+                    // what happened and offers Try again or Close Application; the
+                    // way past it was removed at the owner's call (see failureCode).
+                    Log.e(TAG, "Install not completed (status=$code) — explaining, offering retry or close")
+                    showFailure(code, result.message)
                     canRetry.value = true
-                    canSkip.value = true
                 }
             }
         }
@@ -397,7 +405,8 @@ class SelfUpdateActivity : ComponentActivity() {
                 val retry by canRetry.collectAsState()
                 val label by retryLabel.collectAsState()
                 val detail by failureDetail.collectAsState()
-                val skip by canSkip.collectAsState()
+                val code by failureCode.collectAsState()
+                val error by isError.collectAsState()
                 UpdateScreen(
                     fromVersion = BuildConfig.VERSION_NAME,
                     toVersion = manifest.latestVersionName,
@@ -408,8 +417,9 @@ class SelfUpdateActivity : ComponentActivity() {
                     onRetry = { performRetry() },
                     retryLabel = label,
                     detail = detail,
-                    showSkip = skip,
-                    onSkip = { proceedToApp() },
+                    errorCode = code,
+                    isError = error,
+                    onClose = { closeApplication() },
                 )
             }
         }
@@ -602,6 +612,8 @@ class SelfUpdateActivity : ComponentActivity() {
             failureDetail.value =
                 "Open settings, turn on \u201CAllow from this source\u201D for BlueHive, " +
                     "then come back here."
+            failureCode.value = null
+            isError.value = false
             retryLabel.value = "Open settings"
             canRetry.value = true
         } else {
@@ -635,18 +647,19 @@ class SelfUpdateActivity : ComponentActivity() {
                 // screen vanished and the user was in the app on the old build
                 // with nothing to explain it, on a required update as readily as
                 // an optional one. The reason goes on the same failure screen the
-                // install path uses, and the exit is offered only when the build
-                // is actually allowed to keep running — see canSkip.
+                // install path uses, with the same two ways on: Try again or
+                // Close Application.
                 is UpdateManager.DownloadOutcome.Failed -> {
                     Log.e(TAG, "download failed — ${outcome.reason}")
                     progress.value = 0f
-                    status.value = "Update could not be downloaded"
+                    status.value = "Couldn't download the update"
                     failureDetail.value = outcome.reason
+                    failureCode.value = null
+                    isError.value = true
                     // beginInstall() restarts the download when no APK is held,
                     // so the existing dispatcher already does the right thing.
                     retryLabel.value = "Try again"
                     canRetry.value = true
-                    canSkip.value = !isMandatoryUpdate
                     return@launch
                 }
             }
@@ -691,16 +704,18 @@ class SelfUpdateActivity : ComponentActivity() {
             Log.e(TAG, "no usable downloaded APK — restarting the download")
             downloadedApk = null
             canRetry.value = false
-            canSkip.value = false
             failureDetail.value = null
+            failureCode.value = null
+            isError.value = false
             startDownload(pendingManifest)
             return
         }
         if (installing) return
         installing = true
         canRetry.value = false
-        canSkip.value = false
         failureDetail.value = null
+        failureCode.value = null
+        isError.value = false
         isInstalling.value = true
         status.value = "Installing update…"
         UpdateManager.install(applicationContext, apk)
@@ -747,23 +762,53 @@ class SelfUpdateActivity : ComponentActivity() {
         else -> Failure.RETRYABLE
     }
 
-    /** The failure in language a person can act on, with the code for support. */
-    private fun explain(status: Int, msg: String?): String {
-        val head = when (status) {
-            PackageInstaller.STATUS_FAILURE_STORAGE ->
-                "There is not enough free space on this device to install the update. " +
-                    "Removing an app you do not use will make room."
-            PackageInstaller.STATUS_FAILURE_CONFLICT ->
-                "This update does not match the copy of BlueHive already installed."
-            PackageInstaller.STATUS_FAILURE_INCOMPATIBLE ->
-                "This update is not compatible with this device."
-            PackageInstaller.STATUS_FAILURE_BLOCKED ->
-                "The system blocked this install."
-            PackageInstaller.STATUS_FAILURE_INVALID ->
-                "The downloaded update was damaged."
-            else -> "The update could not be installed."
-        }
-        return if (msg.isNullOrBlank()) "$head  (code $status)" else "$head  (code $status: $msg)"
+    /**
+     * Put a failed install on screen: why in the title, what to do in the red
+     * box, and the status code underneath for support.
+     *
+     * THE TITLE NAMES THE CAUSE. It used to read "Update could not be installed"
+     * whatever happened, with the reason in small grey text at the foot of the
+     * screen -- on a Fire TV Stick out of space, nobody saw it (2026-10-21).
+     */
+    private fun showFailure(code: Int, msg: String?) {
+        status.value = failureTitle(code)
+        failureDetail.value = explain(code)
+        failureCode.value = if (msg.isNullOrBlank()) "code $code" else "code $code: $msg"
+        isError.value = true
+        retryLabel.value = "Try again"
+    }
+
+    /** The cause as a short title. It is the first thing read, so it says why. */
+    private fun failureTitle(status: Int): String = when (status) {
+        PackageInstaller.STATUS_FAILURE_STORAGE -> "Not enough storage to install the update"
+        PackageInstaller.STATUS_FAILURE_CONFLICT -> "This update doesn't match the installed BlueHive"
+        PackageInstaller.STATUS_FAILURE_INCOMPATIBLE -> "This update isn't compatible with this device"
+        PackageInstaller.STATUS_FAILURE_BLOCKED -> "This device blocked the update"
+        PackageInstaller.STATUS_FAILURE_INVALID -> "The update download was damaged"
+        PackageInstaller.STATUS_FAILURE_ABORTED -> "The install was cancelled"
+        PackageInstaller.STATUS_FAILURE_TIMEOUT -> "The install timed out"
+        else -> "The update could not be installed"
+    }
+
+    /** The failure in language a person can act on. The code is shown separately. */
+    private fun explain(status: Int): String = when (status) {
+        PackageInstaller.STATUS_FAILURE_STORAGE ->
+            "There isn't enough free space on this device for the update. " +
+                "Uninstall an app you don't use to make room, then press Try again."
+        PackageInstaller.STATUS_FAILURE_CONFLICT ->
+            "This update does not match the copy of BlueHive already installed."
+        PackageInstaller.STATUS_FAILURE_INCOMPATIBLE ->
+            "This update is not compatible with this device."
+        PackageInstaller.STATUS_FAILURE_BLOCKED ->
+            "The system blocked this install."
+        PackageInstaller.STATUS_FAILURE_INVALID ->
+            "The downloaded update was damaged. Press Try again to download it again."
+        PackageInstaller.STATUS_FAILURE_ABORTED ->
+            "Android's install confirmation closed before it finished. " +
+                "Press Try again and choose Install."
+        PackageInstaller.STATUS_FAILURE_TIMEOUT ->
+            "Android took too long to confirm the install. Press Try again."
+        else -> "Android did not give a reason. Press Try again."
     }
 
     /**
@@ -823,8 +868,12 @@ private val RING_DIAMETER = 188.dp
 /** Arc thickness. Thin enough to read as a ring rather than a donut. */
 private val RING_STROKE_WIDTH = 5.dp
 
-/** The mark inside the ring, with room to breathe against the arc. */
-private val RING_LOGO_SIZE = 96.dp
+/**
+ * The mark inside the ring. 1.5x the original 96dp at the owner's request
+ * (2026-10-21); the ring keeps its size so the screen still fits a 540dp-tall
+ * TV layout, leaving the logo about 19dp clear of the arc.
+ */
+private val RING_LOGO_SIZE = 144.dp
 
 /** Sweep of the chasing arc while progress is unknown. */
 private const val INDETERMINATE_SWEEP_DEG = 96f
@@ -840,15 +889,12 @@ private fun UpdateScreen(
     onRetry: () -> Unit = {},
     retryLabel: String = "Try again",
     detail: String? = null,
-    /**
-     * The quieter second action, drawn under the primary one.
-     *
-     * DEFAULTS OFF so every existing caller and every required update is
-     * unchanged: an update below the manifest's floor must not offer a way past
-     * itself, and a screen that is merely downloading has nothing to skip.
-     */
-    showSkip: Boolean = false,
-    onSkip: () -> Unit = {},
+    /** The status code in support form, drawn small under [detail]. */
+    errorCode: String? = null,
+    /** A stopped screen reporting a failure is drawn in red; a permission prompt is not. */
+    isError: Boolean = false,
+    /** The second button on a stopped screen; Back reaches it too. */
+    onClose: () -> Unit = {},
 ) {
     val bg = Color(0xFF0E0E10)
     val accent = Color(0xFF378ADD)
@@ -857,6 +903,15 @@ private fun UpdateScreen(
     val textPrimary = Color(0xFFF5F5F2)
     val textMuted = Color(0xFF888780)
     val textFaint = Color(0xFF5F5E5A)
+
+    // The failure palette. Red has to read on a TV across a room without
+    // blooming, so the fill is a translucent red over the near-black ground and
+    // the full-strength red is kept for the edge and the title.
+    val errorTitle = Color(0xFFFF6B6B)
+    val errorEdge = Color(0xFFE24B4A)
+    val errorFill = Color(0x40E24B4A)
+    val errorText = Color(0xFFFFE3E3)
+    val errorCodeText = Color(0xFFF2A7A7)
 
     // Two states share this screen and they need different motion. A download
     // reports real fractions; an install cannot, because dex2oat gives nothing
@@ -909,7 +964,7 @@ private fun UpdateScreen(
         contentAlignment = Alignment.Center,
     ) {
         Column(
-            modifier = Modifier.width(520.dp).padding(horizontal = 24.dp),
+            modifier = Modifier.width(620.dp).padding(horizontal = 24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
 
@@ -1015,11 +1070,26 @@ private fun UpdateScreen(
                 Spacer(Modifier.height(4.dp))
             }
 
+            // A stopped screen's title is the cause ("Not enough storage to
+            // install the update"), so it is the largest text here, and red when
+            // it reports a failure.
             Text(
                 text = status,
-                color = if (indeterminate || stopped) textPrimary else textMuted,
-                fontSize = if (indeterminate || stopped) 19.sp else 14.sp,
-                fontWeight = if (indeterminate || stopped) FontWeight.Medium else FontWeight.Normal,
+                color = when {
+                    stopped && isError -> errorTitle
+                    indeterminate || stopped -> textPrimary
+                    else -> textMuted
+                },
+                fontSize = when {
+                    stopped -> 24.sp
+                    indeterminate -> 19.sp
+                    else -> 14.sp
+                },
+                fontWeight = when {
+                    stopped -> FontWeight.SemiBold
+                    indeterminate -> FontWeight.Medium
+                    else -> FontWeight.Normal
+                },
                 textAlign = TextAlign.Center,
             )
 
@@ -1041,7 +1111,47 @@ private fun UpdateScreen(
                 Text(toVersion, color = accentSoft, fontSize = 13.sp, fontWeight = FontWeight.Medium)
             }
 
-            Spacer(Modifier.height(if (showRetry) 26.dp else 20.dp))
+            // ── THE REASON, BOXED AND IN RED ──────────────────────────────────
+            //
+            // This used to be 12sp faint grey at the very foot of the screen, under
+            // the buttons -- on a Fire TV Stick that ran out of space the cause was
+            // there and nobody saw it (2026-10-21). It now sits between the title
+            // and the buttons, so it is read before anyone acts, at a size that
+            // reads from a sofa. A permission prompt gets the same box in blue:
+            // it is an instruction, not a failure.
+            if (stopped && detail != null) {
+                Spacer(Modifier.height(18.dp))
+                val shape = RoundedCornerShape(12.dp)
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(shape)
+                        .background(if (isError) errorFill else accent.copy(alpha = 0.15f))
+                        .border(2.dp, if (isError) errorEdge else accent.copy(alpha = 0.6f), shape)
+                        .padding(horizontal = 20.dp, vertical = 14.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text(
+                        text = detail,
+                        color = if (isError) errorText else textPrimary,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Medium,
+                        textAlign = TextAlign.Center,
+                        lineHeight = 25.sp,
+                    )
+                    if (errorCode != null) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = errorCode,
+                            color = errorCodeText,
+                            fontSize = 13.sp,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(if (showRetry) 22.dp else 20.dp))
 
             // ── THE WAY OUT OF A FAILED REQUIRED INSTALL ──────────────────────
             //
@@ -1052,100 +1162,118 @@ private fun UpdateScreen(
             // called on a required update, and there was no focusable element on
             // the screen at all. That is a brick, and missing one system dialog
             // was enough to reach it.
-            if (showRetry) {
-                val focus = remember { FocusRequester() }
-                var focused by remember { mutableStateOf(false) }
-
-                // TAKES FOCUS ON APPEARANCE. On a remote there is no pointer to
-                // aim; if nothing is focused, pressing OK does nothing and the
-                // screen still looks dead. The button has to be armed the moment
-                // it is drawn.
-                LaunchedEffect(Unit) {
-                    awaitFrame()
-                    runCatching { focus.requestFocus() }
-                }
-
-                Box(
-                    modifier = Modifier
-                        .focusRequester(focus)
-                        .onFocusChanged { focused = it.isFocused }
-                        .focusable()
-                        .onKeyEvent { e ->
-                            if (e.type == KeyEventType.KeyDown &&
-                                (e.key == Key.DirectionCenter || e.key == Key.Enter ||
-                                 e.key == Key.NumPadEnter)
-                            ) { onRetry(); true } else false
-                        }
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(if (focused) accent else Color(0x26378ADD))
-                        .padding(horizontal = 30.dp, vertical = 13.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text(
-                        retryLabel,
-                        color = if (focused) Color(0xFF0E0E10) else accentSoft,
-                        fontSize = 15.sp,
-                        fontWeight = FontWeight.Medium,
-                    )
-                }
-                Spacer(Modifier.height(18.dp))
-            }
-
-            // ── THE WAY PAST AN OPTIONAL UPDATE THAT WOULD NOT DOWNLOAD ───────
             //
-            // Deliberately quieter than the retry above: no fill, muted text. The
-            // update is still the thing we would like to happen, and this is the
-            // concession, so it should not compete for the eye. The primary
-            // button keeps the initial focus and D-pad down reaches this one.
-            if (showSkip) {
-                var skipFocused by remember { mutableStateOf(false) }
-
-                Box(
-                    modifier = Modifier
-                        .onFocusChanged { skipFocused = it.isFocused }
-                        .focusable()
-                        .onKeyEvent { e ->
-                            if (e.type == KeyEventType.KeyDown &&
-                                (e.key == Key.DirectionCenter || e.key == Key.Enter ||
-                                 e.key == Key.NumPadEnter)
-                            ) { onSkip(); true } else false
-                        }
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(if (skipFocused) Color(0x26FFFFFF) else Color.Transparent)
-                        .padding(horizontal = 26.dp, vertical = 11.dp),
-                    contentAlignment = Alignment.Center,
+            // TWO WAYS ON, AND ONLY TWO (owner's call, 2026-10-21): Try again, or
+            // Close Application. Side by side so the pair costs one row of a
+            // 540dp-tall TV layout; D-pad left and right move between them, and
+            // Back is the second way to close (see onCreate).
+            if (showRetry) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text(
-                        "Continue without updating",
-                        color = if (skipFocused) textPrimary else textMuted,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Normal,
+                    UpdateScreenButton(
+                        label = retryLabel,
+                        primary = true,
+                        takeFocus = true,
+                        onClick = onRetry,
+                    )
+                    UpdateScreenButton(
+                        label = "Close Application",
+                        primary = false,
+                        takeFocus = false,
+                        onClick = onClose,
                     )
                 }
                 Spacer(Modifier.height(18.dp))
             }
 
-            Text(
-                // The real reason when there is one. This is the line that makes
-                // a stuck TV supportable: it names the cause and carries the
-                // status code, so a user can act on a full disk and an operator
-                // can recognise a mis-signed publish without a single log line.
-                //
-                // HEDGED ON THE RESTART, deliberately. BlueHive cannot relaunch
-                // itself after being replaced — a receiver with no window is
-                // blocked — so the host does it, and on a bare host nobody does.
-                // The old copy promised an automatic restart outright, which is a
-                // promise this app is not in a position to keep.
-                text = detail ?: if (isInstalling) {
-                    "Installing. This can take a minute on first run.\nBlueHive will close while it finishes."
-                } else {
-                    "Keep this screen open. BlueHive will close to install,\nthen reopen from your home screen."
-                },
-                color = textFaint,
-                fontSize = 12.sp,
-                textAlign = TextAlign.Center,
-                lineHeight = 18.sp,
-            )
+            // In-progress guidance only. A stopped screen carries its reason in
+            // the box above instead, where it is read before the buttons.
+            if (!stopped) {
+                Text(
+                    // HEDGED ON THE RESTART, deliberately. BlueHive cannot relaunch
+                    // itself after being replaced — a receiver with no window is
+                    // blocked — so the host does it, and on a bare host nobody does.
+                    // The old copy promised an automatic restart outright, which is a
+                    // promise this app is not in a position to keep.
+                    text = if (isInstalling) {
+                        "Installing. This can take a minute on first run.\nBlueHive will close while it finishes."
+                    } else {
+                        "Keep this screen open. BlueHive will close to install,\nthen reopen from your home screen."
+                    },
+                    color = textFaint,
+                    fontSize = 12.sp,
+                    textAlign = TextAlign.Center,
+                    lineHeight = 18.sp,
+                )
+            }
         }
+    }
+}
+
+/**
+ * One button on the stopped update screen.
+ *
+ * Remote-driven: OK and Enter press it, and focus is drawn as a fill because a TV
+ * has no pointer to hover with. The primary button is the accent blue; the
+ * secondary one is neutral, so the eye still lands on Try again first.
+ *
+ * TAKES FOCUS ON APPEARANCE when asked. On a remote there is no pointer to aim;
+ * if nothing is focused, pressing OK does nothing and the screen looks dead. The
+ * primary button has to be armed the moment it is drawn.
+ */
+@Composable
+private fun UpdateScreenButton(
+    label: String,
+    primary: Boolean,
+    takeFocus: Boolean,
+    onClick: () -> Unit,
+) {
+    val accent = Color(0xFF378ADD)
+    val accentSoft = Color(0xFF85B7EB)
+    val focus = remember { FocusRequester() }
+    var focused by remember { mutableStateOf(false) }
+
+    if (takeFocus) {
+        LaunchedEffect(Unit) {
+            awaitFrame()
+            runCatching { focus.requestFocus() }
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .focusRequester(focus)
+            .onFocusChanged { focused = it.isFocused }
+            .focusable()
+            .onKeyEvent { e ->
+                if (e.type == KeyEventType.KeyDown &&
+                    (e.key == Key.DirectionCenter || e.key == Key.Enter ||
+                     e.key == Key.NumPadEnter)
+                ) { onClick(); true } else false
+            }
+            .clip(RoundedCornerShape(10.dp))
+            .background(
+                when {
+                    primary && focused -> accent
+                    primary -> Color(0x26378ADD)
+                    focused -> Color(0xFFF5F5F2)
+                    else -> Color(0x1AFFFFFF)
+                }
+            )
+            .padding(horizontal = 30.dp, vertical = 13.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            label,
+            color = when {
+                focused -> Color(0xFF0E0E10)
+                primary -> accentSoft
+                else -> Color(0xFFBDBDB8)
+            },
+            fontSize = 16.sp,
+            fontWeight = FontWeight.Medium,
+        )
     }
 }
