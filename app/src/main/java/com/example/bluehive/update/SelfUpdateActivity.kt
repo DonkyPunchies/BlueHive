@@ -521,12 +521,23 @@ class SelfUpdateActivity : ComponentActivity() {
      *
      * API 25 has no per-app switch -- unknown sources is one global setting there
      * -- so there is nothing to check and nothing to ask for.
+     *
+     * TWO NAMES FOR THE SAME READ, SPLIT AT API 29. unsafeCheckOpNoThrow only
+     * exists from Android 10; on Android 8 and 9 the same appop is read with
+     * checkOpNoThrow, which Android 11 later deprecated in its favour. Calling
+     * the new name unguarded crashed every Accept on a Fire TV Stick (Fire OS 7,
+     * Android 9) with NoSuchMethodError, 2026-10-21 -- before any download, so
+     * no Android 8 or 9 device could update itself.
      */
     private fun canInstallPackages(): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return true
-        val mode = getSystemService(AppOpsManager::class.java).unsafeCheckOpNoThrow(
-            OP_REQUEST_INSTALL_PACKAGES, Process.myUid(), packageName
-        )
+        val appOps = getSystemService(AppOpsManager::class.java)
+        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            appOps.unsafeCheckOpNoThrow(OP_REQUEST_INSTALL_PACKAGES, Process.myUid(), packageName)
+        } else {
+            @Suppress("DEPRECATION")
+            appOps.checkOpNoThrow(OP_REQUEST_INSTALL_PACKAGES, Process.myUid(), packageName)
+        }
         return mode == AppOpsManager.MODE_ALLOWED
     }
 
