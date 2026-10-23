@@ -66,7 +66,11 @@ import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.currentStateAsState
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import com.example.bluehive.update.UpdateGate
 import com.example.bluehive.api.ApiClient
 import com.example.bluehive.api.LockoutBus
 import com.example.bluehive.api.SlotFreedBus
@@ -123,6 +127,9 @@ class LockoutActivity : ComponentActivity() {
 
         @Volatile var isOnTop: Boolean = false
             private set
+
+        /** How often a TV waiting here checks for an update again. */
+        private const val UPDATE_RECHECK_MS = 10L * 60 * 1000
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -153,6 +160,22 @@ class LockoutActivity : ComponentActivity() {
                 onSlotFreed   = { goToProfile() },
                 onReenter     = { returnToHost() },
             )
+        }
+
+        // CHECK FOR UPDATES FROM HERE TOO (2026-10-23). A locked-out TV never
+        // reaches the home screen, where updates are normally checked, and this
+        // screen arrives about 0.1 s after the loading screen and clears it,
+        // check and all. So a TV stuck here could never update. Now: on every
+        // return to this screen, and every 10 minutes while it waits, an
+        // available update opens over it. The lockout gives way to the updater
+        // (see the LockoutBus listener in BlueHiveApplication).
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                while (true) {
+                    UpdateGate.checkNow(this@LockoutActivity, immediate = true)
+                    delay(UPDATE_RECHECK_MS)
+                }
+            }
         }
     }
 

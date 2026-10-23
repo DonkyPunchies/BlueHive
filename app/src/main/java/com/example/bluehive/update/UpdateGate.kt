@@ -219,8 +219,22 @@ object UpdateGate {
      * @param immediate skip the settle delay — used by the operator push, where
      *                  the whole point is that it acts now.
      */
+    /** elapsedRealtime of the last updater launch; see [updaterUp]. */
+    @Volatile private var launchedAt = 0L
+
+    /**
+     * Is the update screen up, or about to be? Counted from the launch, not from
+     * the screen's onCreate, because a lockout landing in between would clear
+     * the task the updater is about to open in.
+     */
+    fun updaterUp(): Boolean =
+        SelfUpdateActivity.isAlive || SystemClock.elapsedRealtime() - launchedAt < 5_000L
+
     fun checkNow(activity: Activity, immediate: Boolean = false) {
-        if (routed) return
+        // Routed, AND the updater still up. A route that was wiped out (the
+        // lockout screen clearing the task under it) must be able to route
+        // again, or a locked-out TV never sees its update.
+        if (routed && updaterUp()) return
 
         val now = SystemClock.elapsedRealtime()
         synchronized(this) {
@@ -304,6 +318,7 @@ object UpdateGate {
      */
     private fun launchUpdater(activity: Activity, update: UpdateManager.Manifest): Boolean =
         runCatching {
+            launchedAt = SystemClock.elapsedRealtime()
             activity.startActivity(
                 Intent(activity, SelfUpdateActivity::class.java).apply {
                     putExtra(SelfUpdateActivity.EXTRA_VERSION_CODE, update.latestVersionCode)

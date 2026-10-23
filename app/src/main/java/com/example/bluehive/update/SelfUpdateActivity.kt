@@ -141,6 +141,15 @@ class SelfUpdateActivity : ComponentActivity() {
          * toggle writes and PackageInstaller reads -- not something we chose.
          */
         private const val OP_REQUEST_INSTALL_PACKAGES = "android:request_install_packages"
+
+        /**
+         * True from onCreate to onDestroy. The lockout screen gives way to this
+         * one while it is up (see UpdateGate.updaterUp): an update needs no
+         * slot, and a TV that cannot get in is exactly the one that most needs
+         * the newest build.
+         */
+        @Volatile var isAlive: Boolean = false
+            private set
     }
 
     private val progress = MutableStateFlow(0f)
@@ -259,6 +268,7 @@ class SelfUpdateActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        isAlive = true
 
         val manifest = UpdateManager.Manifest(
             latestVersionCode = intent.getIntExtra(EXTRA_VERSION_CODE, 0),
@@ -895,6 +905,7 @@ class SelfUpdateActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        isAlive = false
         UpdateInstallBus.unregister()
     }
 }

@@ -1030,6 +1030,15 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
                 Log.d(TAG, "🔒 Lockout posted but already on LockoutActivity — ignoring")
                 return@register
             }
+            // THE UPDATE SCREEN OUTRANKS THE LOCKOUT. The lockout opens with
+            // CLEAR_TASK, which wiped the updater (or the loading screen about to
+            // route to it) and left a full house's TVs unable to ever update.
+            // Updating needs no slot. If the update is declined or fails, the
+            // next retry's 429 brings the lockout back.
+            if (com.example.bluehive.update.UpdateGate.updaterUp()) {
+                Log.e(TAG, "🔒 Lockout (reason=$reason) held back — the update screen is up")
+                return@register
+            }
             // Never from the background. Android 9 (Fire Stick) would put the
             // lockout screen over whatever app the person switched to. When a
             // BlueHive screen is back, the stream reconnects, and its 429 brings
