@@ -1030,6 +1030,15 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
                 Log.d(TAG, "🔒 Lockout posted but already on LockoutActivity — ignoring")
                 return@register
             }
+            // Never from the background. Android 9 (Fire Stick) would put the
+            // lockout screen over whatever app the person switched to. When a
+            // BlueHive screen is back, the stream reconnects, and its 429 brings
+            // the lockout up then.
+            if (!ProcessLifecycleOwner.get().lifecycle.currentState
+                    .isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)) {
+                Log.e(TAG, "🔒 Lockout (reason=$reason) while in the background — not shown")
+                return@register
+            }
             Log.w(TAG, "🔒 Lockout (reason=$reason) — launching lockout screen")
             val intent = Intent(this, LockoutActivity::class.java).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)

@@ -10,9 +10,12 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.ProcessLifecycleOwner
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -103,6 +106,30 @@ object DeviceEventStream {
     // exited via back button, the countdown is irrelevant.
     val isIntentionallyExited: Boolean get() = intentionallyExited
 
+    /**
+     * Hold here while no BlueHive screen is up.
+     *
+     * A connect TAKES A SLOT (the server checks the cap on connect), so the
+     * loop must not connect for a TV nobody is looking at. Until 2026-10-22 it
+     * did. A locked-out TV kept retrying behind another app or with the TV
+     * off, took the slot the moment one freed, and held it with nobody there.
+     * Every 429 on the way posted the lockout screen, which the onn box blocked
+     * (BAL_BLOCK in its log) and Android 9 on the Fire Stick would show over
+     * whatever the person had switched to. A stream that drops while in the
+     * background waits here too, so its reconnect cannot cancel the Home grace
+     * the server is counting down.
+     *
+     * Released the moment a screen starts again (ProcessLifecycleOwner
+     * ON_START), so a returning TV reconnects straight away.
+     */
+    private suspend fun awaitScreenUp() {
+        val state = ProcessLifecycleOwner.get().lifecycle.currentStateFlow
+        if (state.value.isAtLeast(Lifecycle.State.STARTED)) return
+        Log.e(TAG, "no BlueHive screen up — holding the stream until one is")
+        state.first { it.isAtLeast(Lifecycle.State.STARTED) }
+        Log.e(TAG, "screen back — resuming the stream")
+    }
+
     // How many times the stream has opened in this process. A connect only
     // succeeds once the server has given this TV a slot (the cap is checked on
     // connect), so a rise here while the lockout screen is up means the
@@ -175,6 +202,7 @@ fun start() {
             var backoffMs = BACKOFF_INITIAL_MS
 
             while (isActive) {
+                awaitScreenUp()
                 val result = connectAndStream()
 
                 when (result) {
