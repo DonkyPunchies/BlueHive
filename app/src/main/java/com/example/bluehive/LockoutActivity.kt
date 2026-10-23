@@ -66,6 +66,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.compose.currentStateAsState
 import com.example.bluehive.api.ApiClient
 import com.example.bluehive.api.LockoutBus
 import com.example.bluehive.api.SlotFreedBus
@@ -265,8 +266,16 @@ fun LockoutScreen(
     val opensAtStart = remember { DeviceEventStream.opens.value }
     val opens by DeviceEventStream.opens.collectAsState()
     var entering by remember { mutableStateOf(false) }
-    LaunchedEffect(opens, reason) {
-        if (isWorkspaceFull && opens > opensAtStart && !entering) {
+    // ONLY WHILE THIS SCREEN IS ON SCREEN. The retry also lands while the TV is
+    // asleep or the app is in the background, and then Android refuses to open
+    // the next screen (seen 2026-10-22: BAL_BLOCK at 21:15:11, box asleep) while
+    // goToProfile still finished this one, leaving BlueHive with no screen at
+    // all. Waiting for RESUMED walks in the moment someone is looking again.
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    val lifecycleState by lifecycleOwner.lifecycle.currentStateAsState()
+    val onScreen = lifecycleState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)
+    LaunchedEffect(opens, reason, onScreen) {
+        if (isWorkspaceFull && opens > opensAtStart && !entering && onScreen) {
             entering = true
             Log.d("LockoutScreen", "stream connected — the slot is ours, entering")
             onSlotFreed()

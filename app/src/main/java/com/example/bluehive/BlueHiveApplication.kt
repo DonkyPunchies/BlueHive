@@ -837,7 +837,7 @@ class BlueHiveApplication : Application(), ImageLoaderFactory {
         // the socket, so a detail screen, a paused film or a finished one holds a
         // household slot for as long as the TV has power. See IdleWatcher.
         IdleWatcher.setForeground(true)
-        IdleWatcher.start()
+        IdleWatcher.start(this)
 
         // ── Inactivity timeout ─────────────────────────────────────────────────
         // All lifecycle decisions go through InactivityWatcher so a single

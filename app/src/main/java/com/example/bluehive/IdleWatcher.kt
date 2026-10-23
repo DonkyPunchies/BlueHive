@@ -1,10 +1,18 @@
 package com.example.bluehive
 
+import android.app.AlarmManager
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.SystemClock
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.example.bluehive.api.ApiClient
 import com.example.bluehive.auth.DeviceEventStream
 import com.example.bluehive.auth.SessionManager
+import com.example.bluehive.sidebarComponents.SidebarReboot
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -232,6 +240,9 @@ object IdleWatcher {
     /** elapsedRealtime of the last state line; see [DIAG_EVERY_MS]. */
     @Volatile private var lastDiagAt = 0L
 
+    /** elapsedRealtime of the last ticker tick; a long gap means we were frozen or asleep. */
+    @Volatile private var lastTickAt = 0L
+
     /** Minutes of stillness a reset has to cut short before it is worth a log line. */
     private const val NOTABLE_IDLE_MS = 2L * 60 * 1000
 
@@ -254,6 +265,9 @@ object IdleWatcher {
      * the rare woken-from-idle case, a stream start.
      */
     fun noteInteraction(what: String = "") {
+        // BEFORE the reset below: the first key after a TV comes back on can be
+        // the only sign it was ever away. See restartIfAwayTooLong.
+        if (restartIfAwayTooLong("input ($what)")) return
         val now = SystemClock.elapsedRealtime()
         if (now - lastInputAt >= NOTABLE_IDLE_MS) {
             // Only after a real stretch of stillness, so ordinary browsing logs
@@ -326,16 +340,118 @@ object IdleWatcher {
      */
     fun setForeground(isForeground: Boolean) {
         foreground = isForeground
-        if (isForeground) {
-            // Returning from background is interaction by definition, and without
-            // this the first tick after a long background would see a stale
-            // lastInputAt and release immediately.
-            val now = SystemClock.elapsedRealtime()
-            if (now - lastInputAt >= NOTABLE_IDLE_MS) {
-                Log.e(TAG, "foreground return after ${(now - lastInputAt) / 60000}m idle — timer reset")
-            }
-            lastInputAt = now
+        if (!isForeground) {
+            scheduleCloseAlarm()
+            return
         }
+        cancelCloseAlarm()
+        // BEFORE the reset below, which used to swallow a whole night away.
+        if (restartIfAwayTooLong("foreground return")) return
+        // Returning from background is interaction by definition, and without
+        // this the first tick after a long background would see a stale
+        // lastInputAt and release immediately.
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastInputAt >= NOTABLE_IDLE_MS) {
+            Log.e(TAG, "foreground return after ${(now - lastInputAt) / 60000}m idle — timer reset")
+        }
+        lastInputAt = now
+    }
+
+    // ── Away longer than the close: start fresh (2026-10-22) ───────────────────
+    //
+    // THE CLOSE BELOW ONLY FIRES IF THIS PROCESS IS RUNNING AT THE MARK, and on
+    // a real TV it usually is not. Measured on the onn box 2026-10-22:
+    //   - turning the TV off puts the box to sleep with it
+    //     (hdmi_control_auto_device_off_enabled=1). A sleeping CPU runs no ticks:
+    //     delay() counts monotonic time, which stops in suspend.
+    //   - behind the 10-minute screensaver BlueHive is a background app, and the
+    //     box freezes background apps (use_freezer=true, 19 frozen at the time).
+    // Either way the tick never saw the four hours, and the next sign of life
+    // reset the clock: a foreground return (setForeground), or simply a key
+    // press when the TV came back with no lifecycle event at all (seen in this
+    // box's log the same day: "input (KEYCODE_BACK) after 198m idle"). So the
+    // app was found still open in the morning, as reported 2026-10-20.
+    //
+    // Now that first sign of life is checked BEFORE it resets anything. If the
+    // gap was past CLOSE_AFTER_IDLE_MS, BlueHive restarts through the Reboot
+    // relauncher instead of resuming: fresh process, stored-session check,
+    // self-update check, profile picker. To the person on the couch that is
+    // the app having closed while they were away.
+    //
+    // And while the process IS awake in the background (no freezer, or not yet
+    // frozen, or asleep with the CPU suspended), an alarm at the mark wakes it
+    // so the ordinary close runs on time. The alarm only reaches a RUNNING
+    // process: its receiver is registered at runtime, with none in the
+    // manifest, so a dead app is never started by it. That matters because any
+    // start of the main process opens the event stream and can take a slot.
+
+    /** The application Context, for the alarm and the restart. Set by start(). */
+    @Volatile private var appContext: Context? = null
+
+    private const val ACTION_CLOSE_ALARM_SUFFIX = ".IDLE_CLOSE_ALARM"
+
+    private val closeAlarmReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            Log.e(TAG, "close alarm (idle ${(SystemClock.elapsedRealtime() - lastInputAt) / 60000}m)")
+            // tick() makes the decision, exactly as if it had come round itself.
+            scope.launch {
+                runCatching { tick(fromAlarm = true) }.onFailure { Log.e(TAG, "tick failed: $it") }
+            }
+        }
+    }
+
+    private fun closeAlarmIntent(context: Context): PendingIntent =
+        PendingIntent.getBroadcast(
+            context, 0,
+            Intent(context.packageName + ACTION_CLOSE_ALARM_SUFFIX).setPackage(context.packageName),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+
+    /** Going to the background: wake this process at the close mark. */
+    private fun scheduleCloseAlarm() {
+        val ctx = appContext ?: return
+        runCatching {
+            val am = ctx.getSystemService(AlarmManager::class.java)
+            // Inexact on purpose: no exact-alarm permission needed, and a few
+            // minutes late does not matter four hours out.
+            am.setAndAllowWhileIdle(
+                AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                lastInputAt + CLOSE_AFTER_IDLE_MS,
+                closeAlarmIntent(ctx),
+            )
+        }.onFailure { Log.e(TAG, "close alarm not set: $it") }
+    }
+
+    private fun cancelCloseAlarm() {
+        val ctx = appContext ?: return
+        runCatching { ctx.getSystemService(AlarmManager::class.java).cancel(closeAlarmIntent(ctx)) }
+    }
+
+    /**
+     * The first sign of life after an absence. If the gap was longer than
+     * [CLOSE_AFTER_IDLE_MS], restart fresh instead of letting the caller reset
+     * the clock. True when a restart is under way.
+     */
+    private fun restartIfAwayTooLong(trigger: String): Boolean {
+        val awayMs = SystemClock.elapsedRealtime() - lastInputAt
+        if (awayMs < CLOSE_AFTER_IDLE_MS) return false
+        // The same exemptions as the close: never under a film, never for a
+        // signed-out app, and not after Back (that launch comes through the
+        // front door already).
+        if (snapshotPlaying().isNotEmpty()) return false
+        if (!runCatching { SessionManager.get().isAuthenticated }.getOrDefault(false)) return false
+        if (DeviceEventStream.isIntentionallyExited) return false
+        val ctx = appContext ?: return false
+        Log.e(TAG, "$trigger after ${awayMs / 60000}m away " +
+                "(close at ${CLOSE_AFTER_IDLE_MS / 60000}m) — starting fresh")
+        closeRequested = true
+        runCatching { SidebarReboot.restartFresh(ctx) }.onFailure {
+            // Could not relaunch: close instead, which is still what the four
+            // hours promise.
+            Log.e(TAG, "fresh start failed ($it) — closing instead")
+            IdleCloseBus.post()
+        }
+        return true
     }
 
     /**
@@ -351,7 +467,17 @@ object IdleWatcher {
         return was
     }
 
-    fun start() {
+    fun start(context: Context) {
+        if (appContext == null) {
+            appContext = context.applicationContext
+            // Runtime-registered and not exported: reachable only by this app's
+            // own alarm, and only while this process is alive.
+            ContextCompat.registerReceiver(
+                context.applicationContext, closeAlarmReceiver,
+                IntentFilter(context.packageName + ACTION_CLOSE_ALARM_SUFFIX),
+                ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
+        }
         if (job?.isActive == true) return
         job = scope.launch {
             Log.e(TAG, "idle watcher started (release=${IDLE_RELEASE_MS / 60000}m, " +
@@ -373,7 +499,7 @@ object IdleWatcher {
 
     // ── The decision ──────────────────────────────────────────────────────────
 
-    private suspend fun tick() {
+    private suspend fun tick(fromAlarm: Boolean = false) {
         // Every one of these is a reason this class has no opinion, not a reason to
         // release. Releasing on "I could not tell" is how an idle timer locks out a
         // paying user who was sitting right there.
@@ -399,6 +525,12 @@ object IdleWatcher {
         val playing = snapshotPlaying()
         val authed  = SessionManager.get().isAuthenticated
         val exited  = DeviceEventStream.isIntentionallyExited
+        // JUST WOKE: the ticker came round long after it should have, so this
+        // process was frozen (the onn box freezes background apps) or asleep.
+        // The alarm has its own path and is never "just woken".
+        val gapMs    = if (lastTickAt == 0L) 0L else now - lastTickAt
+        if (!fromAlarm) lastTickAt = now
+        val justWoke = !fromAlarm && gapMs > 4 * TICK_MS
         if (now - lastDiagAt >= DIAG_EVERY_MS) {
             lastDiagAt = now
             Log.e(TAG, "state: idle=${idleMs / 60000}m playing=$playing fg=$foreground " +
@@ -426,6 +558,17 @@ object IdleWatcher {
         // during playback — but the cost of being wrong is killing someone's film,
         // and the check is free.
         if (playing.isEmpty() && idleMs >= CLOSE_AFTER_IDLE_MS && !closeRequested) {
+            // A frozen app thaws when someone opens it, and this ticker can run
+            // the instant it thaws, before onStart has said so. Closing now
+            // would shut the app in the face of the person who just opened it.
+            // Wait one tick: their onStart restarts us fresh within
+            // milliseconds (restartIfAwayTooLong), and a wake with nobody there
+            // closes on the next tick or on the alarm.
+            if (justWoke && !foreground) {
+                Log.e(TAG, "idle ${idleMs / 60000}m but just woke (${gapMs / 1000}s since last tick) — " +
+                        "waiting one tick before closing")
+                return
+            }
             closeRequested = true
             // Log.e, not Log.i: R8 strips v/d/i/w from release builds, so on the
             // builds users actually run this line did not exist — which is part of

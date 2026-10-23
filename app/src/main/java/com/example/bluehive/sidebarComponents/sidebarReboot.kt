@@ -1,6 +1,7 @@
 package com.example.bluehive.sidebarComponents
 
 import android.app.Activity
+import android.content.Context
 import androidx.compose.runtime.*
 import androidx.compose.ui.platform.ComposeView
 import android.view.ViewGroup
@@ -61,14 +62,24 @@ object SidebarReboot {
         )
     }
 
-    private fun executeReboot(activity: Activity) {
+    private fun executeReboot(activity: Activity) = restartFresh(activity)
+
+    /**
+     * The reboot itself, for any caller with a Context: the sidebar button, and
+     * IdleWatcher when a TV comes back after more than four hours away.
+     *
+     * The app must be in the foreground when this runs. Android only lets a
+     * visible app start an activity, and both callers are reacting to someone
+     * at the TV.
+     */
+    fun restartFresh(context: Context) {
         releaseSoundPool()
 
         // Hand the relaunch to RebootActivity, which runs in its OWN process
         // (:phoenix) and therefore survives the kill below. It restarts BlueHive
         // through AuthActivity — stored-session check + the self-update check,
         // so a newly published build installs right on reboot.
-        activity.startActivity(Intent(activity, RebootActivity::class.java).apply {
+        context.startActivity(Intent(context, RebootActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
         })
 
