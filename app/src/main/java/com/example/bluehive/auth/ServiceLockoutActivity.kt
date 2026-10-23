@@ -44,6 +44,10 @@ import com.example.bluehive.utilities.ModularButtonColors
 import com.example.bluehive.utilities.ModularButtonDimensions
 import com.example.bluehive.utilities.ModularButtonGlowConfig
 import com.example.bluehive.utilities.ModularButtonTextConfig
+import com.example.bluehive.update.UpdateGate
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -86,6 +90,12 @@ class ServiceLockoutActivity : ComponentActivity() {
          */
         fun launch(context: android.content.Context) {
             if (isOnTop) return          // already up; do not rebuild it underneath them
+            // THE UPDATE SCREEN OUTRANKS THIS ONE, as it does the slot lockout
+            // (v366). CLEAR_TASK would wipe it. Dropping the lock here is safe:
+            // the standing is saved, the updater cannot be skipped, and every
+            // launch after it (including the post-install relaunch) checks
+            // isLockedOut first.
+            if (UpdateGate.updaterUp()) return
             runCatching {
                 context.applicationContext.startActivity(
                     Intent(context.applicationContext, ServiceLockoutActivity::class.java)
@@ -126,6 +136,22 @@ class ServiceLockoutActivity : ComponentActivity() {
                     finish()
                 },
             )
+        }
+
+        // CHECK FOR UPDATES FROM HERE TOO (2026-10-23), as the slot lockout does
+        // since v366. AuthActivity sends a locked TV here before its own update
+        // check runs, so a TV locked out (Off-Grid Drive uninstalled, or the
+        // subscription lapsed) could never update. Now: on every return to this
+        // screen, and every 10 minutes while it waits, an available update opens
+        // over it. Updating unlocks nothing; it keeps the TV current so a fix can
+        // still reach it.
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                while (true) {
+                    UpdateGate.checkNow(this@ServiceLockoutActivity, immediate = true)
+                    delay(10L * 60 * 1000)
+                }
+            }
         }
     }
 
