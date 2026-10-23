@@ -8,6 +8,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -41,6 +44,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.geometry.Offset
@@ -110,10 +114,10 @@ import kotlinx.coroutines.launch
 //    slot_freed and a green hint appears. The Refresh button checks whether
 //    a slot is now available.
 //
-// Back button (both scenarios):
-//   moveTaskToBack(true) — minimizes app to TV home screen without touching
-//   the session. SSE keeps running for workspace_full. For revoked, the user
-//   can return later and tap Re-enter properly.
+// Back, and the Close application button beside Refresh (both scenarios):
+//   closeApp() — stops the stream's retries, so this TV stops trying to take
+//   a slot, and closes BlueHive's task. For revoked, the user can come back
+//   later and tap Re-enter properly.
 // ──────────────────────────────────────────────────────────────────────────────
 
 class LockoutActivity : ComponentActivity() {
@@ -149,8 +153,7 @@ class LockoutActivity : ComponentActivity() {
                 // PHASE 2: nothing sits beneath the lockout screen and BlueHive
                 // owns no pairing front door. Back closes BlueHive's task and
                 // drops the user back to the host.
-                DeviceEventStream.stopAndMarkExited()
-                finishAffinity()
+                closeApp()
             }
         })
 
@@ -159,6 +162,7 @@ class LockoutActivity : ComponentActivity() {
                 initialReason = initialReason,
                 onSlotFreed   = { goToProfile() },
                 onReenter     = { returnToHost() },
+                onClose       = { closeApp() },
             )
         }
 
@@ -181,6 +185,13 @@ class LockoutActivity : ComponentActivity() {
 
     override fun onResume()  { super.onResume();  isOnTop = true  }
     override fun onPause()   { super.onPause();   isOnTop = false }
+
+    // Back, and the Close application button (2026-10-23): one way out. Stops
+    // the stream's retries first, so a closed BlueHive cannot take a slot.
+    private fun closeApp() {
+        DeviceEventStream.stopAndMarkExited()
+        finishAffinity()
+    }
 
 
     // workspace_full or session kick (200 from check-slot) — re-enter workspace
@@ -230,10 +241,29 @@ fun LockoutScreen(
     initialReason: String?,
     onSlotFreed:   () -> Unit,
     onReenter:     () -> Unit,
+    onClose:       () -> Unit,
 ) {
     val scope  = rememberCoroutineScope()
     var state  by remember { mutableStateOf<RefreshState>(RefreshState.Idle) }
     var reason by remember { mutableStateOf(initialReason) }
+
+    // "All slots still in use" FADES OUT after 5 s (2026-10-23). Left up, it read
+    // as the current state long after it had stopped being news. A fade, not a
+    // removal, so nothing on the screen jumps when it goes; the next press
+    // replaces it at once.
+    var feedbackVisible by remember { mutableStateOf(true) }
+    LaunchedEffect(state) {
+        feedbackVisible = true
+        if (state is RefreshState.StillLocked) {
+            delay(STILL_LOCKED_VISIBLE_MS)
+            feedbackVisible = false
+        }
+    }
+    val feedbackAlpha by animateFloatAsState(
+        targetValue   = if (feedbackVisible) 1f else 0f,
+        animationSpec = if (feedbackVisible) snap() else tween(durationMillis = 800),
+        label         = "stillLockedFade",
+    )
 
     val isRevoked       = reason == LockoutBus.REASON_REVOKED_BY_ADMIN
     val isWorkspaceFull = reason == LockoutBus.REASON_WORKSPACE_FULL
@@ -322,6 +352,7 @@ fun LockoutScreen(
     val afterIdleRelease = remember { IdleWatcher.consumeIdleReleaseFlag() }
 
     val buttonFocusRequester = remember { FocusRequester() }
+    val closeFocusRequester  = remember { FocusRequester() }
     LaunchedEffect(Unit) { buttonFocusRequester.requestFocus() }
 
     // ── check-slot — shared by both revoked and workspace_full ────────────────
@@ -499,15 +530,29 @@ fun LockoutScreen(
                 Spacer(Modifier.height(36.dp))
             }
 
-            // ── Action button ─────────────────────────────────────────────────
-            LockoutButton(
-                fontFamily     = uiFont,
-                focusRequester = buttonFocusRequester,
-                state          = state,
-                isRevoked      = isRevoked,
-                cooldownLeft   = cooldownLeft,
-                onClick        = { onRefreshClick() }
-            )
+            // ── Action buttons: Refresh (Re-enter when revoked) on the left,
+            // Close application on the right. Each button's box is 26 dp wider
+            // than the button itself and its glow stays inside that box, so
+            // 14 dp leaves a 40 dp gap and the two glows never overlap.
+            Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                LockoutButton(
+                    fontFamily     = uiFont,
+                    focusRequester = buttonFocusRequester,
+                    state          = state,
+                    isRevoked      = isRevoked,
+                    cooldownLeft   = cooldownLeft,
+                    onClick        = { onRefreshClick() }
+                )
+                LockoutStyledButton(
+                    label          = "Close application",
+                    fontFamily     = uiFont,
+                    focusRequester = closeFocusRequester,
+                    onClick        = {
+                        BlueHiveApplication.playClickSound()
+                        onClose()
+                    }
+                )
+            }
 
             // ── Feedback text ─────────────────────────────────────────────────
             val feedback: String? = when (val s = state) {
@@ -528,6 +573,7 @@ fun LockoutScreen(
                     },
                     fontSize      = 16.sp,
                     fontFamily    = uiFont,
+                    modifier      = Modifier.alpha(feedbackAlpha),
                 )
             }
         }
@@ -557,6 +603,29 @@ private fun LockoutButton(
         else         -> "Refresh"
     }
 
+    LockoutStyledButton(
+        label          = label,
+        fontFamily     = fontFamily,
+        focusRequester = focusRequester,
+        onClick        = {
+            // Presses while disabled are ignored here, never by taking the
+            // button's focus away (see LockoutStyledButton).
+            if (!isDisabled) {
+                BlueHiveApplication.playClickSound()
+                onClick()
+            }
+        }
+    )
+}
+
+/** The lockout screen's button: Refresh / Re-enter, and Close application beside it. */
+@Composable
+private fun LockoutStyledButton(
+    label:          String,
+    fontFamily:     FontFamily,
+    focusRequester: FocusRequester,
+    onClick:        () -> Unit,
+) {
     // The same button as before, at design C's size: every dimension x 1.3,
     // like the rest of the screen (it was 150 x 23 dp, small next to the list).
     ModularButton(
@@ -567,8 +636,8 @@ private fun LockoutButton(
         // ALWAYS FOCUSABLE, so the focus glow never leaves it. This used to be
         // `canFocus = !isDisabled`: a press turned it into "Checking…", focus
         // dropped off, and nothing put it back, so after one Refresh the screen
-        // had no glow at all (2026-10-22). Presses while disabled are ignored in
-        // onClick below instead.
+        // had no glow at all (2026-10-22). LockoutButton ignores presses while
+        // disabled instead.
         modifier       = Modifier
             .onKeyEvent { event ->
                 if (event.type == KeyEventType.KeyDown) BlueHiveApplication.playHoverSound()
@@ -610,12 +679,7 @@ private fun LockoutButton(
             durationMillis        = 110,
             bounceBackDelayMillis = 80
         ),
-        onClick = {
-            if (!isDisabled) {
-                BlueHiveApplication.playClickSound()
-                onClick()
-            }
-        }
+        onClick = onClick
     )
 }
 
@@ -649,6 +713,9 @@ private val BODY_WIDTH = 612.dp   // its 470 px paragraph
 
 /** More TVs than this collapse into "+ N more", so the screen never overflows. */
 private const val MAX_ROWS = 4
+
+/** How long "All slots still in use" stays before it fades out. */
+private const val STILL_LOCKED_VISIBLE_MS = 5_000L
 
 @Composable
 private fun SlotBanner(banner: SlotHolderText.Banner, fontFamily: FontFamily) {
